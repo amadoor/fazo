@@ -3,8 +3,12 @@ name = "fazo"
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
-publish = false
-description = "Lua 5.5 interpreter, stackless and persistent"
+description = "A stackless, JIT-capable, embeddable runtime for Lua 5.5.1"
+repository = "https://github.com/amadoor/fazo"
+readme = "../../README.md"
+keywords = ["lua", "interpreter", "jit", "scripting", "vm"]
+categories = ["compilers", "game-development"]
+exclude = ["scoreboard.json"]
 
 
 [dependencies]

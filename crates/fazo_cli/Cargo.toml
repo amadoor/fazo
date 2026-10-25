@@ -3,8 +3,12 @@ name = "fazo_cli"
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
-publish = false
-description = "The fazo standalone interpreter, mirroring the official lua executable"
+description = "The fazo standalone interpreter, a drop-in for the lua executable"
+repository = "https://github.com/amadoor/fazo"
+readme = "../../README.md"
+keywords = ["lua", "interpreter", "jit", "scripting", "vm"]
+categories = ["compilers", "game-development"]
+exclude = ["tests"]
 
 
 [[bin]]
@@ -13,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4"
-fazo = { path = "../fazo" }
+fazo = { path = "../fazo", version = "0.1.0-alpha.1" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
