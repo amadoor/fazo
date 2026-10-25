@@ -1,0 +1,2 @@
+local object = {}
+object:missing()

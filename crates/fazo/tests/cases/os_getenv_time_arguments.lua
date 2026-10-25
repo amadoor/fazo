@@ -1,0 +1,6 @@
+print(pcall(os.getenv))
+print(pcall(os.time, 5))
+print(pcall(os.time, {year = 2020}))
+print(os.time({year = "2020", month = "1", day = "1", hour = "12"}) == os.time({year = 2020, month = 1, day = 1, hour = 12}))
+print(pcall(os.time, {year = 2020, month = 1.5, day = 1}))
+print(pcall(os.time, {year = 2020, month = 1, day = {}}))

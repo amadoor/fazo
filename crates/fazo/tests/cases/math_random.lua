@@ -1,0 +1,7 @@
+math.randomseed(42)
+local a, b, c = math.random(), math.random(10), math.random(-5, 5)
+print(a, b, c)
+print(math.random(0) ~= nil, math.random(3, 3))
+math.randomseed(7, 1)
+print(math.random(1, 100), math.random(1, 100), math.random(1000000))
+print(select('#', math.randomseed(5)))

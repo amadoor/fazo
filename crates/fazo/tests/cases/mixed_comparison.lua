@@ -1,0 +1,7 @@
+print(1 == 1.0, math.maxinteger == 2 ^ 63, math.maxinteger < 2 ^ 63, math.maxinteger + 0.0 == 2 ^ 63)
+print(math.mininteger == -2 ^ 63, math.mininteger <= -2 ^ 63)
+print(1 < 1.5, 2 > 1.5, 3 <= 3.0, -1 >= -1.0)
+print(9007199254740993 < 9007199254740992.0, 9007199254740993 > 9007199254740992.0)
+print(0 / 0 == 0 / 0, 0 / 0 < 1, 1 < 0 / 0, 1 ~= 1.0)
+print(-0.0 == 0, 1 < math.huge, math.mininteger < -math.huge, math.maxinteger < math.huge)
+print("a" < "b", "Z" < "a", "" < "a", "abc" < "abd", "10" < "9")

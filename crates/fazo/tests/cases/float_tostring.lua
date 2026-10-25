@@ -1,0 +1,8 @@
+print(1e100, -0.0, 1 / 0, -1 / 0)
+print(100.0, 1e15, 1e16, 2 ^ 53, 2 ^ 63, -2 ^ 63)
+print(3.14159265358979, 1e-5, 1.5e-7, 5e-324, 1e-4)
+print(12345678901234567890, 0.1 + 0.2, 100 / 3)
+print(0 / 0 ~= 0 / 0, string.format("%s", 0 / 0) == tostring(0 / 0))
+print(tostring(2.5), tostring(-7.0), tostring(1e14), tostring(123456789012.0))
+print(1e300 * 1e10, -1e300 * 1e10, math.huge == 1 / 0)
+print(255 / 5, 2 ^ -1, 10 / 4)

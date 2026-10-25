@@ -1,0 +1,38 @@
+[package]
+name = "fazo_harness"
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Differential harness, generator and scoreboard for fazo, run against the official PUC-Rio Lua 5.5 interpreter"
+
+
+[[bin]]
+name = "scoreboard"
+path = "src/bin/scoreboard.rs"
+
+[[bin]]
+name = "perf"
+path = "src/bin/perf.rs"
+
+[[bin]]
+name = "bytecode"
+path = "src/bin/bytecode.rs"
+
+[dependencies]
+fazo = { path = "../fazo" }
+cc = "1.9"
+flate2 = "1.1"
+indexmap = { version = "2.14", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10"
+tar = "0.4"
+ureq = "3"
+
+[lints.rust]
+unused_must_use = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+too_many_arguments = "deny"

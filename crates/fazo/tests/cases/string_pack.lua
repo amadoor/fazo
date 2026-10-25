@@ -1,0 +1,5 @@
+local packed = string.pack("<i4 >i2 z s1", -2, 258, "hi", "yo")
+print(#packed, string.unpack("<i4 >i2 z s1", packed))
+print(string.packsize("!8 i1 i8"), string.packsize("i3 d"), string.unpack("<I3", "\1\2\3"))
+print(string.unpack("<d", string.pack("<d", 2.5)), string.pack(">I2", 65):byte(1, -1))
+print(string.unpack("c3", "abcdef", 2))

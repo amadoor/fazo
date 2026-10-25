@@ -1,0 +1,5 @@
+print(pcall(debug.getinfo, 1, ">"))
+print(pcall(debug.getinfo, 1, "X"))
+print(pcall(debug.sethook, 1, "", 0))
+print(pcall(debug.upvaluejoin, print, 1, print, 1))
+print(pcall(debug.upvaluejoin, print, 1))

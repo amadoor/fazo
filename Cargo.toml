@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/fazo", "crates/fazo_cli", "crates/fazo_harness", "xtask"]
+default-members = ["crates/fazo", "crates/fazo_cli", "crates/fazo_harness"]
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

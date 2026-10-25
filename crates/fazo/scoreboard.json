@@ -1,0 +1,378 @@
+{
+  "lua": "5.5.1",
+  "tests": {
+    "official": {
+      "normal": {
+        "pass": 30,
+        "fail": 1,
+        "skip": 2,
+        "failures": [
+          "files.lua"
+        ]
+      }
+    },
+    "cases": {
+      "normal": {
+        "pass": 140,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      }
+    },
+    "syntax": {
+      "normal": {
+        "pass": 43,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      }
+    },
+    "cli": {
+      "normal": {
+        "pass": 73,
+        "fail": 1,
+        "skip": 0,
+        "failures": [
+          "standalone main.lua"
+        ]
+      }
+    },
+    "generated": {
+      "normal": {
+        "pass": 600,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      }
+    }
+  },
+  "bytecode": {
+    "functions": 2729,
+    "identical": 2729,
+    "fazo_instructions": 122699,
+    "puc_instructions": 122699
+  },
+  "perf": {
+    "fib": {
+      "puc": 161182880,
+      "fazo": 119480668,
+      "baseline": 132665909,
+      "peak": 239118782,
+      "interpreter": 153858342
+    },
+    "integer loop": {
+      "puc": 480031101,
+      "fazo": 191630448,
+      "baseline": 191627069,
+      "peak": 219965459,
+      "interpreter": 408028706
+    },
+    "float loop": {
+      "puc": 470060466,
+      "fazo": 177476662,
+      "baseline": 177472399,
+      "peak": 222217573,
+      "interpreter": 402053172
+    },
+    "table array": {
+      "puc": 187926306,
+      "fazo": 112464659,
+      "baseline": 112431607,
+      "peak": 107189970,
+      "interpreter": 168322300
+    },
+    "table hash": {
+      "puc": 150726025,
+      "fazo": 102175267,
+      "baseline": 102202294,
+      "peak": 139074205,
+      "interpreter": 136807381
+    },
+    "closures": {
+      "puc": 189542451,
+      "fazo": 201785313,
+      "baseline": 201783338,
+      "peak": 293541621,
+      "interpreter": 174858996
+    },
+    "method calls through __index": {
+      "puc": 510224213,
+      "fazo": 398913689,
+      "baseline": 398925673,
+      "peak": 794830035,
+      "interpreter": 491961611
+    },
+    "absent metamethods": {
+      "puc": 476179139,
+      "fazo": 379555087,
+      "baseline": 379552598,
+      "peak": 501421004,
+      "interpreter": 365176601
+    },
+    "coroutine switching": {
+      "puc": 498568374,
+      "fazo": 432598978,
+      "baseline": 432598814,
+      "peak": 647882778,
+      "interpreter": 415565401
+    },
+    "strings": {
+      "puc": 71362238,
+      "fazo": 67844611,
+      "baseline": 67845046,
+      "peak": 78338340,
+      "interpreter": 63871199
+    },
+    "binary-trees": {
+      "puc": 452087637,
+      "fazo": 456628747,
+      "baseline": 451739702,
+      "peak": 520592931,
+      "interpreter": 381449841
+    },
+    "n-body": {
+      "puc": 470903890,
+      "fazo": 238456136,
+      "baseline": 238499813,
+      "peak": 935299669,
+      "interpreter": 385590944
+    },
+    "spectral-norm": {
+      "puc": 263371091,
+      "fazo": 168069106,
+      "baseline": 150109258,
+      "peak": 270554471,
+      "interpreter": 230002177
+    },
+    "fannkuch": {
+      "puc": 310512921,
+      "fazo": 251210503,
+      "baseline": 251200903,
+      "peak": 270354340,
+      "interpreter": 287097907
+    },
+    "class dispatch": {
+      "puc": 301377471,
+      "fazo": 177503039,
+      "baseline": 177499010,
+      "peak": 479796280,
+      "interpreter": 247572517
+    },
+    "deltablue": {
+      "puc": 513410560,
+      "fazo": 487075220,
+      "baseline": 486807596,
+      "peak": 1276774254,
+      "interpreter": 471611879
+    },
+    "havlak": {
+      "puc": 169081516,
+      "fazo": 193003093,
+      "baseline": 193086044,
+      "peak": 643381148,
+      "interpreter": 183450912
+    },
+    "garbage collector (generational)": {
+      "puc": 1792963000,
+      "fazo": 1313005720,
+      "baseline": 1313800488,
+      "peak": 1766885067,
+      "interpreter": 1575020288
+    },
+    "stats": {
+      "puc": 517068523,
+      "fazo": 316552002,
+      "baseline": 316865576,
+      "peak": 781568841,
+      "interpreter": 442264654
+    },
+    "dialogue (interpreted)": {
+      "puc": 467260908,
+      "fazo": 337522031,
+      "baseline": 337342280,
+      "peak": 546648421,
+      "interpreter": 403931556
+    },
+    "dialogue (compiled with load)": {
+      "puc": 1752306868,
+      "fazo": 1677075593,
+      "baseline": 1676515642,
+      "peak": 41449028661,
+      "interpreter": 1684125501
+    },
+    "frame": {
+      "puc": 2038314512,
+      "fazo": 926700556,
+      "baseline": 936567935,
+      "peak": 3114357097,
+      "interpreter": 1608332689
+    }
+  },
+  "operations": {
+    "addi": {
+      "puc": 30.0,
+      "fazo": 25.0,
+      "budget": 30.0
+    },
+    "addint": {
+      "puc": 38.0,
+      "fazo": 28.0,
+      "budget": 38.0
+    },
+    "addk": {
+      "puc": 41.0,
+      "fazo": 34.0,
+      "budget": 41.0
+    },
+    "call0": {
+      "puc": 157.0,
+      "fazo": 153.0,
+      "budget": 161.0
+    },
+    "call1": {
+      "puc": 215.0,
+      "fazo": 196.0,
+      "budget": 219.0
+    },
+    "call2": {
+      "puc": 273.0,
+      "fazo": 240.0,
+      "budget": 277.0
+    },
+    "callnative": {
+      "puc": 262.0,
+      "fazo": 213.0,
+      "budget": 262.0
+    },
+    "callplain": {
+      "puc": 405.0,
+      "fazo": 290.0,
+      "budget": 405.0
+    },
+    "closure": {
+      "puc": 429.7,
+      "fazo": 254.4,
+      "budget": 431.2
+    },
+    "concat": {
+      "puc": 402.0,
+      "fazo": 419.0,
+      "budget": 412.0
+    },
+    "eqk": {
+      "puc": 36.0,
+      "fazo": 29.0,
+      "budget": 36.0
+    },
+    "getfield": {
+      "puc": 61.0,
+      "fazo": 48.0,
+      "budget": 61.0
+    },
+    "getiK": {
+      "puc": 41.0,
+      "fazo": 34.0,
+      "budget": 41.0
+    },
+    "gettable": {
+      "puc": 45.0,
+      "fazo": 41.0,
+      "budget": 45.0
+    },
+    "gettabup": {
+      "puc": 63.0,
+      "fazo": 66.0,
+      "budget": 65.0
+    },
+    "getupval": {
+      "puc": 25.0,
+      "fazo": 20.0,
+      "budget": 25.0
+    },
+    "len": {
+      "puc": 91.0,
+      "fazo": 77.0,
+      "budget": 91.0
+    },
+    "loadi": {
+      "puc": 20.0,
+      "fazo": 16.0,
+      "budget": 20.0
+    },
+    "loadk": {
+      "puc": 24.0,
+      "fazo": 17.0,
+      "budget": 24.0
+    },
+    "lt": {
+      "puc": 36.0,
+      "fazo": 31.0,
+      "budget": 36.0
+    },
+    "method": {
+      "puc": 257.0,
+      "fazo": 238.0,
+      "budget": 261.0
+    },
+    "modk": {
+      "puc": 52.0,
+      "fazo": 45.0,
+      "budget": 52.0
+    },
+    "move": {
+      "puc": 23.0,
+      "fazo": 15.0,
+      "budget": 23.0
+    },
+    "mulf": {
+      "puc": 40.0,
+      "fazo": 33.0,
+      "budget": 40.0
+    },
+    "newtable": {
+      "puc": 440.3,
+      "fazo": 362.8,
+      "budget": 440.3
+    },
+    "not": {
+      "puc": 28.0,
+      "fazo": 24.0,
+      "budget": 28.0
+    },
+    "setfield": {
+      "puc": 77.0,
+      "fazo": 71.0,
+      "budget": 77.0
+    },
+    "seti": {
+      "puc": 47.0,
+      "fazo": 50.0,
+      "budget": 47.0
+    },
+    "settable": {
+      "puc": 56.0,
+      "fazo": 55.0,
+      "budget": 56.0
+    },
+    "setupval": {
+      "puc": 27.0,
+      "fazo": 25.0,
+      "budget": 27.0
+    },
+    "tailcall": {
+      "puc": 399.0,
+      "fazo": 362.0,
+      "budget": 407.0
+    },
+    "vararg": {
+      "puc": 456.0,
+      "fazo": 422.0,
+      "budget": 460.0
+    },
+    "forloop": {
+      "puc": 32.0,
+      "fazo": 33.0,
+      "budget": 32.0
+    }
+  }
+}

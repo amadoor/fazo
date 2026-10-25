@@ -1,0 +1,2 @@
+local zero = 0
+print(1 // zero)

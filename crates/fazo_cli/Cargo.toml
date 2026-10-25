@@ -1,0 +1,35 @@
+[package]
+name = "fazo_cli"
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "The fazo standalone interpreter, mirroring the official lua executable"
+
+
+[[bin]]
+name = "fazo"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4"
+fazo = { path = "../fazo" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+opcode-counts = ["fazo/opcode-counts"]
+gc-stress = ["fazo/gc-stress"]
+libm = ["fazo/libm"]
+
+[dev-dependencies]
+fazo_harness = { path = "../fazo_harness" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+too_many_arguments = "deny"
+

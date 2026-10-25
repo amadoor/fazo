@@ -1,0 +1,8 @@
+print(pcall(os.date, "!%Y-%m-%d %H:%M:%S", 0))
+print(pcall(os.date, "!%c|%x|%X", 0))
+print(pcall(os.date, "!%Ec", 0))
+print(pcall(os.date, "!%#d", 0))
+print(pcall(os.date, "!%e", 0))
+print(pcall(os.date, "!%+", 0))
+print(pcall(os.date, "!%#Y|%#y|%#m", 0))
+print(pcall(os.date, "!*t!", 0))

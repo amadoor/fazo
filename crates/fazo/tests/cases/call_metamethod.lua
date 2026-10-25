@@ -1,0 +1,7 @@
+local callable = setmetatable({}, {__call = function(self, a, b) return a + b, self end})
+local sum, self_ref = callable(2, 3)
+print(sum, self_ref == callable)
+print((callable(10, 20)))
+local nested = setmetatable({}, {__call = callable})
+print(pcall(nested, 1, 2))
+print(pcall(function() local x = setmetatable({}, {}) return x() end))

@@ -1,0 +1,13 @@
+local t = {10, 20, 30}
+table.insert(t, 40)
+table.insert(t, 1, 5)
+table.insert(t, 3, 15)
+print(#t, table.concat(t, ","))
+print(table.remove(t), table.remove(t, 1), #t)
+print(table.concat(t, " "))
+print(table.remove({}), #t)
+print(select('#', table.unpack({1, nil, 3})), table.unpack({1, 2, 3}, 2))
+print(table.unpack({1, 2, 3}, 3, 2))
+local p = table.pack(1, nil, 3)
+print(p.n, p[1], p[2], p[3])
+print(table.concat({}, "x"), table.concat({1, 2.5, "z"}, "-", 2, 3))

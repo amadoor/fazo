@@ -1,0 +1,4 @@
+include = [{ path = "local.toml", optional = true }]
+
+[alias]
+xtask = "run --quiet --package xtask --"

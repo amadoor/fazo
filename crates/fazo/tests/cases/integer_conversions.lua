@@ -1,0 +1,8 @@
+print(math.tointeger(3.0), math.tointeger(3.5), math.tointeger(2 ^ 63))
+print(3 | 0, 2 ^ 31 | 0, "10" + 0, "0x10" + 0, "1e2" + 0)
+print(math.floor(3.7), math.ceil(3.2), math.floor(-0.5), math.type(math.floor(2.0)))
+print((7 // 1.0) | 0, 0x7fffffffffffffff, 0xffffffffffffffff)
+print(tonumber("  12  "), tonumber("0x1p4"), tonumber("z", 36), tonumber("1e"), tonumber(""))
+print(tonumber("10", 2), tonumber("ff", 16), tonumber(" -0x10 "), tonumber("1 2"))
+print(pcall(function() return 2 ^ 63 | 0 end))
+print(pcall(function() return 1.5 // 1 | 0 end))

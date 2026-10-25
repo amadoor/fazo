@@ -1,0 +1,7 @@
+local g = string.gmatch("abc", "(")
+print(pcall(g))
+print(pcall(g))
+local h = string.gmatch("one two", "%a+")
+print(h(), h())
+print((pcall(string.gmatch, "x", "%")))
+print(h())

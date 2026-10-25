@@ -1,0 +1,6 @@
+print(math.type(1), math.type(1.0), math.type("1"), math.type(nil))
+print(1 + 1, 1 + 1.0, 2 * 3.0, 7 // 2, 7.0 // 2, 7 / 2, 2 ^ 2)
+print(math.type(2 ^ 2), math.type(7 // 2), math.type(7.0 // 2), math.type(7 / 1))
+print(3 % 2.0, 3.5 % 2, -3.5 % 2)
+print(0.1, 1 / 3, 123456.789e3, 1e2, 5 // 0.5)
+print(3 == 3.0, math.type(3 | 0), 1e308 * 10 == math.huge)

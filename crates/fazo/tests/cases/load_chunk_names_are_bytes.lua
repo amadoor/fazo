@@ -1,0 +1,5 @@
+print(load("x=", "=\255"))
+print(load("x=", "@\254.lua"))
+print(load("x = = 1", "=\255\254"))
+print(load("x=\255\n y"))
+print(type(load("x = 1", "=\255")))

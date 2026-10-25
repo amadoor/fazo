@@ -1,0 +1,1 @@
+print(counter * 2)

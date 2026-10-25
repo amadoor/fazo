@@ -1,0 +1,15 @@
+print(pcall(error))
+print(pcall(error, nil))
+print(pcall(error, 42))
+print(pcall(error, "msg", 0))
+print(pcall(error, "msg"))
+local function deep() error("deep", 2) end
+local function caller() deep() end
+print(pcall(caller))
+print(select("#", pcall(error)))
+local shown = setmetatable({}, {__tostring = function() return "custom" end})
+print(pcall(error, shown))
+print(pcall(function() error() end))
+print(pcall(function() error(true) end))
+print(pcall(function() return "fine", 2 end))
+print(pcall(pcall, error, "inner", 0))

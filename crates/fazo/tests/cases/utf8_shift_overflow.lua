@@ -1,0 +1,7 @@
+print(pcall(utf8.codepoint, "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 1, 1, true))
+print(pcall(utf8.len, "\xFE\x80\x80\x80\x80\x80\x80\x80\x80", 1, -1, true))
+print(utf8.len("\xF4\x90\x80\x80"))
+print(utf8.len("\xE0\x80\x80"))
+print(pcall(utf8.char, 0x7FFFFFFF))
+print(utf8.codepoint(utf8.char(0x7FFFFFFF), 1, 1, true))
+print(utf8.len("\xFC\x80\x80\x80\x80\x80", 1, -1, true))

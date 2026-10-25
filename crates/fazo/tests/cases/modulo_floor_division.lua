@@ -1,0 +1,7 @@
+print(7 // 2, -7 // 2, 7 // -2, -7 // -2)
+print(7 % 3, -7 % 3, 7 % -3, -7 % -3)
+print(7.5 // 2, -7.5 // 2, 7.5 % 2, -7.5 % 2, 7 % -2.5)
+print(5 % math.huge, -5 % math.huge, 5 % -math.huge)
+print(math.mininteger % -1, math.maxinteger % -2, math.mininteger // 3)
+print(-6 % 4, 6 % -4, -6 // 4, 6 // -4, 0 % -5)
+print(3.0 // 0.5, -3 % 0.5, 2 ^ 0.5 // 1)

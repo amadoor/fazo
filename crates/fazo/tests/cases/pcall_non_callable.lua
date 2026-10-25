@@ -1,0 +1,6 @@
+print(pcall(nil))
+print(pcall(42))
+print(pcall({}))
+print(pcall("str"))
+print(pcall(pcall))
+print(pcall(setmetatable({}, {__call = function(_, x) return "called " .. x end}), "ok"))

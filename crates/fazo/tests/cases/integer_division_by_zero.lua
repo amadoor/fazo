@@ -1,0 +1,7 @@
+print(pcall(function() return 1 // 0 end))
+print(pcall(function() return 1 % 0 end))
+print(1 // 0.0, -1 // 0.0, 1 % 0.0 ~= 1 % 0.0)
+print(pcall(function() local z = 0 return 5 // z end))
+print(pcall(function() return math.mininteger // 0 end))
+print(pcall(function() local z = 0 return 5 % z end))
+print(1.0 // 0, 0 // 0.0 ~= 0 // 0.0)

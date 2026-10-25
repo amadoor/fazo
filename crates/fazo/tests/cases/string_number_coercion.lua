@@ -1,0 +1,6 @@
+print("10" + 1, "10" * "2", "3" ^ 2, 10 .. "", 1.5 .. "|", -0.0 .. "")
+print("10" + 1.0, " 0x10 " * 1, "1e1" // 1, "7" // "2", "-3" % 5)
+print(#(1 .. 2), 2 .. 3 == "23", 1 .. 2 + 3)
+print(pcall(function() return "abc" + 1 end))
+print(pcall(function() return 10 < "9" end))
+print(math.type("10" + 1), math.type("10.0" + 1), math.type(10 .. ""))
