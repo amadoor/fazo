@@ -299,6 +299,8 @@ pub(crate) struct ProtoJit {
     pub(crate) retired_peak: Vec<ssa::PeakUnit>,
     /// Sites whose speculation failed; a recompile runs them through the interpreter's helpers.
     pub(crate) avoid: Vec<u32>,
+    /// Sites compiled before the interpreter reached them; they keep the helpers until they gain feedback.
+    pub(crate) insufficient: Vec<u32>,
     pub(crate) deopts: u32,
     pub(crate) deopt_sites: Vec<(u32, u32)>,
     pub(crate) peak_compiles: u32,

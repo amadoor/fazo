@@ -361,6 +361,7 @@ fn key(op: &Op, rep: Rep, map: &[Val]) -> Option<(Key, bool)> {
         Op::LoadUpval { closure, index } => (UPVALUE_KIND, [u64::from(*index), u64::from(matches!(closure, Closure::Root))], true),
         Op::LoadNode { node, .. } => (NODE_KIND, [u64::from(*node), 0], true),
         Op::LoadProto { .. } => (19, [0, 0], false),
+        Op::Requests => (21, [0, 0], false),
         Op::Builtin { function, .. } if function.is_pure() => (20, [*function as u64, 0], false),
         _ => return None,
     };

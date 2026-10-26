@@ -1,3 +1,5 @@
+use smallvec::{SmallVec, smallvec};
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub(crate) struct Val(pub(crate) u32);
 
@@ -251,7 +253,9 @@ pub(crate) enum Op {
     ShapeIs { table: Val, shape: u64 },
     LoadSlot { table: Val, slot: u32 },
     LoadProto { closure: Val },
-    LoadArray { table: Val, index: Val, state: StateId },
+    /// Read once before a loop that cannot resize the array.
+    ArrayBase { table: Val },
+    LoadArray { table: Val, base: Val, index: Val, state: StateId },
     GuardType { value: Val, ty: Type, state: StateId },
     GuardShape { table: Val, shape: u64, state: StateId },
     GuardHasMeta { table: Val, state: StateId },
@@ -276,7 +280,9 @@ pub(crate) enum Op {
     GuardAbsent { table: Val, bit: u8, state: StateId },
     CallLua { pc: u32, a: u8, b: u8, c: u8 },
     /// `weight` is the loop's length in bytecodes, the work one iteration stands for.
-    Safepoint { pc: u32, weight: u32, state: StateId },
+    Safepoint { pc: u32, weight: u32, requests: Val, state: StateId },
+    /// Fixed for the whole run, so a loop's poll can keep it in a register.
+    Requests,
 }
 
 impl Op {
@@ -288,7 +294,9 @@ impl Op {
 
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
         match self {
-            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Safepoint { .. } => {}
+            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
+            Op::Safepoint { requests, .. } => f(*requests),
+            Op::ArrayBase { table } => f(*table),
             Op::NewTable { fields, .. } => fields.iter().for_each(|&field| f(field)),
             Op::Materialize { object } => object.for_each_operand(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) | Op::Len { value, .. } => f(*value),
@@ -309,8 +317,9 @@ impl Op {
                 f(*no);
             }
             Op::LoadProto { closure } => f(*closure),
-            Op::LoadArray { table, index, .. } => {
+            Op::LoadArray { table, base, index, .. } => {
                 f(*table);
+                f(*base);
                 f(*index);
             }
             Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => f(*value),
@@ -344,7 +353,9 @@ impl Op {
 
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Val) -> Val) {
         match self {
-            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Safepoint { .. } => {}
+            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
+            Op::Safepoint { requests, .. } => *requests = f(*requests),
+            Op::ArrayBase { table } => *table = f(*table),
             Op::NewTable { fields, .. } => fields.iter_mut().for_each(|field| *field = f(*field)),
             Op::Materialize { object } => object.map_operands(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) => *value = f(*value),
@@ -370,8 +381,9 @@ impl Op {
                 *no = f(*no);
             }
             Op::LoadProto { closure } => *closure = f(*closure),
-            Op::LoadArray { table, index, .. } => {
+            Op::LoadArray { table, base, index, .. } => {
                 *table = f(*table);
+                *base = f(*base);
                 *index = f(*index);
             }
             Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => *value = f(*value),
@@ -462,14 +474,14 @@ impl Op {
     pub(crate) fn is_pure(&self) -> bool {
         match self {
             Op::Builtin { function, .. } => function.is_pure(),
-            _ => matches!(self, Op::Const(_) | Op::Unary(..) | Op::Binary(..) | Op::Pure(..) | Op::EqConst(..) | Op::Select { .. }),
+            _ => matches!(self, Op::Const(_) | Op::Unary(..) | Op::Binary(..) | Op::Pure(..) | Op::EqConst(..) | Op::Select { .. } | Op::Requests),
         }
     }
 
     pub(crate) fn is_removable(&self) -> bool {
         match self {
             Op::Builtin { function, .. } => !function.writes(),
-            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. }),
+            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. } | Op::ArrayBase { .. }),
         }
     }
 }
@@ -510,25 +522,25 @@ pub(crate) enum Term {
 }
 
 impl Term {
-    pub(crate) fn edges(&self) -> Vec<&Edge> {
+    pub(crate) fn edges(&self) -> SmallVec<[&Edge; 2]> {
         match self {
-            Term::Jump(edge) => vec![edge],
-            Term::Branch { then, other, .. } => vec![then, other],
+            Term::Jump(edge) => smallvec![edge],
+            Term::Branch { then, other, .. } => smallvec![then, other],
             Term::Switch { cases, .. } => cases.iter().map(|(_, edge)| edge).collect(),
-            Term::Open | Term::Return { .. } | Term::TailCall { .. } | Term::Deopt { .. } => Vec::new(),
+            Term::Open | Term::Return { .. } | Term::TailCall { .. } | Term::Deopt { .. } => SmallVec::new(),
         }
     }
 
-    pub(crate) fn edges_mut(&mut self) -> Vec<&mut Edge> {
+    pub(crate) fn edges_mut(&mut self) -> SmallVec<[&mut Edge; 2]> {
         match self {
-            Term::Jump(edge) => vec![edge],
-            Term::Branch { then, other, .. } => vec![then, other],
+            Term::Jump(edge) => smallvec![edge],
+            Term::Branch { then, other, .. } => smallvec![then, other],
             Term::Switch { cases, .. } => cases.iter_mut().map(|(_, edge)| edge).collect(),
-            Term::Open | Term::Return { .. } | Term::TailCall { .. } | Term::Deopt { .. } => Vec::new(),
+            Term::Open | Term::Return { .. } | Term::TailCall { .. } | Term::Deopt { .. } => SmallVec::new(),
         }
     }
 
-    pub(crate) fn successors(&self) -> Vec<BlockId> {
+    pub(crate) fn successors(&self) -> SmallVec<[BlockId; 2]> {
         self.edges().into_iter().map(|edge| edge.block).collect()
     }
 

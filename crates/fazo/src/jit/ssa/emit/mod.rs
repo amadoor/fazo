@@ -93,7 +93,7 @@ fn materialize_values(func: &Func) -> usize {
 }
 
 fn calls_directly(func: &Func) -> bool {
-    func.insts.iter().any(|inst| matches!(inst.op, Op::CallLua { .. }))
+    func.insts.iter().any(|inst| matches!(inst.op, Op::CallLua { .. })) || func.blocks.iter().any(|block| matches!(block.term, super::ir::Term::TailCall { .. }))
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -156,6 +156,9 @@ fn assemble<A: Asm>(func: &Func, env: &Env<'_>, points: Box<[DeoptPoint]>) -> Op
     asm.bind(generated.epilogue);
     asm.epilogue(frame, &floats, A::SCRATCH);
     let dispatch = asm.offset();
+    if ctx_size != 0 {
+        asm.store_imm(asm::Width::Q, A::SP, ctx_at + std::mem::offset_of!(JitCtx, requests) as i32, 0);
+    }
     for &(pc, label) in &generated.roots {
         asm.cmp_imm(A::SCRATCH, pc as i32);
         match env.tier_budget {

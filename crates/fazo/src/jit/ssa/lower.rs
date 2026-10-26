@@ -42,6 +42,7 @@ pub(crate) struct Env<'a> {
     pub(crate) calls: &'a [Vec<CallTarget>],
     pub(crate) unknown_calls: &'a [bool],
     pub(crate) call_depth_limit: u32,
+    pub(crate) vararg: bool,
     pub(crate) points: &'a [DeoptPoint],
     pub(crate) stress_exits: bool,
     pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
@@ -605,7 +606,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 let address = self.closure_address(self.one(closure));
                 Word::One(self.builder.ins().load(types::I64, self.heap_flags, address, offset_of!(crate::object::Closure, proto) as i32))
             }
-            Op::LoadArray { table, index, state } => self.load_array(table, index, state),
+            Op::LoadArray { table, base, index, state } => self.load_array((table, base), index, state),
             Op::GuardType { value: input, ty, state } => self.guard_type(input, ty, state, rep),
             Op::GuardShape { table, shape, state } => {
                 let same = self.shape_is(table, shape);
@@ -711,6 +712,11 @@ impl<'a, 'f> Lowering<'a, 'f> {
             Op::Safepoint { pc, state, .. } => {
                 self.safepoint(pc, state);
                 Word::None
+            }
+            Op::Requests => Word::One(self.ctx_load(self.pointer, offset_of!(JitCtx, requests))),
+            Op::ArrayBase { table } => {
+                let address = self.table_address(self.one(table));
+                Word::One(self.builder.ins().load(self.pointer, self.heap_flags, address, self.env.layout.array))
             }
         };
         self.set(value, word);
@@ -1209,14 +1215,17 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.scratch_load(0)
     }
 
-    fn load_array(&mut self, table: Val, index: Val, state: StateId) -> Word {
+    fn load_array(&mut self, (table, base): (Val, Val), index: Val, state: StateId) -> Word {
         let join = self.builder.create_block();
         let tag = self.builder.append_block_param(join, types::I64);
         let payload = self.builder.append_block_param(join, types::I64);
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
         let position = self.one(index);
-        let element = self.element_address(table, position);
+        let elements = self.one(base);
+        let previous = self.builder.ins().iadd_imm_s(position, -1);
+        let offset = self.builder.ins().imul_imm_s(previous, i64::from(VALUE_SIZE));
+        let element = self.builder.ins().iadd(elements, offset);
         let (found_tag, found) = self.load_pair(self.heap_flags, element, 0);
         let low = self.tag_of(found_tag);
         let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, low, NIL_TAG);

@@ -29,16 +29,34 @@ fn eliminate(func: &mut Func, entry: &Loop, counted: Counted) {
     let Some(accesses) = accesses(func, entry, counted) else {
         return;
     };
-    let mut ranged: Vec<Val> = Vec::new();
+    let allocates = allocates(func, entry);
+    let mut ranged: Vec<(Val, Val)> = Vec::new();
     for access in accesses {
         let table = invariant_table(func, entry, access.table);
         let state = func.op(access.value).state().unwrap_or(entry.entry_state);
-        if !ranged.contains(&table) {
-            add_range_guard(func, entry, table, (start, count, counted.step));
-            ranged.push(table);
-        }
-        func.inst_mut(access.value).op = Op::LoadArray { table, index: counted.index, state };
+        let base = match ranged.iter().find(|&&(known, _)| known == table) {
+            Some(&(_, base)) => base,
+            None => {
+                add_range_guard(func, entry, table, (start, count, counted.step));
+                let base = func.append(entry.preheader, Op::ArrayBase { table }, Type::NONE, Rep::Word);
+                ranged.push((table, base));
+                base
+            }
+        };
+        let base = if allocates { base_before(func, access.value, table) } else { base };
+        func.inst_mut(access.value).op = Op::LoadArray { table, base, index: counted.index, state };
     }
+}
+
+/// A collection step may move a table's array part, so such loops reload the address.
+fn allocates(func: &Func, entry: &Loop) -> bool {
+    entry.blocks.iter().any(|&block| func.block(block).insts.iter().any(|&value| matches!(func.op(value), Op::NewTable { .. } | Op::Materialize { .. })))
+}
+
+fn base_before(func: &mut Func, access: Val, table: Val) -> Val {
+    let block = func.definitions()[access.0 as usize].expect("an access lies in a block");
+    let position = func.block(block).insts.iter().position(|&value| value == access).unwrap_or(0);
+    super::insert(func, block, position, Op::ArrayBase { table }, Type::NONE, Rep::Word)
 }
 
 fn entry_values(func: &Func, entry: &Loop, counted: Counted) -> Option<(Val, Val)> {

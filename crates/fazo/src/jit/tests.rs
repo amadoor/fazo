@@ -510,6 +510,7 @@ fn compiled_ir_size(statements: usize) -> usize {
         call_depth_limit: 0,
         inline_caches: true,
         avoid: &[],
+        insufficient: &[],
         float_guess: false,
         forced: false,
         observed: &[],

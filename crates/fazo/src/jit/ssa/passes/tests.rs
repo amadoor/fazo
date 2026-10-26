@@ -93,6 +93,10 @@ fn child_proto(vm: &crate::Vm, main: crate::Value, index: usize) -> Ref<Proto> {
 
 /// The graph of the chunk's first function, built without feedback.
 fn built(source: &str) -> Func {
+    built_with(source, &[])
+}
+
+fn built_with(source: &str, insufficient: &[u32]) -> Func {
     let mut vm = crate::Vm::new(crate::Options::default());
     let chunk = vm.load(b"=test", source.as_bytes()).expect("the chunk loads");
     let reference = child_proto(&vm, chunk, 0);
@@ -104,6 +108,7 @@ fn built(source: &str) -> Func {
     let facts = build::Facts {
         inline_caches: true,
         avoid: &[],
+        insufficient,
         interned: &interned,
         proto_of: &proto_of,
         policy: inline::Policy::default(),
@@ -146,6 +151,20 @@ fn the_builder_leaves_a_call_without_feedback_as_a_call() {
     check::check(&func, false).expect("the built graph is valid");
     let ops = all_ops(&func);
     assert!(ops.iter().any(|op| matches!(op, Op::CallLua { .. })), "a call without callee feedback stays a call:\n{func}");
+}
+
+#[test]
+fn the_builder_deoptimizes_at_a_field_access_the_interpreter_never_reached() {
+    let soft = |func: &Func| {
+        func.blocks.iter().any(|block| matches!(block.term, Term::Deopt { state } if func.state(state).site == build::SOFT_SITE))
+    };
+    let func = built("local function f(t) return t.x + 1 end");
+    check::check(&func, false).expect("the built graph is valid");
+    assert!(soft(&func), "the access without feedback goes back to the interpreter:
+{func}");
+    let func = built_with("local function f(t) return t.x + 1 end", &[0]);
+    assert!(!soft(&func), "after that deopt, the next compile takes the helper:
+{func}");
 }
 
 #[test]
@@ -321,6 +340,56 @@ fn bounds_checks_on_the_loop_index_become_one_range_guard() {
         body.iter().any(|op| matches!(op, Op::LoadArray { index, .. } if *index == fixture.index)),
         "the access reads the array part without a bounds check"
     );
+}
+
+#[test]
+fn bounds_reads_the_array_base_once_in_the_preheader() {
+    let mut fixture = counted_loop();
+    hoist::run(&mut fixture.func);
+    bounds::run(&mut fixture.func);
+    let bases: Vec<Val> = fixture.func.block(fixture.preheader).insts.iter().copied().filter(|&value| matches!(fixture.func.op(value), Op::ArrayBase { .. })).collect();
+    assert_eq!(bases.len(), 1, "the preheader reads the array part's address");
+    let body = ops(&fixture.func, fixture.header);
+    assert!(body.iter().any(|op| matches!(op, Op::LoadArray { base, .. } if *base == bases[0])), "the access uses it");
+}
+
+#[test]
+fn bounds_rereads_the_array_base_in_a_loop_that_allocates() {
+    let mut fixture = counted_loop();
+    let s = state(&mut fixture.func, 6);
+    let header = fixture.header;
+    let table = fresh_table(&mut fixture.func, header, &[], s);
+    fixture.func.block_mut(header).insts.retain(|&value| value != table);
+    fixture.func.block_mut(header).insts.insert(0, table);
+    hoist::run(&mut fixture.func);
+    bounds::run(&mut fixture.func);
+    check::check(&fixture.func, false).expect("the graph stays valid");
+    let insts = fixture.func.block(header).insts.clone();
+    let load = insts.iter().position(|&value| matches!(fixture.func.op(value), Op::LoadArray { .. })).expect("the access reads the array part");
+    let Op::LoadArray { base, .. } = *fixture.func.op(insts[load]) else {
+        unreachable!();
+    };
+    assert_eq!(insts.get(load.wrapping_sub(1)), Some(&base), "a collection may move the array, so the address is read at the access");
+}
+
+#[test]
+fn hoisting_moves_the_request_flags_out_of_a_loop_without_calls_only() {
+    for calls in [false, true] {
+        let mut fixture = counted_loop();
+        let header = fixture.header;
+        let requests = fixture.func.add_inst(Op::Requests, Type::NONE, Rep::Word);
+        fixture.func.block_mut(header).insts.insert(0, requests);
+        let s = state(&mut fixture.func, 7);
+        let poll = fixture.func.add_inst(Op::Safepoint { pc: 3, weight: 2, requests, state: s }, Type::NONE, Rep::None);
+        fixture.func.block_mut(header).insts.insert(1, poll);
+        if calls {
+            let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1 }, Type::NONE, Rep::Word);
+            fixture.func.block_mut(header).insts.insert(2, call);
+        }
+        hoist::run(&mut fixture.func);
+        check::check(&fixture.func, false).expect("the graph stays valid");
+        assert_eq!(fixture.func.block(fixture.preheader).insts.contains(&requests), !calls, "a call may switch the running session");
+    }
 }
 
 #[test]

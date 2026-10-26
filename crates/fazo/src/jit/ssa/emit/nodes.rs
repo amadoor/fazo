@@ -105,7 +105,23 @@ impl<A: Asm> Gen<'_, A> {
                 self.closure_address(out, payload);
                 self.asm.load(Width::Q, out, out, offset_of!(crate::object::Closure, proto) as i32);
             }
-            Op::LoadArray { table, index, state } => self.load_array(value, *table, *index, *state),
+            Op::ArrayBase { table } => {
+                let payload = self.reg(*table);
+                let Def::Gp(out) = self.define(value) else {
+                    self.failed = true;
+                    return;
+                };
+                self.table_address(out, payload);
+                self.asm.load(Width::Q, out, out, self.env.layout.array);
+            }
+            Op::LoadArray { table, base, index, state } => self.load_array(value, (*table, *base), *index, *state),
+            Op::Requests => {
+                let Def::Gp(out) = self.define(value) else {
+                    self.failed = true;
+                    return;
+                };
+                self.ctx_load(out, offset_of!(JitCtx, requests));
+            }
             Op::GuardType { value: input, ty, state } => self.guard_type(value, *input, *ty, *state),
             Op::GuardShape { table, shape, state } => {
                 let payload = self.reg(*table);
@@ -198,7 +214,7 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.branch(Cond::Eq, exit);
             }
             Op::CallLua { pc, a, b, c } => self.call_lua(value, *pc as usize, (*a, *b, *c)),
-            Op::Safepoint { pc, weight, state } => self.safepoint(*pc, *weight, *state),
+            Op::Safepoint { pc, weight, requests, state } => self.safepoint(*pc, *weight, *requests, *state),
         }
     }
 
@@ -781,8 +797,9 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(done);
     }
 
-    fn load_array(&mut self, value: Val, table: Val, index: Val, state: StateId) {
+    fn load_array(&mut self, value: Val, (table, base): (Val, Val), index: Val, state: StateId) {
         let payload = self.reg(table);
+        let elements = self.reg(base);
         let position = self.reg(index);
         let key = self.pair(index);
         let address = self.temp();
@@ -792,7 +809,8 @@ impl<A: Asm> Gen<'_, A> {
         };
         let saves = self.saves(&[]);
         let join = self.asm.new_label();
-        self.element_address(address, payload, position);
+        self.asm.shl_imm(address, position, 4);
+        self.asm.alu(Alu::Add, address, address, elements);
         self.asm.load(Width::Q, tag, address, -VALUE_SIZE);
         self.asm.load(Width::Q, word, address, -VALUE_SIZE + PAYLOAD);
         self.asm.cmp_byte(tag, NIL_TAG);
@@ -803,14 +821,6 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.branch(Cond::Eq, exit);
         self.scratch_load(0, tag, word);
         self.asm.bind(join);
-    }
-
-    /// Leaves the address one past the element, so the element is at `-VALUE_SIZE`.
-    fn element_address(&mut self, dst: u8, table: u8, index: u8) {
-        self.table_address(dst, table);
-        self.asm.load(Width::Q, dst, dst, self.env.layout.array);
-        self.asm.shl_imm(A::SCRATCH, index, 4);
-        self.asm.alu(Alu::Add, dst, dst, A::SCRATCH);
     }
 
     fn guard_type(&mut self, value: Val, input: Val, ty: Type, state: StateId) {
@@ -895,13 +905,16 @@ impl<A: Asm> Gen<'_, A> {
             self.failed = true;
             return;
         };
+        let string = self.string_key(key);
+        let probe = string.map(|_| (self.temp(), self.temp(), self.temp()));
         let saves = self.saves(&[]);
         let join = self.asm.new_label();
         let slow = self.asm.new_label();
+        let strings = if string.is_some() { self.asm.new_label() } else { slow };
         if let Some((index, is_int)) = integer {
             if let Some(key_tag) = is_int {
                 self.asm.cmp_byte(key_tag, INT_TAG);
-                self.asm.branch(Cond::Ne, slow);
+                self.asm.branch(Cond::Ne, strings);
             }
             self.inside(address, payload, index, tag, slow);
             self.asm.load(Width::Q, address, address, self.env.layout.array);
@@ -909,6 +922,17 @@ impl<A: Asm> Gen<'_, A> {
             self.asm.alu(Alu::Add, address, address, tag);
             self.asm.load(Width::Q, tag, address, 0);
             self.asm.load(Width::Q, word, address, PAYLOAD);
+            self.asm.cmp_byte(tag, NIL_TAG);
+            self.asm.branch(Cond::Ne, join);
+            if string.is_some() {
+                self.asm.jump(slow);
+            }
+        }
+        if let (Some((key_tag, key_word)), Some((entry, key, node))) = (string, probe) {
+            self.asm.bind(strings);
+            self.string_node((payload, key_tag, key_word), [address, entry, tag, key, node], slow);
+            self.asm.load(Width::Q, tag, node, NODE_VALUE);
+            self.asm.load(Width::Q, word, node, NODE_VALUE + PAYLOAD);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
         }
@@ -919,6 +943,61 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.branch(Cond::Eq, exit);
         self.scratch_load(0, tag, word);
         self.asm.bind(join);
+    }
+
+    fn string_key(&mut self, key: Val) -> Option<(u8, u8)> {
+        let may_be_string = !self.func.ty(key).intersect(Type::of_tag(STRING_TAG)).is_none();
+        if self.func.rep(key) != Rep::Boxed || !may_be_string || self.is_const(key).is_some() {
+            return None;
+        }
+        Some(self.pair_regs(key))
+    }
+
+    /// Follows LuaJIT's `asm_href` (lj_asm.c).
+    /// The key is copied first, since the result registers may share the key's.
+    fn string_node(&mut self, (table, key_tag, key_word): (u8, u8, u8), [address, entry, index, key, node]: [u8; 5], slow: Label) {
+        let layout = self.env.layout;
+        let walk = self.asm.new_label();
+        let follow = self.asm.new_label();
+        let found = self.asm.new_label();
+        self.asm.cmp_byte(key_tag, STRING_TAG);
+        self.asm.branch(Cond::Ne, slow);
+        self.asm.mov(key, key_word);
+        self.table_address(address, table);
+        self.asm.load(Width::B, A::SCRATCH, address, layout.shaped);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Ne, slow);
+        self.asm.zext32(entry, key);
+        self.asm.alu_imm(Alu::Mul, entry, entry, std::mem::size_of::<crate::heap::StringKey>() as i32);
+        self.ctx_load(A::SCRATCH, offset_of!(JitCtx, vm));
+        self.asm.add_mem(entry, A::SCRATCH, layout.string_keys);
+        self.asm.load(Width::B, A::SCRATCH, entry, offset_of!(crate::heap::StringKey, interned) as i32);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Eq, slow);
+        self.asm.load(Width::Q, index, address, layout.nodes_len);
+        self.asm.alu_imm(Alu::Sub, index, index, 1);
+        self.asm.load(Width::Q, A::SCRATCH, entry, offset_of!(crate::heap::StringKey, hash) as i32);
+        self.asm.alu(Alu::And, index, index, A::SCRATCH);
+        self.asm.load(Width::Q, entry, address, layout.nodes);
+        self.asm.bind(walk);
+        self.asm.alu_imm(Alu::Mul, node, index, crate::table::offsets::NODE_SIZE as i32);
+        self.asm.alu(Alu::Add, node, node, entry);
+        self.asm.load(Width::B, A::SCRATCH, node, NODE_KEY);
+        self.asm.cmp_imm(A::SCRATCH, i32::from(STRING_TAG));
+        self.asm.branch(Cond::Ne, follow);
+        self.asm.load(Width::Q, A::SCRATCH, node, NODE_KEY + PAYLOAD);
+        self.asm.cmp(A::SCRATCH, key);
+        self.asm.branch(Cond::Ne, follow);
+        self.asm.load(Width::B, A::SCRATCH, node, crate::table::offsets::NODE_DEAD as i32);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Eq, found);
+        self.asm.bind(follow);
+        self.asm.load(Width::W, index, node, crate::table::offsets::NODE_NEXT as i32);
+        self.asm.cmp_imm(index, 0);
+        self.asm.branch(Cond::Eq, slow);
+        self.asm.alu_imm(Alu::Sub, index, index, 1);
+        self.asm.jump(walk);
+        self.asm.bind(found);
     }
 
     /// Jumps to `slow` past the array part.
@@ -936,17 +1015,20 @@ impl<A: Asm> Gen<'_, A> {
         let payload = self.reg(object);
         let key_pair = self.pair(key);
         let integer = self.integer_key(key);
+        let string = self.string_key(key);
         let address = self.temp();
         let element = self.temp();
+        let probe = string.map(|_| (self.temp(), self.temp(), self.temp()));
         let saves = self.saves(&[]);
         let done = self.asm.new_label();
         let slow = self.asm.new_label();
+        let strings = if string.is_some() { self.asm.new_label() } else { slow };
         if let Some((index, is_int)) = integer {
             let layout = self.env.layout;
             let store = self.asm.new_label();
             if let Some(key_tag) = is_int {
                 self.asm.cmp_byte(key_tag, INT_TAG);
-                self.asm.branch(Cond::Ne, slow);
+                self.asm.branch(Cond::Ne, strings);
             }
             self.inside(address, payload, index, element, slow);
             self.asm.shl_imm(element, element, 4);
@@ -960,6 +1042,18 @@ impl<A: Asm> Gen<'_, A> {
             self.asm.branch(Cond::Ne, slow);
             self.asm.bind(store);
             self.store_pair(value, element, 0);
+            if self.may_collect(stored) {
+                self.barrier(payload, value, address, &saves);
+            }
+            self.asm.jump(done);
+        }
+        if let (Some((key_tag, key_word)), Some((entry, key, node))) = (string, probe) {
+            self.asm.bind(strings);
+            self.string_node((payload, key_tag, key_word), [address, entry, element, key, node], slow);
+            self.asm.load(Width::B, A::SCRATCH, node, NODE_VALUE);
+            self.asm.cmp_imm(A::SCRATCH, i32::from(NIL_TAG));
+            self.asm.branch(Cond::Eq, slow);
+            self.store_pair(value, node, NODE_VALUE);
             if self.may_collect(stored) {
                 self.barrier(payload, value, address, &saves);
             }
@@ -1150,7 +1244,7 @@ impl<A: Asm> Gen<'_, A> {
         let data = self.func.state(state);
         let pc = data.frames.first().map_or(data.pc, |frame| frame.caller_pc);
         self.save(&saves);
-        self.store_state(state);
+        self.store_state_for_step(state);
         self.call_c(self.addresses.new_table, &[Src::R(A::CTX), Src::I(i64::from(pc)), Src::I(i64::from(hash_log)), Src::I(i64::from(top))]);
         self.asm.mov(out, A::result());
         self.restore(&saves);
@@ -1173,6 +1267,17 @@ impl<A: Asm> Gen<'_, A> {
         let quiet = self.exit(after);
         self.asm.cmp_imm(ran, 0);
         self.asm.branch(Cond::Ne, quiet);
+    }
+
+    /// Stored only when the allocation debt is paid and a collection step runs.
+    fn store_state_for_step(&mut self, state: StateId) {
+        let quiet = self.asm.new_label();
+        self.ctx_load(A::SCRATCH, offset_of!(JitCtx, vm));
+        self.asm.load(Width::Q, A::SCRATCH, A::SCRATCH, offset_of!(crate::Vm, heap.gc.debt) as i32);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Gt, quiet);
+        self.store_state(state);
+        self.asm.bind(quiet);
     }
 
     fn materialize(&mut self, value: Val, object: &Virtual) {
@@ -1235,7 +1340,7 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// Charges the loop's length to the budget as Baseline does at a back edge; running out enters the tier check with state written back.
-    fn safepoint(&mut self, pc: u32, weight: u32, state: StateId) {
+    fn safepoint(&mut self, pc: u32, weight: u32, requests: Val, state: StateId) {
         let Some(&(_, osr)) = self.func.osr.iter().find(|&&(at, _)| at == pc) else {
             return;
         };
@@ -1245,8 +1350,8 @@ impl<A: Asm> Gen<'_, A> {
         let next = self.asm.new_label();
         let slow = self.asm.new_label();
         if !self.env.stress_exits {
-            self.ctx_load(A::SCRATCH, offset_of!(JitCtx, requests));
-            self.asm.cmp_mem_byte(A::SCRATCH, 0, 0);
+            let flags = self.reg(requests);
+            self.asm.cmp_mem_byte(flags, 0, 0);
             match (charge, cell) {
                 (Some(address), Some(cell)) => {
                     self.asm.branch(Cond::Ne, slow);

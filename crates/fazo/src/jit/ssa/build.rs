@@ -19,9 +19,13 @@ use crate::{
     },
 };
 
+/// Set on sites that deopted for missing feedback, so their speculation is kept.
+pub(crate) const SOFT_SITE: u32 = 1 << 30;
+
 pub(crate) struct Facts<'a> {
     pub(crate) inline_caches: bool,
     pub(crate) avoid: &'a [u32],
+    pub(crate) insufficient: &'a [u32],
     pub(crate) interned: &'a dyn Fn(LuaValue) -> bool,
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
     pub(crate) policy: inline::Policy,
@@ -261,6 +265,21 @@ impl<'a> Builder<'a, '_> {
 
     fn forget(&mut self) {
         self.regs.iter_mut().for_each(|reg| *reg = Reg::Mem);
+    }
+
+    fn lacks_feedback(&self, frame: &Frame<'_>, pc: usize) -> bool {
+        let unreached = matches!(frame.proto.exec.feedback.get(pc), None | Some(InlineCache::Uninitialized));
+        frame.site.is_none() && self.facts.inline_caches && unreached && !self.facts.insufficient.contains(&(pc as u32))
+    }
+
+    /// Follows Maglev's insufficient-feedback deopt (src/maglev/maglev-graph-builder.cc).
+    fn soft_deopt(&mut self, frame: &Frame<'_>, pc: usize) -> usize {
+        let shared = self.state_at(frame, pc);
+        let mut soft = self.func.state(shared).clone();
+        soft.site = pc as u32 | SOFT_SITE;
+        let state = self.func.add_state(soft);
+        self.end(Term::Deopt { state });
+        pc + 1
     }
 
     fn speculates(&self, frame: &Frame<'_>, pc: usize) -> bool {
@@ -834,7 +853,8 @@ impl<'a> Builder<'a, '_> {
             return;
         }
         let state = self.state_at(frame, target);
-        self.effect(Op::Safepoint { pc: target as u32, weight: (pc + 1 - target) as u32, state });
+        let requests = self.emit(Op::Requests, Type::NONE, Rep::Word);
+        self.effect(Op::Safepoint { pc: target as u32, weight: (pc + 1 - target) as u32, requests, state });
     }
 
     fn conditional(&mut self, frame: &mut Frame<'a>, pc: usize, cond: Val, k: bool) -> usize {
@@ -1010,6 +1030,9 @@ impl<'a> Builder<'a, '_> {
         if !self.speculates(frame, pc) {
             return self.fallback(frame, pc);
         }
+        if self.lacks_feedback(frame, pc) {
+            return self.soft_deopt(frame, pc);
+        }
         let state = self.state_at(frame, pc);
         let value = self.field_value(frame, pc, object, c, state);
         self.write(frame, a, value);
@@ -1022,6 +1045,10 @@ impl<'a> Builder<'a, '_> {
         if let [method] = methods.as_slice() {
             let table = self.table_of(object, state);
             return self.method_chain(table, method, state);
+        }
+        if methods.len() > 1 {
+            let table = self.table_of(object, state);
+            return self.polymorphic_method(table, &methods, state);
         }
         let entries = self.field_feedback(frame, pc);
         match entries.as_slice() {
@@ -1083,6 +1110,37 @@ impl<'a> Builder<'a, '_> {
         self.emit(Op::GuardNotNil { value, state }, Type::ANY.without(Type::NIL), Rep::Boxed)
     }
 
+    fn polymorphic_method(&mut self, table: Val, methods: &[MethodEntry], state: StateId) -> Val {
+        let join = self.func.new_block();
+        let result = self.func.add_param(join, Type::ANY, Rep::Boxed);
+        for method in methods {
+            let next = self.func.new_block();
+            let receiver = self.emit(Op::ShapeIs { table, shape: method.receiver.packed() }, Type::BOOL, Rep::Bool);
+            self.branch_or(receiver, next);
+            let metatable = self.emit(Op::GuardHasMeta { table, state }, Type::TABLE, Rep::Payload);
+            let shaped = self.emit(Op::ShapeIs { table: metatable, shape: method.metatable_shape.packed() }, Type::BOOL, Rep::Bool);
+            self.branch_or(shaped, next);
+            let index = self.emit(Op::LoadSlot { table: metatable, slot: method.index_slot }, Type::ANY, Rep::Boxed);
+            let found = self.emit(Op::EqConst(index, Const::Gc { tag: 5, payload: method.class.packed() }), Type::BOOL, Rep::Bool);
+            self.branch_or(found, next);
+            let class = self.constant(Const::Gc { tag: 5, payload: method.class.packed() });
+            self.effect(Op::GuardShape { table: class, shape: method.class_shape.packed(), state });
+            let value = self.emit(Op::LoadSlot { table: class, slot: method.class_slot }, Type::ANY, Rep::Boxed);
+            let value = self.emit(Op::GuardNotNil { value, state }, Type::ANY.without(Type::NIL), Rep::Boxed);
+            self.end(Term::Jump(Edge { block: join, args: vec![value] }));
+            self.current = Some(next);
+        }
+        self.end(Term::Deopt { state });
+        self.current = Some(join);
+        result
+    }
+
+    fn branch_or(&mut self, cond: Val, other: BlockId) {
+        let hit = self.func.new_block();
+        self.end(Term::Branch { cond, then: Edge::to(hit), other: Edge::to(other) });
+        self.current = Some(hit);
+    }
+
     fn field_feedback(&self, frame: &Frame<'_>, pc: usize) -> Vec<Entry> {
         if !self.facts.inline_caches {
             return Vec::new();
@@ -1100,6 +1158,9 @@ impl<'a> Builder<'a, '_> {
     fn self_op(&mut self, frame: &mut Frame<'a>, pc: usize, a: u8, b: u8, c: u8) -> usize {
         if !self.speculates(frame, pc) {
             return self.fallback(frame, pc);
+        }
+        if self.lacks_feedback(frame, pc) {
+            return self.soft_deopt(frame, pc);
         }
         let object = self.read(frame, b);
         let state = self.state_at(frame, pc);
@@ -1142,6 +1203,9 @@ impl<'a> Builder<'a, '_> {
     fn set_field(&mut self, frame: &mut Frame<'a>, pc: usize, a: u8, b: u8, value: (u8, bool)) -> usize {
         if !self.speculates(frame, pc) {
             return self.fallback(frame, pc);
+        }
+        if self.lacks_feedback(frame, pc) {
+            return self.soft_deopt(frame, pc);
         }
         let object = self.read(frame, a);
         let entries: Vec<Entry> = self.field_feedback(frame, pc).into_iter().filter(|entry| entry.slot != ABSENT).collect();

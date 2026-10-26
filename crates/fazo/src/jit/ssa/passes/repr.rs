@@ -61,7 +61,8 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
         Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::GuardNode { .. } | Op::ShapeIs { .. } | Op::GuardShape { .. } | Op::GuardHasMeta { .. } | Op::GuardNoMeta { .. } | Op::GuardAbsent { .. } => {
             vec![payload]
         }
-        Op::LoadArray { .. } => vec![payload, int],
+        Op::ArrayBase { .. } => vec![payload],
+        Op::LoadArray { .. } => vec![payload, None, int],
         Op::GuardRange { .. } => vec![payload, int, int],
         Op::StoreSlot { .. } | Op::StoreNode { .. } => vec![payload, boxed],
         Op::AddSlot { .. } => vec![payload, boxed, boxed],

@@ -733,7 +733,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             Term::Branch { cond, then, other } => self.branch(*cond, then, other),
             Term::Switch { code, cases } => self.switch(*code, cases),
             Term::Return { pc, first, count, close } => self.ret(*pc, *first, *count, *close),
-            Term::TailCall { pc, .. } => self.tail_call(*pc),
+            Term::TailCall { pc, a, b, k } => self.tail_call(*pc, (*a, *b, *k)),
             Term::Deopt { state } => {
                 let exit = self.exit(*state);
                 self.asm.jump(exit);

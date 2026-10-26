@@ -87,12 +87,16 @@ pub(crate) fn entry_state_for(func: &mut Func, entry: &Loop, state: StateId) -> 
     func.add_state(moved)
 }
 
+/// Kept in a register across calls, where a save around each call would cost more.
 fn movable(func: &Func, value: Val, invariant: &[bool], clobbers: &Clobbers, every_iteration: bool) -> bool {
     let op = func.op(value);
     let mut operands_invariant = true;
     op.for_each_operand(|operand| operands_invariant &= invariant[operand.0 as usize]);
     if !operands_invariant {
         return false;
+    }
+    if matches!(op, Op::Requests) {
+        return !clobbers.calls;
     }
     if op.is_pure() {
         return true;

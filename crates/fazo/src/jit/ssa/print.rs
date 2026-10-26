@@ -180,7 +180,8 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::ShapeIs { table, shape } => format!("shape.is {} {shape:x}", v(table)),
         Op::LoadSlot { table, slot } => format!("load.slot {} #{slot}", v(table)),
         Op::LoadProto { closure } => format!("load.proto {}", v(closure)),
-        Op::LoadArray { table, index, state } => format!("load.array {} [{}] s{}", v(table), v(index), state.0),
+        Op::ArrayBase { table } => format!("array.base {}", v(table)),
+        Op::LoadArray { table, base, index, state } => format!("load.array {} {} [{}] s{}", v(table), v(base), v(index), state.0),
         Op::GuardType { value, ty, state } => format!("guard.type {} {ty} s{}", v(value), state.0),
         Op::GuardShape { table, shape, state } => format!("guard.shape {} {shape:x} s{}", v(table), state.0),
         Op::GuardHasMeta { table, state } => format!("guard.meta {} s{}", v(table), state.0),
@@ -215,6 +216,7 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::Materialize { object } => format!("materialize {}", virtual_text(object)),
         Op::GuardAbsent { table, bit, state } => format!("guard.absent {} bit{bit} s{}", v(table), state.0),
         Op::CallLua { pc, a, b, c } => format!("call @{pc} r{a} b{b} c{c}"),
-        Op::Safepoint { pc, weight, state } => format!("safepoint @{pc} x{weight} s{}", state.0),
+        Op::Safepoint { pc, weight, requests, state } => format!("safepoint @{pc} x{weight} {} s{}", v(requests), state.0),
+        Op::Requests => "requests".to_string(),
     }
 }

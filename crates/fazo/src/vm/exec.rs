@@ -2786,7 +2786,7 @@ mod memory_tests {
 }
 
 /// Follows `buildhiddenargs` in ltm.c. The two ranges do not overlap, since `moved` is past every argument.
-fn hide_arguments(stack: &mut [Value], base: usize, moved: usize, params: usize) {
+pub(crate) fn hide_arguments(stack: &mut [Value], base: usize, moved: usize, params: usize) {
     let stack = &mut stack[base - 1..=moved + params];
     let offset = moved - base;
     for index in 0..=params {

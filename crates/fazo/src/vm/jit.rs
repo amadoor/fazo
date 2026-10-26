@@ -501,7 +501,7 @@ impl Vm {
         let calls = self.jit_call_targets(proto);
         let estimate = self.jit_estimate(proto, &calls, tier);
         let executed = self.heap.protos.live(proto).jit.peak_executed;
-        let charges = tier == Tier::Optimizing && self.jit_ceiling() == Tier::Peak && self.jit_forced().is_none();
+        let charges = tier == Tier::Optimizing && self.jit_ceiling() == Tier::Peak && self.jit_forced().is_none() && self.jit_estimate(proto, &calls, Tier::Peak).gain > 0;
         let judged = self.options.jit_policy.peak.estimate_payoff && self.jit_forced().is_none();
         if judged && !estimate.pays_after(executed) {
             self.jit_decline_peak(proto, estimate);
@@ -510,6 +510,7 @@ impl Vm {
         let has_baseline = self.heap.protos.live(proto).jit.baseline.is_some();
         self.jit_trace_sites(proto);
         let avoid = self.heap.protos.live(proto).jit.avoid.clone();
+        let insufficient = self.heap.protos.live(proto).jit.insufficient.clone();
         let observed = self.heap.protos.live(proto).jit.observed.clone();
         let nodes = self.jit_node_hints(proto);
         let running_floats = if at.is_some() { self.jit_running_floats(proto) } else { Vec::new() };
@@ -534,6 +535,7 @@ impl Vm {
             call_depth_limit: JIT_CALL_DEPTH,
             inline_caches: !facts_stress.inline_caches_off,
             avoid: &avoid,
+            insufficient: &insufficient,
             float_guess: self.heap.protos.live(proto).jit.float_guess,
             forced: self.jit_forced().is_some(),
             observed: &observed,
@@ -626,6 +628,9 @@ impl Vm {
         if self.options.jit_trace {
             self.jit_trace(proto, &format!("deoptimize peak at pc {}", point.site));
         }
+        if point.site & crate::jit::ssa::build::SOFT_SITE != 0 {
+            return self.jit_soft_deopt(proto, point.site & !crate::jit::ssa::build::SOFT_SITE);
+        }
         let kinds = point.frames.is_empty().then(|| self.jit_observed_kinds(ctx, proto, point.site)).flatten();
         let function = self.heap.protos.live_mut(proto);
         function.jit.float_guess |= kinds.is_some_and(|kinds| kinds & KIND_FLOAT != 0);
@@ -649,6 +654,21 @@ impl Vm {
         if let Some(tier) = self.jit_forced().filter(|_| forced) {
             self.jit_compile(proto, tier);
         }
+        -EXIT_RELOAD
+    }
+
+    /// Retiers on a fresh budget after an insufficient-feedback deopt, as V8 does.
+    fn jit_soft_deopt(&mut self, proto: Ref<Proto>, site: u32) -> i64 {
+        let divisor = self.options.jit_stress.threshold_divisor;
+        let wait = self.options.jit_policy.peak.budget(0, divisor);
+        let function = self.heap.protos.live_mut(proto);
+        function.jit.insufficient.push(site);
+        function.jit.primed = false;
+        if let Some(unit) = function.jit.unit.take() {
+            function.jit.retired_peak.push(*unit);
+        }
+        self.jit_peak_wait(proto, wait);
+        self.jit_reveal(proto);
         -EXIT_RELOAD
     }
 
@@ -1317,33 +1337,41 @@ impl Vm {
     ) -> Control {
         let proto = self.heap.closures.live(closure).proto;
         let function = self.heap.protos.live(proto);
-        let entry = function.jit.code().filter(|_| !function.is_vararg);
+        let vararg = function.is_vararg;
+        let entry = match vararg {
+            false => function.jit.code(),
+            true if function.vararg_table => None,
+            true => function.jit.code_at(VARARG_BODY),
+        };
         let Some(entry) = entry else {
             return self.jit_call_lua(ctx, pc, function_slot, closure, argument_count, c);
         };
         let constants = function.constants.as_ptr();
         let num_params = usize::from(function.num_params);
         let max_stack = usize::from(function.max_stack);
-        let base = function_slot + 1;
+        let function_base = function_slot + 1;
         let frames = self.frame_count();
         let thread = self.current_thread;
         let wanted = i32::from(c) - 1;
 
-        if let Err(error) = self.check_stack(base + argument_count + max_stack) {
+        if let Err(error) = self.check_stack(function_base + argument_count + max_stack + usize::from(vararg)) {
             ctx.fail(error);
             return Control::Error;
         }
-        self.ensure_stack(base + super::REGISTER_SPAN);
+        self.ensure_stack(function_base + super::REGISTER_SPAN);
         self.count_call_for_feedback(proto);
         let state = self.thread_mut();
         for index in argument_count..num_params {
-            state.stack[base + index] = Value::Nil;
+            state.stack[function_base + index] = Value::Nil;
         }
         if let Some(crate::object::Frame::Lua(caller)) = state.frames.last_mut() {
             caller.set_pc(pc + 1);
         }
-        state.frames.push(crate::object::Frame::Lua(crate::object::LuaFrame::called(closure, base, wanted, 0)));
-        let registers = state.stack.as_mut_ptr().wrapping_add(base);
+        let frame = crate::object::LuaFrame::called(closure, function_base, wanted, 0);
+        let frame = if vararg { frame.with_arguments(argument_count) } else { frame };
+        state.frames.push(crate::object::Frame::Lua(frame));
+        let base = if vararg { self.jit_hide_arguments(function_base, num_params, max_stack) } else { function_base };
+        let registers = self.thread_mut().stack.as_mut_ptr().wrapping_add(base);
         let mut callee = JitCtx {
             requests: ctx.requests,
             registers,
@@ -1356,7 +1384,7 @@ impl Vm {
             closure,
             base,
             proto,
-            direct_results: wanted,
+            direct_results: if vararg { NOT_DIRECT } else { wanted },
             ret_offset: -(std::mem::size_of::<Value>() as i64),
             thread: ctx.thread,
             thread_ref: ctx.thread_ref,
@@ -1364,7 +1392,7 @@ impl Vm {
             error: ctx.error,
         };
         self.jit.call_depth += 1;
-        let code = crate::jit::enter(entry, &mut callee, 0);
+        let code = crate::jit::enter(entry, &mut callee, if vararg { VARARG_BODY } else { 0 });
         self.jit.call_depth -= 1;
         match code {
             EXIT_RETURNED => {
@@ -1379,6 +1407,19 @@ impl Vm {
             }
             _ => Control::Reload,
         }
+    }
+
+    /// Runs `VARARGPREP` here as the interpreter does, so compiled code starts past it.
+    fn jit_hide_arguments(&mut self, base: usize, params: usize, max_stack: usize) -> usize {
+        let total = self.top_frame().expect("the callee's frame was just pushed").argument_count().max(params);
+        let moved = base + total + 1;
+        self.ensure_stack(moved + super::REGISTER_SPAN.max(max_stack));
+        let thread = self.thread_mut();
+        super::exec::hide_arguments(&mut thread.stack, base, moved, params);
+        let frame = super::window::top_lua_frame(&mut thread.frames);
+        frame.base = moved;
+        frame.set_hidden(params as u8, total - params);
+        moved
     }
 
     fn jit_call_lua(
@@ -1892,6 +1933,8 @@ const ARITH_OPS: [crate::instruction::ArithOp; 12] = [
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CODE_BUDGET: usize = 256 * 1024 * 1024;
 
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const VARARG_BODY: usize = 1;
 /// A forced Peak compile waits for call feedback, so it builds the code normal tiering would.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const FORCED_PEAK_WAIT: i64 = crate::jit::ENTRY_CHARGE as i64 * super::ic::FEEDBACK_CALLS as i64;

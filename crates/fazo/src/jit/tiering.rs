@@ -17,29 +17,37 @@ const OPTIMIZING_IR_PER_UNIT: i64 = 131_031;
 const OPTIMIZING_IR_PER_CLASS: Sizes = [69_677, 30_045, 8_188, 76_111, 0, 0];
 /// Peak compile Ir per byte of the prototype's Optimizing code.
 const PEAK_IR_PER_OPTIMIZING_BYTE: i64 = 3_096;
-/// Peak's savings over Optimizing, as a share of its savings over Baseline.
-const PEAK_OVER_OPTIMIZING_PERCENT: i64 = 7;
 const LOOP_WEIGHT: i64 = 8;
 const MAX_DEPTH: u32 = 3;
 
-/// Ir saved per execution against Baseline, measured per operation.
+/// Measured with `cargo xtask perf`.
 const ARITHMETIC_GAIN: i64 = 9;
 const MOVE_GAIN: i64 = 4;
 const UPVALUE_GAIN: i64 = 7;
-const COMPARE_GAIN: i64 = 6;
-const STORE_GAIN: i64 = 12;
+const COMPARE_GAIN: i64 = 8;
+const STORE_GAIN: i64 = 16;
 const GLOBAL_GAIN: i64 = 30;
 const LEN_GAIN: i64 = 90;
-const LOAD_COST: i64 = 11;
+const LOAD_GAIN: i64 = 6;
+/// Only an empty constructor allocates inline.
+const NEW_TABLE_GAIN: i64 = 200;
 const HELPER_COST: i64 = 5;
 const CONCAT_COST: i64 = 180;
 const VARARG_COST: i64 = 1100;
 /// A non-integer key goes through the value helper, where Baseline probes the hash part inline.
 const GENERIC_TABLE_COST: i64 = 20;
+/// Optimizing tests a polymorphic method's entries one after another.
+const POLYMORPHIC_METHOD_COST: i64 = 150;
+/// Optimizing stores and reloads every register below a call's base; Baseline keeps them in the frame.
+const CALL_REGISTER_COST: i64 = 8;
+/// An unseen shape deoptimizes and recompiles; Baseline's chain does not.
+const POLYMORPHIC_FIELD_COST: i64 = 40;
 /// A call through the call helper costs more than Baseline's.
 const HELPER_CALL_COST: i64 = 620;
-/// A tail call leaves Peak code through its helper.
+const DIRECT_CALL_GAIN: i64 = 40;
+/// Unknown tail callees exit through the helper.
 const TAIL_CALL_COST: i64 = 1000;
+const DIRECT_TAIL_CALL_GAIN: i64 = 50;
 /// Inlining saves Baseline's call and return.
 const INLINED_CALL_GAIN: i64 = 170;
 /// An inlined builtin saves Baseline's native call.
@@ -134,6 +142,7 @@ impl Estimate {
 /// Inlined callees' bytecodes add to compile cost but not to executed work.
 pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>], lookup: &Lookup<'_>, target: crate::Tier) -> Estimate {
     let depths = super::sites::loop_depths(proto);
+    let peak = target == crate::Tier::Peak;
     let mut gain: i64 = 0;
     let mut weight: i64 = 0;
     let mut sizes: Sizes = [0; CLASSES];
@@ -141,25 +150,35 @@ pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>], lookup: &Lookup
         let scale = depth_weight(depths[pc]);
         sizes[class(instruction)] += 1;
         let site_gain = match call_inlines(proto, pc, instruction, lookup, 1) {
-            Some((site_gain, inlined)) => {
+            Some((site_gain, inlined, peak_gain)) => {
                 add(&mut sizes, &inlined);
-                site_gain
+                if peak { peak_gain } else { site_gain }
             }
+            None if peak => peak_gain(instruction),
             None => bytecode_gain(proto, calls, pc, instruction),
         };
         gain = gain.saturating_add(site_gain.saturating_mul(scale));
         weight = weight.saturating_add(scale);
     }
-    let (per_unit, per_class, percent) = match target {
-        crate::Tier::Peak => (COMPILE_IR_PER_UNIT, COMPILE_IR_PER_CLASS, PEAK_OVER_OPTIMIZING_PERCENT),
-        _ => (OPTIMIZING_IR_PER_UNIT, OPTIMIZING_IR_PER_CLASS, 100),
-    };
+    let (per_unit, per_class) = if peak { (COMPILE_IR_PER_UNIT, COMPILE_IR_PER_CLASS) } else { (OPTIMIZING_IR_PER_UNIT, OPTIMIZING_IR_PER_CLASS) };
     let cost = sizes.iter().zip(per_class).fold(per_unit, |cost, (&size, per)| cost.saturating_add(size.saturating_mul(per)));
-    Estimate {
-        cost,
-        gain: gain.saturating_mul(percent) / 100,
-        weight: weight.max(1),
-        sizes,
+    Estimate { cost, gain, weight: weight.max(1), sizes }
+}
+
+/// Cranelift is slower than Optimizing except on table construction and wide calls.
+fn peak_gain(instruction: Instruction) -> i64 {
+    use Instruction as I;
+    match instruction {
+        I::NewTable { .. } => 24,
+        I::Concat { .. } | I::TailCall { .. } => 2,
+        I::GetField { .. } | I::GetTable { .. } | I::GetI { .. } | I::SelfOp { .. } => -15,
+        I::Vararg { .. } => -14,
+        I::Call { .. } => -3,
+        I::Move { .. } | I::LoadI { .. } | I::LoadK { .. } | I::LoadF { .. } | I::GetTabUp { .. } => -3,
+        other if super::ssa::flow::is_arithmetic(other) => -3,
+        I::SetTable { .. } | I::SetI { .. } | I::SetField { .. } | I::Lt { .. } | I::Le { .. } | I::LtI { .. } | I::LeI { .. } | I::GtI { .. } | I::GeI { .. } => -2,
+        I::GetUpval { .. } | I::SetUpval { .. } | I::Len { .. } | I::Closure { .. } => -1,
+        _ => 0,
     }
 }
 
@@ -167,7 +186,7 @@ pub(crate) fn peak_cost_from_optimizing(code_bytes: i64) -> i64 {
     PEAK_IR_PER_OPTIMIZING_BYTE.saturating_mul(code_bytes)
 }
 
-fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Lookup<'_>, depth: usize) -> Option<(i64, Sizes)> {
+fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Lookup<'_>, depth: usize) -> Option<(i64, Sizes, i64)> {
     let (b, c) = match instruction {
         Instruction::Call { b, c, .. } if depth == 1 || b != 0 => (b, c),
         Instruction::TailCall { b, .. } if depth > 1 => (b, 1),
@@ -180,7 +199,7 @@ fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Loo
         return None;
     };
     if let LuaValue::Native(native) = callee.value {
-        return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|_| (BUILTIN_GAIN, [0; CLASSES]));
+        return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|_| (BUILTIN_GAIN, [0; CLASSES], 0));
     }
     let function = (lookup.proto_of)(callee.proto?)?;
     let policy = super::ssa::passes::inline::Policy::default();
@@ -190,21 +209,23 @@ fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Loo
     }
     super::ssa::passes::inline::candidate(function, callee.proto?, &policy)?;
     let mut gain = INLINED_CALL_GAIN;
+    let mut over_optimizing = 0;
     let mut sizes: Sizes = [0; CLASSES];
     for (inner, &instruction) in function.code.iter().enumerate() {
         let calls = matches!(instruction, Instruction::Call { .. } | Instruction::TailCall { .. });
         sizes[class(instruction)] += 1;
-        let site_gain = match call_inlines(function, inner, instruction, lookup, depth + 1) {
-            Some((site_gain, inlined)) => {
+        let (site_gain, site_over) = match call_inlines(function, inner, instruction, lookup, depth + 1) {
+            Some((site_gain, inlined, site_over)) => {
                 add(&mut sizes, &inlined);
-                site_gain
+                (site_gain, site_over)
             }
             None if calls => return None,
-            None => bytecode_gain(function, &[], inner, instruction),
+            None => (bytecode_gain(function, &[], inner, instruction), peak_gain(instruction)),
         };
         gain = gain.saturating_add(site_gain);
+        over_optimizing += site_over;
     }
-    Some((gain, sizes))
+    Some((gain, sizes, over_optimizing))
 }
 
 fn inlined_builtin(builtin: Builtin) -> bool {
@@ -215,26 +236,38 @@ fn depth_weight(depth: u32) -> i64 {
     LOOP_WEIGHT.pow(depth.min(MAX_DEPTH))
 }
 
-/// A Lua call with no or several compiled callees runs slower in Optimizing code than in Baseline; a single callee pays.
-fn slow_lua_call(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize) -> bool {
-    super::sites::calls_lua(proto, pc) && calls.get(pc).is_none_or(|targets| targets.len() != 1)
+fn direct_lua_call(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize) -> Option<bool> {
+    super::sites::calls_lua(proto, pc).then(|| calls.get(pc).is_some_and(|targets| !targets.is_empty()))
 }
 
 /// A site the interpreter never reached records no feedback and counts for nothing.
 fn bytecode_gain(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize, instruction: Instruction) -> i64 {
     let reached = !matches!(proto.exec.feedback.get(pc), None | Some(InlineCache::Uninitialized));
     let cached = super::sites::site_is_cached(proto, pc);
+    let methods = match proto.exec.feedback.get(pc) {
+        Some(InlineCache::Method(methods)) => methods.len(),
+        _ => 0,
+    };
+    let polymorphic = matches!(proto.exec.feedback.get(pc), Some(InlineCache::Polymorphic(_)));
     match instruction {
+        Instruction::TailCall { .. } if direct_lua_call(proto, calls, pc) == Some(true) => DIRECT_TAIL_CALL_GAIN,
         Instruction::TailCall { .. } => -TAIL_CALL_COST,
-        Instruction::Call { .. } if slow_lua_call(proto, calls, pc) => -HELPER_CALL_COST,
+        Instruction::Call { a, .. } => match direct_lua_call(proto, calls, pc) {
+            Some(true) => DIRECT_CALL_GAIN - i64::from(a) * CALL_REGISTER_COST,
+            Some(false) => -HELPER_CALL_COST,
+            None => 0,
+        },
         Instruction::GetField { .. } | Instruction::SelfOp { .. } | Instruction::SetField { .. } if reached && !cached => -GENERIC_TABLE_COST,
+        Instruction::SelfOp { .. } if methods > 1 => -POLYMORPHIC_METHOD_COST,
+        Instruction::GetField { .. } | Instruction::SetField { .. } if polymorphic => -POLYMORPHIC_FIELD_COST,
         Instruction::Concat { .. } => -CONCAT_COST,
         Instruction::Vararg { .. } => -VARARG_COST,
+        Instruction::NewTable { b: 0, c: 0, k: false, .. } => NEW_TABLE_GAIN,
         Instruction::NewTable { .. } | Instruction::Closure { .. } | Instruction::SetList { .. } | Instruction::Close { .. } | Instruction::Tbc { .. } => {
             -HELPER_COST
         }
         Instruction::SetTable { .. } | Instruction::SetI { .. } | Instruction::SetField { .. } | Instruction::SetTabUp { .. } => STORE_GAIN,
-        Instruction::GetField { .. } | Instruction::SelfOp { .. } | Instruction::GetTable { .. } | Instruction::GetI { .. } => -LOAD_COST,
+        Instruction::GetField { .. } | Instruction::SelfOp { .. } | Instruction::GetTable { .. } | Instruction::GetI { .. } => LOAD_GAIN,
         Instruction::GetTabUp { .. } if reached => GLOBAL_GAIN,
         Instruction::Len { .. } => LEN_GAIN,
         Instruction::GetUpval { .. } => UPVALUE_GAIN,
