@@ -11,7 +11,7 @@ use crate::{
     jit::{
         compile::{
             FAST_ARITH, FAST_CALL, FAST_FOR_PREP, FAST_GET_FIELD, FAST_GET_INT, FAST_GET_SELF, FAST_GET_TABLE, FAST_GET_TABUP,
-            FAST_CLOSURE, FAST_GET_UPVAL, FAST_NEW_TABLE, FAST_RETURN, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
+            FAST_CLOSE, FAST_CLOSURE, FAST_GET_UPVAL, FAST_SET_LIST, FAST_NEW_TABLE, FAST_RETURN, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
             CallTarget, FAST_TABLE_BARRIER, FAST_TAIL_CALL, add_entries, all_method_entries, field_entries,
         },
         helpers::CONSTANT_OPERAND,
@@ -398,9 +398,14 @@ impl<'a> Emitter<'a> {
             Instruction::Return1 { a } => self.lower_return(pc, a, 1),
             Instruction::Return { a, b, k: false, .. } if b != 0 => self.lower_return(pc, a, u32::from(b) - 1),
             Instruction::Return { a, k: false, .. } => self.fast(pc, FAST_RETURN, [i64::from(a), i64::from(u32::MAX as i32), 0], None),
+            Instruction::Return { a, b, k: true, .. } if b != 0 => {
+                self.close_before_return(pc);
+                self.lower_return(pc, a, u32::from(b) - 1);
+            }
             Instruction::TailCall { a, b, k, .. } => self.tail_call(pc, a, b, k),
             Instruction::NewTable { a, b, c, k } => self.new_table(pc, a, b, c, k),
             Instruction::Closure { a, bx } => self.fast(pc, FAST_CLOSURE, [i64::from(a), i64::from(bx), 0], Some(pc + 1)),
+            Instruction::SetList { a, b, c, k: false } => self.fast(pc, FAST_SET_LIST, [i64::from(a), i64::from(b), i64::from(c)], Some(pc + 1)),
             Instruction::Pow { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(c)),
             Instruction::PowK { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(CONSTANT_OPERAND | u32::from(c))),
             Instruction::Shl { a, b, c } => self.arith_helper(pc, a, ArithOp::Shl, i64::from(b), i64::from(c)),
@@ -836,6 +841,16 @@ impl<'a> Emitter<'a> {
                 self.bind_here(mark);
             }
         }
+    }
+
+    /// The helper answers this instruction's pc to continue into the inline return.
+    fn close_before_return(&mut self, pc: usize) {
+        let after = self.mark();
+        let mut labels = self.labels(pc);
+        labels[usize::from(ext::NEXT)] = Label::Mark(after);
+        let values = values(&[(slot::PC, pc as i64), (slot::A, 0), (slot::B, 0), (slot::C, 0), (slot::I, pc as i64)]);
+        self.put(false, Key::Helper(HelperId::Fast(FAST_CLOSE as u8)), &values, &labels);
+        self.bind_here(after);
     }
 
     fn lower_return(&mut self, pc: usize, first: u8, count: u32) {

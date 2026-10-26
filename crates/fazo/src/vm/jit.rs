@@ -1219,6 +1219,10 @@ impl Vm {
     }
 
     /// `count` is `None` when the results run to the stack top. Outcomes are as for `jit_call_direct`; a hook makes the interpreter perform the return.
+    pub(crate) fn jit_close_for_return(&mut self, ctx: &JitCtx) -> bool {
+        !self.tracing && self.closed_for_return(ctx.base)
+    }
+
     pub(crate) fn jit_return(&mut self, ctx: &mut JitCtx, pc: usize, first: u8, count: Option<usize>) -> Control {
         if self.tracing {
             return Control::Interpret;
@@ -1245,6 +1249,19 @@ impl Vm {
 
     pub(crate) fn jit_new_table(&mut self, ctx: &mut JitCtx, pc: usize, a: u8, array: u32, hash_log: u8) -> i64 {
         match self.direct_new_table(ctx.closure, ctx.base, ctx.proto, pc, (a, u64::from(array), hash_log)) {
+            Ok(next) => {
+                self.jit_refresh(ctx);
+                next as i64
+            }
+            Err(error) => {
+                ctx.fail(error);
+                -EXIT_ERROR
+            }
+        }
+    }
+
+    pub(crate) fn jit_set_list(&mut self, ctx: &mut JitCtx, pc: usize, a: u8, b: u8, c: u8) -> i64 {
+        match self.direct_set_list(ctx.closure, ctx.base, ctx.proto, pc, (a, b, c)) {
             Ok(next) => {
                 self.jit_refresh(ctx);
                 next as i64

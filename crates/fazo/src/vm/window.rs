@@ -845,7 +845,7 @@ impl Window {
     pub(super) fn string_hash(vm: &Vm, string: Ref<crate::object::LuaString>) -> u64 {
         debug_assert!(vm.heap.strings.try_get(string).is_some() && string.index() < vm.heap.string_keys.len());
         // SAFETY: every live string has its key entry, below the arena length.
-        unsafe { (*vm.heap.string_keys.as_ptr().add(string.index())).hash }
+        unsafe { (*vm.heap.string_keys.as_ptr().add(string.index())).hash.get() }
     }
 
     /// Follows `clLvalue(s2v(ra))` in `luaV_execute` (lvm.c).

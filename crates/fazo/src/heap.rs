@@ -1,5 +1,4 @@
-use std::ops::Range;
-
+use std::{cell::Cell, ops::Range};
 
 use crate::{
     arena::{Arena, Pinned, Ref, Slots},
@@ -14,11 +13,12 @@ use crate::{
 pub const SHORT_STRING_LIMIT: usize = 40;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StringKey {
-    pub(crate) hash: u64,
+    pub(crate) hash: Cell<u64>,
     next: u32,
     pub(crate) interned: bool,
+    hashed: Cell<bool>,
 }
 
 /// Follows `strt` in lstring.c.
@@ -44,7 +44,28 @@ impl<'a> KeyView<'a> {
     }
 
     pub(crate) fn hash(self, string: Ref<LuaString>) -> u64 {
-        self.keys[string.index()].hash
+        let key = &self.keys[string.index()];
+        debug_assert!(key.interned);
+        key.hash.get()
+    }
+
+    #[inline]
+    pub(crate) fn any_hash(self, string: Ref<LuaString>) -> u64 {
+        let key = &self.keys[string.index()];
+        if key.hashed.get() {
+            return key.hash.get();
+        }
+        self.hash_long_string(string, key)
+    }
+
+    /// Follows `luaS_hashlongstr` in lstring.c.
+    #[cold]
+    #[inline(never)]
+    fn hash_long_string(self, string: Ref<LuaString>, key: &StringKey) -> u64 {
+        let hash = hash_bytes(&self.arena.get(string).bytes);
+        key.hash.set(hash);
+        key.hashed.set(true);
+        hash
     }
 
     pub(crate) fn is_interned(self, string: Ref<LuaString>) -> bool {
@@ -56,8 +77,7 @@ impl<'a> KeyView<'a> {
     }
 
     pub(crate) fn same_content(self, left: Ref<LuaString>, right: Ref<LuaString>) -> bool {
-        let (left_key, right_key) = (self.keys[left.index()], self.keys[right.index()]);
-        if (left_key.interned && right_key.interned) || left_key.hash != right_key.hash {
+        if self.keys[left.index()].interned || self.keys[right.index()].interned {
             return false;
         }
         match (self.arena.try_get(left), self.arena.try_get(right)) {
@@ -145,17 +165,22 @@ impl Heap {
 
     pub fn string(&mut self, bytes: &[u8]) -> Ref<LuaString> {
         if bytes.len() > SHORT_STRING_LIMIT {
-            return self.new_string(StringBytes::from_slice(bytes), hash_bytes(bytes), false);
+            return self.new_long_string(StringBytes::from_slice(bytes));
         }
         let hash = hash_bytes(bytes);
         if let Some(index) = self.find_short_string(bytes, hash) {
             self.revive_dead_string_at(index);
             return self.strings.reference_at(index);
         }
+        self.intern_short_string(bytes, hash)
+    }
+
+    #[inline(never)]
+    fn intern_short_string(&mut self, bytes: &[u8], hash: u64) -> Ref<LuaString> {
         if self.short_strings.used >= self.short_strings.buckets.len() {
             self.grow_short_strings();
         }
-        let reference = self.new_string(StringBytes::from_slice(bytes), hash, true);
+        let reference = self.new_short_string(StringBytes::from_slice(bytes), hash);
         self.link_short_string(reference.index());
         reference
     }
@@ -209,7 +234,7 @@ impl Heap {
 
     fn link_short_string(&mut self, index: usize) {
         let table = &mut self.short_strings;
-        let bucket = self.string_keys[index].hash as usize & (table.buckets.len() - 1);
+        let bucket = self.string_keys[index].hash.get() as usize & (table.buckets.len() - 1);
         self.string_keys[index].next = table.buckets[bucket];
         table.buckets[bucket] = index as u32 + 1;
         table.used += 1;
@@ -239,7 +264,7 @@ impl Heap {
                 let index = link as usize - 1;
                 let key = &mut self.string_keys[index];
                 link = key.next;
-                let bucket = key.hash as usize & (size - 1);
+                let bucket = key.hash.get() as usize & (size - 1);
                 key.next = self.short_strings.buckets[bucket];
                 self.short_strings.buckets[bucket] = index as u32 + 1;
             }
@@ -273,7 +298,7 @@ impl Heap {
         let target = index as u32 + 1;
         let after = self.string_keys[index].next;
         let buckets = &mut self.short_strings.buckets;
-        let bucket = self.string_keys[index].hash as usize & (buckets.len() - 1);
+        let bucket = self.string_keys[index].hash.get() as usize & (buckets.len() - 1);
         self.short_strings.used -= 1;
         if buckets[bucket] == target {
             buckets[bucket] = after;
@@ -293,19 +318,28 @@ impl Heap {
 
     pub fn string_from_buffer(&mut self, bytes: Vec<u8>) -> Ref<LuaString> {
         if bytes.len() > SHORT_STRING_LIMIT {
-            let hash = hash_bytes(&bytes);
-            return self.new_string(StringBytes::from_vec(bytes), hash, false);
+            return self.new_long_string(StringBytes::from_vec(bytes));
         }
         self.string(&bytes)
     }
 
-    fn new_string(&mut self, bytes: StringBytes, hash: u64, interned: bool) -> Ref<LuaString> {
+    fn new_short_string(&mut self, bytes: StringBytes, hash: u64) -> Ref<LuaString> {
+        self.new_string(bytes, StringKey { hash: Cell::new(hash), next: 0, interned: true, hashed: Cell::new(true) })
+    }
+
+    /// Follows `luaS_createlngstrobj` in lstring.c: the hash waits until the string is first a key.
+    #[inline(never)]
+    fn new_long_string(&mut self, bytes: StringBytes) -> Ref<LuaString> {
+        self.new_string(bytes, StringKey::default())
+    }
+
+    fn new_string(&mut self, bytes: StringBytes, key: StringKey) -> Ref<LuaString> {
         let reference = self.alloc(LuaString { bytes });
         let index = reference.index();
         if self.string_keys.len() <= index {
             self.string_keys.resize(index + 1, StringKey::default());
         }
-        self.string_keys[index] = StringKey { hash, next: 0, interned };
+        self.string_keys[index] = key;
         reference
     }
 
@@ -550,7 +584,7 @@ impl Heap {
         if value.is_nil() || !self.string_keys[string.index()].interned {
             return Ok(0);
         }
-        let hash = self.string_keys[string.index()].hash;
+        let hash = self.string_keys[string.index()].hash.get();
         if self.shapes.live(shape).slot(&self.shapes, string, hash).is_some() {
             return Ok(0);
         }

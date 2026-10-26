@@ -155,6 +155,11 @@ impl Vm {
         Ok(next)
     }
 
+    pub(crate) fn direct_set_list(&mut self, closure: Ref<Closure>, base: usize, proto: Ref<Proto>, pc: usize, (a, b, c): (u8, u8, u8)) -> Result<usize, LuaError> {
+        self.set_list(Activation { closure, base, proto }, a, b, u32::from(c))?;
+        Ok(pc + 1)
+    }
+
     pub(crate) fn direct_closure(&mut self, closure: Ref<Closure>, base: usize, proto: Ref<Proto>, pc: usize, (a, index): (u8, usize)) -> Result<usize, LuaError> {
         let activation = Activation { closure, base, proto };
         let instruction = self.heap.protos.live(proto).code[pc];

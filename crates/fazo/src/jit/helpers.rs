@@ -190,6 +190,15 @@ pub(super) extern "C" fn closure(ctx: *mut JitCtx, pc: u32, a: u32, index: u32, 
     with_vm(ctx, pc, |ctx, vm| Some(vm.jit_closure(ctx, pc as usize, a as u8, index as usize)))
 }
 
+pub(super) extern "C" fn set_list(ctx: *mut JitCtx, pc: u32, a: u32, b: u32, c: u32) -> i64 {
+    with_vm(ctx, pc, |ctx, vm| Some(vm.jit_set_list(ctx, pc as usize, a as u8, b as u8, c as u8)))
+}
+
+/// Closes the frame's upvalues before an inline return; a pending to-be-closed variable leaves the return to the step.
+pub(super) extern "C" fn close(ctx: *mut JitCtx, pc: u32, _a: u32, _b: u32, _c: u32) -> i64 {
+    with_vm(ctx, pc, |ctx, vm| vm.jit_close_for_return(ctx).then_some(i64::from(pc)))
+}
+
 pub(super) extern "C" fn tail_call(ctx: *mut JitCtx, pc: u32, _a: u32, _b: u32, _c: u32) -> i64 {
     with_vm(ctx, pc, |ctx, vm| control(pc, vm.jit_tail_call(ctx, pc as usize)))
 }

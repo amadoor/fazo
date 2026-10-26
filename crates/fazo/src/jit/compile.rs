@@ -51,11 +51,13 @@ const TABLE_BARRIER: &str = "fazo_jit_table_barrier";
 const AFTER_CALL: &str = "fazo_jit_after_call";
 const NEW_TABLE: &str = "fazo_jit_new_table";
 const CLOSURE: &str = "fazo_jit_closure";
+const CLOSE: &str = "fazo_jit_close";
+const SET_LIST: &str = "fazo_jit_set_list";
 
 /// Indexes match the function references in `Helpers::fast`.
-const FAST_NAMES: [&str; 19] = [
+const FAST_NAMES: [&str; 21] = [
     GET_FIELD, GET_TABLE, GET_INT, GET_SELF, SET_FIELD, SET_TABLE, SET_INT, CALL_DIRECT, RETURN, FOR_PREP, GET_TABUP, ARITH, GET_UPVAL,
-    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE,
+    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE, CLOSE, SET_LIST,
 ];
 pub(crate) const FAST_GET_FIELD: usize = 0;
 pub(crate) const FAST_GET_TABLE: usize = 1;
@@ -76,10 +78,12 @@ pub(crate) const FAST_TABLE_BARRIER: usize = 15;
 pub(crate) const FAST_AFTER_CALL: usize = 16;
 pub(crate) const FAST_NEW_TABLE: usize = 17;
 pub(crate) const FAST_CLOSURE: usize = 18;
+pub(crate) const FAST_CLOSE: usize = 19;
+pub(crate) const FAST_SET_LIST: usize = 20;
 
 type FastFn = extern "C" fn(*mut JitCtx, u32, u32, u32, u32) -> i64;
 
-pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 19] {
+pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 21] {
     [
         (GET_FIELD, helpers::get_field as FastFn as *const u8),
         (GET_TABLE, helpers::get_table as FastFn as *const u8),
@@ -100,6 +104,8 @@ pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 19] {
         (AFTER_CALL, helpers::after_call as FastFn as *const u8),
         (NEW_TABLE, helpers::new_table as FastFn as *const u8),
         (CLOSURE, helpers::closure as FastFn as *const u8),
+        (CLOSE, helpers::close as FastFn as *const u8),
+        (SET_LIST, helpers::set_list as FastFn as *const u8),
     ]
 }
 const ENTRY: &str = "fazo_jit_entry";

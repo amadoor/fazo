@@ -9,11 +9,25 @@
         "failures": [
           "files.lua"
         ]
+      },
+      "interpreter": {
+        "pass": 30,
+        "fail": 1,
+        "skip": 2,
+        "failures": [
+          "files.lua"
+        ]
       }
     },
     "cases": {
       "normal": {
-        "pass": 140,
+        "pass": 152,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "interpreter": {
+        "pass": 152,
         "fail": 0,
         "skip": 0,
         "failures": []
@@ -21,6 +35,12 @@
     },
     "syntax": {
       "normal": {
+        "pass": 43,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "interpreter": {
         "pass": 43,
         "fail": 0,
         "skip": 0,
@@ -35,10 +55,24 @@
         "failures": [
           "standalone main.lua"
         ]
+      },
+      "interpreter": {
+        "pass": 73,
+        "fail": 1,
+        "skip": 0,
+        "failures": [
+          "standalone main.lua"
+        ]
       }
     },
     "generated": {
       "normal": {
+        "pass": 600,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "interpreter": {
         "pass": 600,
         "fail": 0,
         "skip": 0,
@@ -55,157 +89,157 @@
   "perf": {
     "fib": {
       "puc": 161182880,
-      "fazo": 119480668,
-      "baseline": 132665909,
-      "peak": 239118782,
-      "interpreter": 153858342
+      "fazo": 119494487,
+      "baseline": 132663331,
+      "peak": 239133674,
+      "interpreter": 153858006
     },
     "integer loop": {
       "puc": 480031101,
-      "fazo": 191630448,
-      "baseline": 191627069,
-      "peak": 219965459,
-      "interpreter": 408028706
+      "fazo": 191628346,
+      "baseline": 191625481,
+      "peak": 219967794,
+      "interpreter": 408028897
     },
     "float loop": {
       "puc": 470060466,
-      "fazo": 177476662,
-      "baseline": 177472399,
-      "peak": 222217573,
-      "interpreter": 402053172
+      "fazo": 177473527,
+      "baseline": 177469439,
+      "peak": 222222388,
+      "interpreter": 402052615
     },
     "table array": {
       "puc": 187926306,
-      "fazo": 112464659,
-      "baseline": 112431607,
-      "peak": 107189970,
-      "interpreter": 168322300
+      "fazo": 111539106,
+      "baseline": 111505458,
+      "peak": 106270684,
+      "interpreter": 167701094
     },
     "table hash": {
       "puc": 150726025,
-      "fazo": 102175267,
-      "baseline": 102202294,
-      "peak": 139074205,
-      "interpreter": 136807381
+      "fazo": 102591765,
+      "baseline": 102594034,
+      "peak": 139154070,
+      "interpreter": 137782815
     },
     "closures": {
       "puc": 189542451,
-      "fazo": 201785313,
-      "baseline": 201783338,
-      "peak": 293541621,
-      "interpreter": 174858996
+      "fazo": 170873542,
+      "baseline": 170869503,
+      "peak": 293587772,
+      "interpreter": 174855625
     },
     "method calls through __index": {
       "puc": 510224213,
-      "fazo": 398913689,
-      "baseline": 398925673,
-      "peak": 794830035,
-      "interpreter": 491961611
+      "fazo": 399260288,
+      "baseline": 399241469,
+      "peak": 794244154,
+      "interpreter": 492407078
     },
     "absent metamethods": {
       "puc": 476179139,
-      "fazo": 379555087,
-      "baseline": 379552598,
-      "peak": 501421004,
-      "interpreter": 365176601
+      "fazo": 379550308,
+      "baseline": 379545557,
+      "peak": 501424014,
+      "interpreter": 365775895
     },
     "coroutine switching": {
       "puc": 498568374,
-      "fazo": 432598978,
-      "baseline": 432598814,
-      "peak": 647882778,
-      "interpreter": 415565401
+      "fazo": 427098803,
+      "baseline": 427098643,
+      "peak": 647902254,
+      "interpreter": 416065241
     },
     "strings": {
       "puc": 71362238,
-      "fazo": 67844611,
-      "baseline": 67845046,
-      "peak": 78338340,
-      "interpreter": 63871199
+      "fazo": 66906529,
+      "baseline": 66907787,
+      "peak": 77056606,
+      "interpreter": 62843832
     },
     "binary-trees": {
       "puc": 452087637,
-      "fazo": 456628747,
-      "baseline": 451739702,
-      "peak": 520592931,
-      "interpreter": 381449841
+      "fazo": 448862093,
+      "baseline": 438707707,
+      "peak": 519915495,
+      "interpreter": 380988674
     },
     "n-body": {
       "puc": 470903890,
-      "fazo": 238456136,
-      "baseline": 238499813,
-      "peak": 935299669,
-      "interpreter": 385590944
+      "fazo": 238418750,
+      "baseline": 238460275,
+      "peak": 950810006,
+      "interpreter": 385579472
     },
     "spectral-norm": {
       "puc": 263371091,
-      "fazo": 168069106,
-      "baseline": 150109258,
-      "peak": 270554471,
-      "interpreter": 230002177
+      "fazo": 168075790,
+      "baseline": 150088800,
+      "peak": 270618340,
+      "interpreter": 230005001
     },
     "fannkuch": {
       "puc": 310512921,
-      "fazo": 251210503,
-      "baseline": 251200903,
-      "peak": 270354340,
-      "interpreter": 287097907
+      "fazo": 251202379,
+      "baseline": 251194471,
+      "peak": 270382025,
+      "interpreter": 287318605
     },
     "class dispatch": {
       "puc": 301377471,
-      "fazo": 177503039,
-      "baseline": 177499010,
-      "peak": 479796280,
-      "interpreter": 247572517
+      "fazo": 177534738,
+      "baseline": 177536111,
+      "peak": 479852672,
+      "interpreter": 247572751
     },
     "deltablue": {
       "puc": 513410560,
-      "fazo": 487075220,
-      "baseline": 486807596,
-      "peak": 1276774254,
-      "interpreter": 471611879
+      "fazo": 465687309,
+      "baseline": 465503121,
+      "peak": 1273440031,
+      "interpreter": 464280462
     },
     "havlak": {
       "puc": 169081516,
-      "fazo": 193003093,
-      "baseline": 193086044,
-      "peak": 643381148,
-      "interpreter": 183450912
+      "fazo": 179548085,
+      "baseline": 179597745,
+      "peak": 633123482,
+      "interpreter": 167764996
     },
     "garbage collector (generational)": {
       "puc": 1792963000,
-      "fazo": 1313005720,
-      "baseline": 1313800488,
-      "peak": 1766885067,
-      "interpreter": 1575020288
+      "fazo": 1243129120,
+      "baseline": 1242003614,
+      "peak": 1692351913,
+      "interpreter": 1466974962
     },
     "stats": {
       "puc": 517068523,
-      "fazo": 316552002,
-      "baseline": 316865576,
-      "peak": 781568841,
-      "interpreter": 442264654
+      "fazo": 314539820,
+      "baseline": 314518875,
+      "peak": 780748689,
+      "interpreter": 439644629
     },
     "dialogue (interpreted)": {
       "puc": 467260908,
-      "fazo": 337522031,
-      "baseline": 337342280,
-      "peak": 546648421,
-      "interpreter": 403931556
+      "fazo": 330325161,
+      "baseline": 330153284,
+      "peak": 541632058,
+      "interpreter": 399621748
     },
     "dialogue (compiled with load)": {
       "puc": 1752306868,
-      "fazo": 1677075593,
-      "baseline": 1676515642,
-      "peak": 41449028661,
-      "interpreter": 1684125501
+      "fazo": 1625377945,
+      "baseline": 1624725304,
+      "peak": 41667739090,
+      "interpreter": 1633622339
     },
     "frame": {
       "puc": 2038314512,
-      "fazo": 926700556,
-      "baseline": 936567935,
-      "peak": 3114357097,
-      "interpreter": 1608332689
+      "fazo": 926772574,
+      "baseline": 936625728,
+      "peak": 3149335116,
+      "interpreter": 1608332716
     }
   },
   "operations": {
@@ -256,7 +290,7 @@
     },
     "concat": {
       "puc": 402.0,
-      "fazo": 419.0,
+      "fazo": 346.0,
       "budget": 412.0
     },
     "eqk": {
@@ -281,7 +315,7 @@
     },
     "gettabup": {
       "puc": 63.0,
-      "fazo": 66.0,
+      "fazo": 67.0,
       "budget": 65.0
     },
     "getupval": {
@@ -346,12 +380,12 @@
     },
     "seti": {
       "puc": 47.0,
-      "fazo": 50.0,
+      "fazo": 46.0,
       "budget": 47.0
     },
     "settable": {
       "puc": 56.0,
-      "fazo": 55.0,
+      "fazo": 56.0,
       "budget": 56.0
     },
     "setupval": {

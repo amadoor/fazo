@@ -124,13 +124,7 @@ pub(super) fn int_set(vm: &mut Vm, object: &Value, key: &Value, value: &Value) -
     let (Value::Table(table), Value::Integer(index)) = (*object, *key) else {
         return false;
     };
-    let target = Window::table_object_mut(vm, table);
-    let stored = if target.metatable.is_some() {
-        target.replace_array_item(index, value)
-    } else {
-        target.replace_int(index, value)
-    };
-    if !stored {
+    if !Window::table_object_mut(vm, table).fast_set_int(index, value) {
         return false;
     }
     vm.heap.table_barrier_back(table, *value);

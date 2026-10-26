@@ -29,7 +29,7 @@ pub(crate) struct HelperAddresses {
     pub(crate) safe_point: u64,
     pub(crate) misc: u64,
     pub(crate) tier_check: u64,
-    pub(crate) fast: [u64; 19],
+    pub(crate) fast: [u64; 21],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,7 +145,8 @@ pub(crate) enum Key {
     TailEnter { upvalues: bool },
 }
 
-pub(crate) const KEY_COUNT: usize = 277;
+pub(crate) const KEY_COUNT: usize = 279;
+const HELPER_SLOTS: u8 = 19;
 
 impl Key {
     pub(crate) fn index(self) -> usize {
@@ -192,6 +193,7 @@ impl Key {
             Key::ArraySet { constant_key, constant_value } => 33 + 2 * usize::from(constant_key) + usize::from(constant_value),
             Key::FieldGet { absent, method } => 37 + 2 * usize::from(absent) + usize::from(method),
             Key::FieldSet { constant } => 41 + usize::from(constant),
+            Key::Helper(HelperId::Fast(which)) if which >= HELPER_SLOTS => 277 + usize::from(which - HELPER_SLOTS),
             Key::Helper(id) => {
                 43 + match id {
                     HelperId::Step => 0,
@@ -1349,6 +1351,7 @@ fn field_add(m: &mut dyn Masm, env: &Env, constant: bool) {
     m.store(Width::U64, Reg::T3, Reg::T0, fixed(i64::from(layout.slots_len)));
     m.mov_imm(Reg::T2, reg(slot::Z));
     m.store(Width::U64, Reg::T2, Reg::T0, fixed(i64::from(layout.shape)));
+    m.store_imm(Width::U8, Reg::T0, fixed(i64::from(layout.absent)), 0);
     m.load(Width::U64, Reg::T2, Reg::T0, fixed(i64::from(layout.slots)));
     m.mov_imm(Reg::T3, reg(slot::I));
     m.alu(Alu::Add, Reg::T2, Reg::T3);

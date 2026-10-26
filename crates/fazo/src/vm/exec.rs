@@ -1213,6 +1213,13 @@ impl Vm {
                         if ok!(self.allocation_point(|| Activation::of(&window), window.pc(ip), instruction)) {
                             window.refresh(self);
                         }
+                        if b == 2
+                            && matches!(window.register(a + 1), Value::String(_))
+                            && let Some(value) = self.concat_short_strings(window.register(a), window.register(a + 1))
+                        {
+                            window.set_register(a, value);
+                            continue;
+                        }
                         window.save_pc(window.pc(ip));
                         if ok!(self.concat_loop(window.base(), a, usize::from(b))) {
                             if self.options.memory_limit.is_some() {
@@ -1681,6 +1688,9 @@ impl Vm {
     #[inline(never)]
     fn field_set_missed(&mut self, site: Site<'_>, a: u8, b: u8, c: u8, k: bool) -> Result<Flow, LuaError> {
         let window = site.window;
+        if self.cached_store_in(window.feedback(site.pc - 1), window.register(a), quick::rk(window.pass(), c, k)) {
+            return Ok(Flow::Done);
+        }
         window.miss(site.pc - 1, Dispatch::SetField);
         let key = quick::constant(window.pass(), u32::from(b));
         if self.field_store_hit_in(window.feedback(site.pc - 1), window.register(a), key, quick::rk(window.pass(), c, k)) {
@@ -2181,7 +2191,7 @@ impl Vm {
 
     /// A pending to-be-closed variable needs the generic return for its `__close` call.
     #[inline(never)]
-    fn closed_for_return(&mut self, base: usize) -> bool {
+    pub(super) fn closed_for_return(&mut self, base: usize) -> bool {
         if self.has_to_close(base) {
             return false;
         }

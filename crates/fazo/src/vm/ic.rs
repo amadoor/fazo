@@ -170,6 +170,18 @@ impl InlineCache {
         };
     }
 
+    fn replace(&mut self, entry: Entry) {
+        match self {
+            Self::Monomorphic(known) if known.shape == entry.shape => *known = entry,
+            Self::Polymorphic(entries) => {
+                if let Some(known) = entries.iter_mut().find(|known| known.shape == entry.shape) {
+                    *known = entry;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn record(&mut self, entry: Entry) {
         *self = match std::mem::take(self) {
             Self::Uninitialized => Self::Monomorphic(entry),
@@ -330,26 +342,43 @@ impl Vm {
         let Some(entry) = self.heap.protos.live(proto).exec.feedback[site].find(shape) else {
             return false;
         };
-        let target = self.heap.tables.live(table);
-        if target.metatable.is_some() {
-            let present = !entry.adds_key() && entry.slot != ABSENT && !target.slot_value(entry.slot as usize).is_nil();
-            if !present && self.blocks_new_index(table) {
+        self.entry_store(table, entry, value)
+    }
+
+    pub(super) fn cached_store_in(&mut self, cache: Option<&InlineCache>, object: Value, value: Value) -> bool {
+        let (Value::Table(table), Some(cache)) = (object, cache) else {
+            return false;
+        };
+        let Some(entry) = self.heap.tables.live(table).shape().and_then(|shape| cache.find(shape)) else {
+            return false;
+        };
+        self.entry_store(table, entry, value)
+    }
+
+    /// The table has the entry's shape. A nil store into an absent key adds nothing, as `luaH_newkey` in ltable.c skips nil values.
+    fn entry_store(&mut self, table: Ref<Table>, entry: Entry, value: Value) -> bool {
+        if entry.adds_key() && self.transition_store_hit(table, entry, value) {
+            return true;
+        }
+        let present = !entry.adds_key() && entry.slot != ABSENT && !self.heap.tables.live(table).slot_value(entry.slot as usize).is_nil();
+        if !present && !self.may_add_key(table) {
+            return false;
+        }
+        if entry.slot == ABSENT {
+            return value.is_nil();
+        }
+        if entry.adds_key() {
+            if value.is_nil() {
+                return true;
+            }
+            if !self.heap.take_transition(table, entry.next) {
                 return false;
             }
-        }
-        if entry.adds_key() && !self.heap.take_transition(table, entry.next) {
-            return false;
+            self.heap.tables.live_mut(table).forget_absences();
         }
         self.heap.tables.live_mut(table).set_slot(entry.slot as usize, value);
         self.heap.table_barrier_back(table, value);
         true
-    }
-
-    fn blocks_new_index(&mut self, table: Ref<Table>) -> bool {
-        match self.heap.tables.live(table).metatable {
-            Some(metatable) => !self.table_event(metatable, crate::vm::Event::NewIndex).is_nil(),
-            None => false,
-        }
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -401,22 +430,26 @@ impl Vm {
         }
     }
 
-    /// Metamethod keys are not recorded, since a cached store would skip clearing the table's absence flags.
+    /// A cached store of a metamethod key only adds it, and every cached addition clears the table's absence flags.
     pub(crate) fn record_store(&mut self, proto: Ref<Proto>, site: usize, object: Value, key: Ref<LuaString>, before: Option<Ref<Shape>>) {
         let (Value::Table(table), Some(before)) = (object, before) else {
             return;
         };
-        if self.heap.bytes(key).starts_with(b"__") {
-            return;
-        }
         let Some(after) = self.heap.tables.live(table).shape() else {
             return;
         };
         let hash = self.heap.key_view().hash(key);
         let Some(slot) = self.heap.shapes.live(after).slot(&self.heap.shapes, key, hash) else {
+            if after == before {
+                self.record_store_entry(proto, site, Entry::plain(before, ABSENT));
+            }
             return;
         };
+        let metamethod = self.heap.bytes(key).starts_with(b"__");
         let entry = if after == before {
+            if metamethod {
+                return;
+            }
             Entry::plain(before, slot as u32)
         } else if self.heap.shapes.live(after).len() == slot + 1 && slot == self.heap.shapes.live(before).len() {
             Entry {
@@ -427,7 +460,22 @@ impl Vm {
         } else {
             return;
         };
-        self.record_entry(proto, site, entry);
+        self.record_store_entry(proto, site, entry);
+    }
+
+    /// A site keeps one entry per shape; an addition replaces the absent entry a nil store left, since it answers nil stores too.
+    fn record_store_entry(&mut self, proto: Ref<Proto>, site: usize, entry: Entry) {
+        let cache = &mut self.heap.protos.live_mut(proto).exec.feedback[site];
+        match cache.find(entry.shape) {
+            None => self.record_entry(proto, site, entry),
+            Some(known) if known.slot == ABSENT && entry.slot != ABSENT => {
+                cache.replace(entry);
+                self.keep_site_shapes(proto, &[entry.shape, entry.next]);
+                self.quicken_site(proto, site);
+                self.jit_feedback_changed(proto);
+            }
+            Some(_) => {}
+        }
     }
 
 
@@ -721,7 +769,7 @@ impl Vm {
             None => return false,
         };
         if entry.slot == ABSENT {
-            return false;
+            return value.is_nil() && self.absent_store_hit(table);
         }
         if entry.adds_key() {
             return self.transition_store_hit(table, entry, value);
@@ -735,7 +783,6 @@ impl Vm {
         true
     }
 
-    /// Covers only a non-nil store into a non-black table with room and no metatable; everything else goes through `cached_store`.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn transition_store_hit(&mut self, table: Ref<Table>, entry: Entry, value: Value) -> bool {
         let target = self.heap.tables.live(table);
@@ -749,9 +796,30 @@ impl Vm {
             return false;
         }
         let target = self.heap.tables.live_mut(table);
+        target.forget_absences();
         target.enter_shape(entry.next);
         target.set_slot(entry.slot as usize, value);
         true
+    }
+
+    #[inline(never)]
+    fn absent_store_hit(&mut self, table: Ref<Table>) -> bool {
+        self.may_add_key(table)
+    }
+
+    /// Follows the `__newindex` test of `luaV_finishset` in lvm.c, which `fasttm` answers from the metatable's absence flag.
+    fn may_add_key(&mut self, table: Ref<Table>) -> bool {
+        let Some(metatable) = self.heap.tables.live(table).metatable else {
+            return true;
+        };
+        if Event::NewIndex.absence_bit().is_some_and(|bit| self.heap.tables.live(metatable).is_absent(bit)) {
+            return true;
+        }
+        self.lacks_new_index(metatable)
+    }
+
+    fn lacks_new_index(&mut self, metatable: Ref<Table>) -> bool {
+        self.table_event(metatable, Event::NewIndex).is_nil()
     }
 
     fn cached_transition(&mut self, proto: Ref<Proto>, site: usize, object: Value, value: Value) -> bool {

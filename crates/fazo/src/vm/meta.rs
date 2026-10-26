@@ -441,6 +441,32 @@ impl Vm {
         }
     }
 
+    /// Follows `luaV_concat` in lvm.c for two strings with a short result; `None` leaves the rest to `concat_loop`.
+    #[inline(never)]
+    pub(crate) fn concat_short_strings(&mut self, first: Value, second: Value) -> Option<Value> {
+        let (Value::String(left), Value::String(right)) = (first, second) else {
+            return None;
+        };
+        if self.options.memory_limit.is_some() {
+            return None;
+        }
+        let (left, right) = (&self.heap.strings.live(left).bytes, &self.heap.strings.live(right).bytes);
+        if right.is_empty() {
+            return Some(first);
+        }
+        if left.is_empty() {
+            return Some(second);
+        }
+        let size = left.len() + right.len();
+        if size > crate::heap::SHORT_STRING_LIMIT {
+            return None;
+        }
+        let mut buffer = [0u8; crate::heap::SHORT_STRING_LIMIT];
+        buffer[..left.len()].copy_from_slice(left);
+        buffer[left.len()..size].copy_from_slice(right);
+        Some(Value::String(self.heap.string(&buffer[..size])))
+    }
+
     /// Follows `luaV_concat` in lvm.c. `None` leaves a float operand or a long result to `concat_string`.
     fn concat_pair(&mut self, first: Value, second: Value) -> Result<Option<Value>, LuaError> {
         if let (Value::String(left), Value::String(right)) = (first, second) {

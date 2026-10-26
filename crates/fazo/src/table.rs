@@ -12,6 +12,7 @@ use crate::{
 const MAX_ARRAY_BITS: usize = 31;
 const MAX_VICINITY: usize = 4;
 const HASH_SEARCH_SEED: u64 = 0x9E37_79B9;
+const SMALL_ARRAY_BYTES: usize = 1024;
 
 #[repr(C)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -181,6 +182,20 @@ impl Table {
             return true;
         }
         self.replace_present_node_int(index, *value)
+    }
+
+    /// Follows `luaH_fastseti` in ltable.h; an empty array item of a table with a metatable leaves `__newindex` to the caller.
+    #[inline(always)]
+    pub(crate) fn fast_set_int(&mut self, index: i64, value: &Value) -> bool {
+        let Some(slot) = array_slot(index, self.array.len()) else {
+            return self.replace_present_node_int(index, *value);
+        };
+        let place = &mut self.array[slot];
+        if self.metatable.is_some() && place.is_nil() {
+            return false;
+        }
+        *place = *value;
+        true
     }
 
     /// A table without a metatable has no `__newindex` to run, so the store can skip it.
@@ -401,6 +416,10 @@ impl Table {
         self.absent & bit != 0
     }
 
+    pub(crate) fn forget_absences(&mut self) {
+        self.absent = 0;
+    }
+
     pub(crate) fn mark_absent(&mut self, bit: u8) {
         self.absent |= bit;
     }
@@ -446,7 +465,7 @@ impl Table {
                 return Err(SetError::Memory);
             }
         }
-        self.array.try_reserve_exact(size - self.array.len()).map_err(|_| SetError::Memory)?;
+        self.reserve_array(size)?;
         self.array.resize(size, Value::Nil);
         self.last_free = 0;
         self.length_hint.set(size / 2);
@@ -757,15 +776,20 @@ impl Table {
         let size = self.array.len();
         let mut used = 0;
         let mut start = 0;
-        for slice in 0..=MAX_ARRAY_BITS {
-            let limit = (1usize << slice).min(size);
-            if start >= limit {
+        let mut limit = 1;
+        for slice in &mut counts.slices {
+            let end = limit.min(size);
+            if start >= end {
                 break;
             }
-            let count = self.array[start..limit].iter().filter(|value| !value.is_nil()).count();
-            counts.slices[slice] += count;
+            let mut count = 0;
+            for value in &self.array[start..end] {
+                count += usize::from(!value.is_nil());
+            }
+            *slice += count;
             used += count;
-            start = limit;
+            start = end;
+            limit *= 2;
         }
         counts.total += used;
         counts.array_keys += used;
@@ -782,7 +806,7 @@ impl Table {
         let nodes = nodes_for(hash_size)?;
         let old_size = self.array.len();
         if array_size > old_size {
-            self.array.try_reserve_exact(array_size - old_size).map_err(|_| SetError::Memory)?;
+            self.reserve_array(array_size)?;
         }
         let old_nodes = std::mem::replace(&mut self.nodes, nodes);
         self.last_free = self.nodes.len();
@@ -805,14 +829,35 @@ impl Table {
 
     /// Follows `reinsertOldSlice` in ltable.c.
     fn reinsert_old_slice(&mut self, array_size: usize) -> Result<(), SetError> {
-        let vanishing = self.array.split_off(array_size);
-        for (offset, value) in vanishing.into_iter().enumerate() {
+        for index in array_size..self.array.len() {
+            let value = self.array[index];
             if value.is_nil() {
                 continue;
             }
-            let index = array_size + offset;
             self.reinsert(Value::Integer(index as i64 + 1), index as u64 + 1, value)?;
         }
+        self.array.truncate(array_size);
+        Ok(())
+    }
+
+    #[inline]
+    fn reserve_array(&mut self, size: usize) -> Result<(), SetError> {
+        if size <= self.array.capacity() {
+            return Ok(());
+        }
+        self.reallocate_array(size)
+    }
+
+    /// Follows `resizearray` in ltable.c. A small array moves to a fresh block, which costs less than `realloc` moving it.
+    #[inline(never)]
+    fn reallocate_array(&mut self, size: usize) -> Result<(), SetError> {
+        if size.saturating_mul(std::mem::size_of::<Value>()) > SMALL_ARRAY_BYTES {
+            return self.array.try_reserve_exact(size - self.array.len()).map_err(|_| SetError::Memory);
+        }
+        let mut array = Vec::new();
+        array.try_reserve_exact(size).map_err(|_| SetError::Memory)?;
+        array.extend_from_slice(&self.array);
+        self.array = array;
         Ok(())
     }
 
@@ -997,13 +1042,14 @@ fn ceil_log2(value: usize) -> usize {
     (usize::BITS - (value - 1).leading_zeros()) as usize
 }
 
+#[inline(always)]
 fn key_hash(keys: KeyView, key: Value) -> u64 {
     match key {
         Value::Nil => 0,
         Value::Boolean(flag) => u64::from(flag),
         Value::Integer(index) => index as u64,
         Value::Float(f) => mix(f.to_bits()),
-        Value::String(string) => keys.hash(string),
+        Value::String(string) => keys.any_hash(string),
         Value::Table(reference) => mix(reference_index(reference)),
         Value::Closure(reference) => mix(reference_index(reference)),
         Value::Native(reference) => mix(reference_index(reference)),

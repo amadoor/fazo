@@ -68,7 +68,7 @@ fn keys() -> Vec<Key> {
     for id in [HelperId::Step, HelperId::SafePoint, HelperId::Misc, HelperId::TierCheck] {
         keys.push(Key::Helper(id));
     }
-    for which in 0..19 {
+    for which in 0..21 {
         keys.push(Key::Helper(HelperId::Fast(which)));
     }
     let ops = [
