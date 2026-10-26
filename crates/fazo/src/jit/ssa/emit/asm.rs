@@ -122,6 +122,8 @@ pub(crate) trait Asm {
     fn not(&mut self, dst: u8, src: u8);
     /// Follows lvm.c's `luaV_mod` and `luaV_idiv`; `y` is neither 0 nor -1.
     fn floor_div(&mut self, op: Division, dst: u8, x: u8, y: u8);
+    /// `y` is not zero.
+    fn unsigned_rem(&mut self, dst: u8, x: u8, y: u8);
 
     /// Leaves the flags `cmp old, value` would.
     fn sub_mem(&mut self, base: u8, disp: i32, value: i32);
@@ -139,7 +141,12 @@ pub(crate) trait Asm {
     fn jump(&mut self, target: Label);
 
     fn falu(&mut self, op: FAlu, dst: u8, left: u8, right: u8);
+    fn falu_const(&mut self, op: FAlu, dst: u8, left: u8, (bits, scratch): (u64, u8)) {
+        self.fconst(scratch, bits);
+        self.falu(op, dst, left, scratch);
+    }
     fn fneg(&mut self, dst: u8, src: u8);
+    fn fsqrt(&mut self, dst: u8, src: u8);
     fn ffloor(&mut self, dst: u8, src: u8);
     fn fbranch(&mut self, cond: FCond, left: u8, right: u8, target: Label);
     /// Taken when the ordered condition is false, NaN operands included.

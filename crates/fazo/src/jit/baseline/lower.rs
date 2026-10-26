@@ -75,6 +75,8 @@ struct Emitter<'a> {
     shared_step: u32,
 }
 
+static DISCARDED_KINDS: [std::sync::atomic::AtomicU8; 2] = [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+
 fn values(pairs: &[(u8, i64)]) -> Values {
     let mut values = [0; slot::COUNT];
     for &(slot, value) in pairs {
@@ -346,7 +348,7 @@ impl<'a> Emitter<'a> {
             Instruction::DivK { a, b, c } => self.arith_constant(pc, ArithKind::Div, a, b, c),
             Instruction::AddI { a, b, sc } => {
                 let slow = self.cold_step(pc);
-                let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::I, i64::from(sc))]);
+                let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::I, i64::from(sc)), (slot::U, self.kinds(pc))]);
                 self.put(false, Key::Arith { op: ArithKind::Add, rhs: Rhs::Imm }, &vals, &self.with(pc, &[(ext::SLOW, slow)]));
             }
             Instruction::Unm { a, b } => self.unary(pc, Key::Unm, a, b),
@@ -554,7 +556,7 @@ impl<'a> Emitter<'a> {
             return self.step(pc);
         };
         let slow = self.cold_step(pc);
-        let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::C, offset(c))]);
+        let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::C, offset(c)), (slot::U, self.kinds(pc))]);
         self.put(false, Key::Arith { op, rhs: Rhs::Reg }, &vals, &self.with(pc, &[(ext::SLOW, slow)]));
     }
 
@@ -571,8 +573,13 @@ impl<'a> Emitter<'a> {
             _ => return self.step(pc),
         };
         let slow = self.cold_step(pc);
-        let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::K, index as i64 * VALUE)]);
+        let vals = values(&[(slot::A, offset(a)), (slot::B, offset(b)), (slot::K, index as i64 * VALUE), (slot::U, self.kinds(pc))]);
         self.put(false, Key::Arith { op, rhs }, &vals, &self.with(pc, &[(ext::SLOW, slow)]));
+    }
+
+    /// The prototype keeps the cells as long as its code, which writes them.
+    fn kinds(&self, pc: usize) -> i64 {
+        self.proto.exec.arith_kinds.get(2 * pc).map_or(DISCARDED_KINDS[0].as_ptr().cast_const(), |cell| cell.as_ptr().cast_const()) as i64
     }
 
     fn unary(&mut self, pc: usize, key: Key, a: u8, b: u8) {

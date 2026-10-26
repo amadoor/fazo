@@ -135,7 +135,9 @@ pub(crate) enum UnOp {
     INeg,
     IBnot,
     FNeg,
+    FSqrt,
     IToF,
+    NumToF,
     Truthy,
     Not,
     Box,
@@ -544,6 +546,28 @@ impl Term {
         self.edges().into_iter().map(|edge| edge.block).collect()
     }
 
+    pub(crate) fn edge(&self, index: usize) -> Option<&Edge> {
+        match self {
+            Term::Jump(edge) if index == 0 => Some(edge),
+            Term::Branch { then, .. } if index == 0 => Some(then),
+            Term::Branch { other, .. } if index == 1 => Some(other),
+            Term::Switch { cases, .. } => cases.get(index).map(|(_, edge)| edge),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn successor(&self, index: usize) -> Option<BlockId> {
+        self.edge(index).map(|edge| edge.block)
+    }
+
+    pub(crate) fn for_each_successor(&self, mut f: impl FnMut(BlockId)) {
+        let mut index = 0;
+        while let Some(block) = self.successor(index) {
+            f(block);
+            index += 1;
+        }
+    }
+
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Val) -> Val) {
         match self {
             Term::Branch { cond, .. } => *cond = f(*cond),
@@ -762,24 +786,23 @@ impl Func {
 
     pub(crate) fn reverse_postorder(&self) -> Vec<BlockId> {
         let mut seen = vec![false; self.blocks.len()];
-        let mut order = Vec::new();
-        let roots: Vec<BlockId> = self.entry.into_iter().chain(self.osr.iter().map(|&(_, block)| block)).collect();
-        for root in roots {
-            self.postorder_from(root, &mut seen, &mut order);
+        let mut order = Vec::with_capacity(self.blocks.len());
+        let mut stack = Vec::new();
+        for root in self.entry.into_iter().chain(self.osr.iter().map(|&(_, block)| block)) {
+            self.postorder_from(root, &mut seen, (&mut order, &mut stack));
         }
         order.reverse();
         order
     }
 
-    fn postorder_from(&self, root: BlockId, seen: &mut [bool], order: &mut Vec<BlockId>) {
+    fn postorder_from(&self, root: BlockId, seen: &mut [bool], (order, stack): (&mut Vec<BlockId>, &mut Vec<(BlockId, usize)>)) {
         if seen[root.0 as usize] {
             return;
         }
         seen[root.0 as usize] = true;
-        let mut stack = vec![(root, 0usize)];
+        stack.push((root, 0));
         while let Some((block, next)) = stack.pop() {
-            let successors = self.block(block).term.successors();
-            let Some(&successor) = successors.get(next) else {
+            let Some(successor) = self.block(block).term.successor(next) else {
                 order.push(block);
                 continue;
             };
@@ -794,9 +817,7 @@ impl Func {
     pub(crate) fn predecessors(&self) -> Vec<Vec<BlockId>> {
         let mut predecessors = vec![Vec::new(); self.blocks.len()];
         for block in self.reverse_postorder() {
-            for successor in self.block(block).term.successors() {
-                predecessors[successor.0 as usize].push(block);
-            }
+            self.block(block).term.for_each_successor(|successor| predecessors[successor.0 as usize].push(block));
         }
         predecessors
     }
@@ -814,6 +835,9 @@ impl Func {
 
 
     pub(crate) fn rewrite_uses(&mut self, map: &[Val]) {
+        if map.iter().enumerate().all(|(index, value)| value.0 as usize == index) {
+            return;
+        }
         let resolve = |value: Val| resolve(map, value);
         for block in &mut self.blocks {
             block.term.map_operands(resolve);
@@ -835,7 +859,10 @@ impl Func {
 
     /// Cooper, Harvey and Kennedy's iterative algorithm; all entries hang off one virtual root.
     pub(crate) fn dominators(&self) -> Vec<Option<BlockId>> {
-        let order = self.reverse_postorder();
+        self.dominators_in(&self.reverse_postorder())
+    }
+
+    pub(crate) fn dominators_in(&self, order: &[BlockId]) -> Vec<Option<BlockId>> {
         let mut position = vec![usize::MAX; self.blocks.len()];
         for (index, block) in order.iter().enumerate() {
             position[block.0 as usize] = index + 1;
@@ -849,7 +876,7 @@ impl Func {
         let mut changed = true;
         while changed {
             changed = false;
-            for &block in &order {
+            for &block in order {
                 if roots.contains(&block) {
                     continue;
                 }

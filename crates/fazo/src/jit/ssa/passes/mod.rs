@@ -68,6 +68,9 @@ pub(crate) fn insert(func: &mut Func, block: BlockId, position: usize, op: Op, t
 
 /// Uses must already be rewritten when these are removed.
 pub(crate) fn remove(func: &mut Func, dead: &[bool]) {
+    if !dead.contains(&true) {
+        return;
+    }
     for block in &mut func.blocks {
         block.insts.retain(|value| !dead.get(value.0 as usize).copied().unwrap_or(false));
     }

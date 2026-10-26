@@ -130,9 +130,12 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, pipeline
     func.observed = facts.observed.to_vec();
     func.type_names = Some(facts.type_names);
     func.sink_allocations = facts.sink_allocations;
-    ssa::check::check(&func, false).map_err(|message| unsupported(&format!("built graph: {message}")))?;
-    passes::optimize(&mut func, pipeline, cfg!(debug_assertions)).map_err(|message| unsupported(&format!("optimized graph {message}")))?;
-    ssa::check::check(&func, true).map_err(|message| unsupported(&format!("optimized graph: {message}")))?;
+    // V8 verifies Maglev graphs only in DEBUG builds (src/maglev/maglev-compiler.cc, `VerifyGraph`).
+    let verify = cfg!(debug_assertions);
+    if verify {
+        ssa::check::check(&func, false).map_err(|message| unsupported(&format!("built graph: {message}")))?;
+    }
+    passes::optimize(&mut func, pipeline, verify).map_err(|message| unsupported(&format!("optimized graph {message}")))?;
     Ok(func)
 }
 

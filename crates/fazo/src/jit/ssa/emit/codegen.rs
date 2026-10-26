@@ -113,6 +113,15 @@ impl<A: Asm> Moves for Mover<'_, A> {
     }
 }
 
+/// A loop poll's slow path, placed after the code; it re-enters the loop through its OSR block, so it needs no registers.
+pub(super) struct SafepointStub {
+    pub(super) label: Label,
+    pub(super) state: Option<u32>,
+    pub(super) pc: u32,
+    pub(super) charge: bool,
+    pub(super) target: Label,
+}
+
 pub(super) struct Gen<'a, A: Asm> {
     pub(super) func: &'a Func,
     pub(super) env: &'a Env<'a>,
@@ -123,6 +132,7 @@ pub(super) struct Gen<'a, A: Asm> {
     labels: Vec<Option<Label>>,
     snapshots: Vec<Option<Vec<Entry>>>,
     stubs: Vec<(Label, u32)>,
+    pub(super) safepoints: Vec<SafepointStub>,
     pub(super) table: Box<ExitTable>,
     pub(super) epilogue: Label,
     pub(super) exit_with: Label,
@@ -180,6 +190,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             labels: vec![None; func.blocks.len()],
             snapshots: vec![None; func.blocks.len()],
             stubs: Vec::new(),
+            safepoints: Vec::new(),
             table,
             epilogue,
             exit_with,
@@ -563,6 +574,10 @@ impl<'a, A: Asm> Gen<'a, A> {
             return;
         }
         let index = self.exit_index(state);
+        self.store_state_at(index);
+    }
+
+    pub(super) fn store_state_at(&mut self, index: u32) {
         self.asm.dump_registers();
         self.runtime_exit_call(self.addresses.store, index);
         self.asm.alu_imm(super::asm::Alu::Add, A::SP, A::SP, DUMP + A::OUTGOING);
@@ -607,6 +622,9 @@ impl<'a, A: Asm> Gen<'a, A> {
     }
 
     fn tails(&mut self) {
+        for stub in std::mem::take(&mut self.safepoints) {
+            self.safepoint_tail(stub);
+        }
         for (label, index) in std::mem::take(&mut self.stubs) {
             self.asm.bind(label);
             self.asm.mov_imm(A::SCRATCH, i64::from(index));

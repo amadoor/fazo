@@ -14,10 +14,14 @@ use crate::{
 pub(crate) fn run(func: &mut Func) {
     for _ in 0..8 {
         let mut changed = merge_blocks(func);
-        changed |= remove_trivial_params(func);
-        changed |= fold_constants(func);
-        changed |= fold_branches(func);
-        changed |= cse(func);
+        let mut order = func.reverse_postorder();
+        changed |= remove_trivial_params(func, &order);
+        changed |= fold_constants(func, &order);
+        if fold_branches(func, &order) {
+            changed = true;
+            order = func.reverse_postorder();
+        }
+        changed |= cse(func, &order);
         if !changed {
             break;
         }
@@ -54,12 +58,11 @@ pub(crate) fn merge_blocks(func: &mut Func) -> bool {
 }
 
 /// Braun et al., "Simple and Efficient Construction of Static Single Assignment Form", section 3.1.
-pub(crate) fn remove_trivial_params(func: &mut Func) -> bool {
+pub(crate) fn remove_trivial_params(func: &mut Func, order: &[BlockId]) -> bool {
     let mut map = func.identity_map();
     let mut changed = false;
-    let order = func.reverse_postorder();
-    let incoming = incoming_edges(func, &order);
-    for &block in &order {
+    let incoming = incoming_edges(func, order);
+    for &block in order {
         let params = func.block(block).params.clone();
         let mut keep = Vec::with_capacity(params.len());
         for (index, &param) in params.iter().enumerate() {
@@ -176,6 +179,15 @@ pub(crate) fn fold(func: &Func, op: &Op) -> Option<Const> {
         }
         Op::Unary(UnOp::INeg | UnOp::FNeg, operand) => from_lua(fast::unary(UnaryOp::Minus, lua(constant(func, *operand)?)?)?),
         Op::Unary(UnOp::IBnot, operand) => from_lua(fast::unary(UnaryOp::BNot, lua(constant(func, *operand)?)?)?),
+        Op::Unary(UnOp::FSqrt, operand) => match constant(func, *operand)? {
+            Const::Float(float) => Some(Const::Float(float.sqrt())),
+            _ => None,
+        },
+        Op::Unary(UnOp::NumToF, operand) => match constant(func, *operand)? {
+            Const::Int(integer) => Some(Const::Float(integer as f64)),
+            Const::Float(float) => Some(Const::Float(float)),
+            _ => None,
+        },
         Op::Unary(UnOp::IToF, operand) => match constant(func, *operand)? {
             Const::Int(integer) => Some(Const::Float(integer as f64)),
             _ => None,
@@ -274,11 +286,11 @@ fn rep_of(constant: Const) -> Rep {
     }
 }
 
-fn fold_constants(func: &mut Func) -> bool {
+fn fold_constants(func: &mut Func, order: &[BlockId]) -> bool {
     let mut changed = false;
     let mut map = func.identity_map();
     let mut dead = vec![false; func.insts.len()];
-    for block in func.reverse_postorder() {
+    for &block in order {
         for index in 0..func.block(block).insts.len() {
             let value = func.block(block).insts[index];
             let op = func.op(value);
@@ -318,9 +330,9 @@ fn redundant_guard(func: &Func, op: &Op) -> Option<Option<Val>> {
     }
 }
 
-fn fold_branches(func: &mut Func) -> bool {
+fn fold_branches(func: &mut Func, order: &[BlockId]) -> bool {
     let mut changed = false;
-    for block in func.reverse_postorder() {
+    for &block in order {
         let Term::Branch { cond, then, other } = func.block(block).term.clone() else {
             continue;
         };
@@ -421,12 +433,11 @@ fn clobbers_tables(op: &Op) -> bool {
     }
 }
 
-fn cse(func: &mut Func) -> bool {
-    let idom = func.dominators();
-    let order = func.reverse_postorder();
+fn cse(func: &mut Func, order: &[BlockId]) -> bool {
+    let idom = func.dominators_in(order);
     let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
     let mut roots = Vec::new();
-    for &block in &order {
+    for &block in order {
         match idom[block.0 as usize] {
             Some(parent) if parent.0 != u32::MAX && parent != block => children[parent.0 as usize].push(block),
             _ => roots.push(block),

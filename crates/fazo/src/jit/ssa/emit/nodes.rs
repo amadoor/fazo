@@ -4,7 +4,7 @@ use std::mem::offset_of;
 
 use super::{
     asm::{Alu, Asm, Cond, Division, FAlu, FCond, Label, Width},
-    codegen::{BOOL_TAG, CLOSURE_TAG, Def, FLOAT_TAG, Gen, INT_TAG, NIL_TAG, PAYLOAD, STRING_TAG, Src, TABLE_TAG, VALUE_SIZE},
+    codegen::{BOOL_TAG, CLOSURE_TAG, Def, FLOAT_TAG, Gen, INT_TAG, NIL_TAG, PAYLOAD, STRING_TAG, SafepointStub, Src, TABLE_TAG, VALUE_SIZE},
     regs::PReg,
 };
 use crate::jit::{
@@ -321,12 +321,32 @@ impl<A: Asm> Gen<'_, A> {
                 let out = self.out(value);
                 self.asm.fneg(out, x);
             }
+            UnOp::FSqrt => {
+                let x = self.freg(operand);
+                let out = self.out(value);
+                self.asm.fsqrt(out, x);
+            }
             UnOp::IToF => {
                 let x = self.reg(operand);
                 let out = self.out(value);
                 self.asm.int_to_float(out, x);
             }
+            UnOp::NumToF => self.number_to_float(value, operand),
         }
+    }
+
+    fn number_to_float(&mut self, value: Val, operand: Val) {
+        let (tag, word) = self.pair_regs(operand);
+        let out = self.out(value);
+        let integer = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.cmp_byte(tag, INT_TAG);
+        self.asm.branch(Cond::Eq, integer);
+        self.asm.bits_to_float(out, word);
+        self.asm.jump(done);
+        self.asm.bind(integer);
+        self.asm.int_to_float(out, word);
+        self.asm.bind(done);
     }
 
     fn truthy(&mut self, value: Val, operand: Val) {
@@ -391,7 +411,11 @@ impl<A: Asm> Gen<'_, A> {
             BinOp::IAdd | BinOp::ISub | BinOp::IMul | BinOp::IBand | BinOp::IBor | BinOp::IBxor => self.int_binary(value, op, left, right),
             BinOp::IMod | BinOp::IDiv => self.floor_division(value, op, left, right),
             BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FIDiv => {
-                let (x, y) = (self.freg(left), self.freg(right));
+                let x = self.freg(left);
+                let y = match self.word(right) {
+                    Src::I(bits) if bits != 0 => Err((bits as u64, self.ftemp())),
+                    _ => Ok(self.freg(right)),
+                };
                 let out = self.out_over(value, left);
                 let alu = match op {
                     BinOp::FAdd => FAlu::Add,
@@ -399,7 +423,10 @@ impl<A: Asm> Gen<'_, A> {
                     BinOp::FMul => FAlu::Mul,
                     _ => FAlu::Div,
                 };
-                self.asm.falu(alu, out, x, y);
+                match y {
+                    Ok(y) => self.asm.falu(alu, out, x, y),
+                    Err(constant) => self.asm.falu_const(alu, out, x, constant),
+                }
                 if op == BinOp::FIDiv {
                     self.asm.ffloor(out, out);
                 }
@@ -834,11 +861,19 @@ impl<A: Asm> Gen<'_, A> {
                 }
                 None => {
                     let ok = self.asm.new_label();
-                    for wanted in (0..11u8).filter(|&tag| !ty.intersect(Type::of_tag(tag)).is_none()) {
-                        self.asm.cmp_byte(reg, wanted);
-                        self.asm.branch(Cond::Eq, ok);
+                    let tags = (0..11u8).filter(|&tag| !ty.intersect(Type::of_tag(tag)).is_none());
+                    let count = tags.clone().count();
+                    if count == 0 {
+                        self.asm.jump(exit);
                     }
-                    self.asm.jump(exit);
+                    for (index, wanted) in tags.enumerate() {
+                        self.asm.cmp_byte(reg, wanted);
+                        if index + 1 == count {
+                            self.asm.branch(Cond::Ne, exit);
+                        } else {
+                            self.asm.branch(Cond::Eq, ok);
+                        }
+                    }
                     self.asm.bind(ok);
                 }
             },
@@ -906,22 +941,32 @@ impl<A: Asm> Gen<'_, A> {
             return;
         };
         let string = self.string_key(key);
-        let probe = string.map(|_| (self.temp(), self.temp(), self.temp()));
+        let scratch = (string.is_some() || integer.is_some()).then(|| [self.temp(), self.temp(), self.temp()]);
+        let probe = string.and(scratch).map(|[entry, key, node]| (entry, key, node));
+        let hashed = integer.and(scratch);
         let saves = self.saves(&[]);
         let join = self.asm.new_label();
         let slow = self.asm.new_label();
         let strings = if string.is_some() { self.asm.new_label() } else { slow };
-        if let Some((index, is_int)) = integer {
+        if let (Some((index, is_int)), Some(temps)) = (integer, hashed) {
+            let ints = self.asm.new_label();
             if let Some(key_tag) = is_int {
                 self.asm.cmp_byte(key_tag, INT_TAG);
                 self.asm.branch(Cond::Ne, strings);
             }
-            self.inside(address, payload, index, tag, slow);
+            self.inside(address, payload, index, tag, ints);
             self.asm.load(Width::Q, address, address, self.env.layout.array);
             self.asm.shl_imm(tag, tag, 4);
             self.asm.alu(Alu::Add, address, address, tag);
             self.asm.load(Width::Q, tag, address, 0);
             self.asm.load(Width::Q, word, address, PAYLOAD);
+            self.asm.cmp_byte(tag, NIL_TAG);
+            self.asm.branch(Cond::Ne, join);
+            self.asm.jump(slow);
+            self.asm.bind(ints);
+            self.int_node((address, index), temps, slow);
+            self.asm.load(Width::Q, tag, temps[2], NODE_VALUE);
+            self.asm.load(Width::Q, word, temps[2], NODE_VALUE + PAYLOAD);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
             if string.is_some() {
@@ -1000,6 +1045,41 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(found);
     }
 
+    /// Follows `Table::find_int`: PUC's `hashint` main position (ltable.c), then the collision chain. Leaves the node in
+    /// the last temporary; `address` holds the table.
+    fn int_node(&mut self, (address, key): (u8, u8), [entry, index, node]: [u8; 3], slow: Label) {
+        let layout = self.env.layout;
+        let walk = self.asm.new_label();
+        let follow = self.asm.new_label();
+        let found = self.asm.new_label();
+        self.asm.load(Width::Q, index, address, layout.nodes_len);
+        self.asm.cmp_imm(index, 0);
+        self.asm.branch(Cond::Eq, slow);
+        self.asm.alu_imm(Alu::Sub, index, index, 1);
+        self.asm.alu_imm(Alu::Or, index, index, 1);
+        self.asm.unsigned_rem(index, key, index);
+        self.asm.load(Width::Q, entry, address, layout.nodes);
+        self.asm.bind(walk);
+        self.asm.alu_imm(Alu::Mul, node, index, NODE_SIZE);
+        self.asm.alu(Alu::Add, node, node, entry);
+        self.asm.load(Width::B, A::SCRATCH, node, NODE_KEY);
+        self.asm.cmp_imm(A::SCRATCH, i32::from(INT_TAG));
+        self.asm.branch(Cond::Ne, follow);
+        self.asm.load(Width::Q, A::SCRATCH, node, NODE_KEY + PAYLOAD);
+        self.asm.cmp(A::SCRATCH, key);
+        self.asm.branch(Cond::Ne, follow);
+        self.asm.load(Width::B, A::SCRATCH, node, crate::table::offsets::NODE_DEAD as i32);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Eq, found);
+        self.asm.bind(follow);
+        self.asm.load(Width::W, index, node, crate::table::offsets::NODE_NEXT as i32);
+        self.asm.cmp_imm(index, 0);
+        self.asm.branch(Cond::Eq, slow);
+        self.asm.alu_imm(Alu::Sub, index, index, 1);
+        self.asm.jump(walk);
+        self.asm.bind(found);
+    }
+
     /// Jumps to `slow` past the array part.
     fn inside(&mut self, address: u8, table: u8, index: u8, position: u8, slow: Label) {
         self.table_address(address, table);
@@ -1018,19 +1098,22 @@ impl<A: Asm> Gen<'_, A> {
         let string = self.string_key(key);
         let address = self.temp();
         let element = self.temp();
-        let probe = string.map(|_| (self.temp(), self.temp(), self.temp()));
+        let scratch = (string.is_some() || integer.is_some()).then(|| [self.temp(), self.temp()]);
+        let probe = string.and(scratch).map(|[entry, key]| (entry, key, self.temp()));
+        let hashed = integer.and(scratch).map(|[entry, index]| [entry, index, element]);
         let saves = self.saves(&[]);
         let done = self.asm.new_label();
         let slow = self.asm.new_label();
         let strings = if string.is_some() { self.asm.new_label() } else { slow };
-        if let Some((index, is_int)) = integer {
+        if let (Some((index, is_int)), Some(temps)) = (integer, hashed) {
             let layout = self.env.layout;
             let store = self.asm.new_label();
+            let ints = self.asm.new_label();
             if let Some(key_tag) = is_int {
                 self.asm.cmp_byte(key_tag, INT_TAG);
                 self.asm.branch(Cond::Ne, strings);
             }
-            self.inside(address, payload, index, element, slow);
+            self.inside(address, payload, index, element, ints);
             self.asm.shl_imm(element, element, 4);
             self.asm.load(Width::Q, A::SCRATCH, address, layout.array);
             self.asm.alu(Alu::Add, element, element, A::SCRATCH);
@@ -1042,6 +1125,16 @@ impl<A: Asm> Gen<'_, A> {
             self.asm.branch(Cond::Ne, slow);
             self.asm.bind(store);
             self.store_pair(value, element, 0);
+            if self.may_collect(stored) {
+                self.barrier(payload, value, address, &saves);
+            }
+            self.asm.jump(done);
+            self.asm.bind(ints);
+            self.int_node((address, index), temps, slow);
+            self.asm.load(Width::B, A::SCRATCH, element, NODE_VALUE);
+            self.asm.cmp_imm(A::SCRATCH, i32::from(NIL_TAG));
+            self.asm.branch(Cond::Eq, slow);
+            self.store_pair(value, element, NODE_VALUE);
             if self.may_collect(stored) {
                 self.barrier(payload, value, address, &saves);
             }
@@ -1347,28 +1440,32 @@ impl<A: Asm> Gen<'_, A> {
         let charge = self.env.tier_budget;
         let cell = charge.map(|_| self.temp());
         let target = self.label(osr);
-        let next = self.asm.new_label();
         let slow = self.asm.new_label();
-        if !self.env.stress_exits {
-            let flags = self.reg(requests);
-            self.asm.cmp_mem_byte(flags, 0, 0);
-            match (charge, cell) {
-                (Some(address), Some(cell)) => {
-                    self.asm.branch(Cond::Ne, slow);
-                    self.spend(cell, address as i64, weight);
-                    self.asm.branch(Cond::Gt, next);
-                }
-                _ => self.asm.branch(Cond::Eq, next),
-            }
+        let stored = (!self.func.state(state).slots.is_empty()).then(|| self.exit_index(state));
+        self.safepoints.push(SafepointStub { label: slow, state: stored, pc, charge: charge.is_some(), target });
+        if self.env.stress_exits {
+            self.asm.jump(slow);
+            return;
         }
-        self.asm.bind(slow);
-        self.store_state(state);
-        self.poll(self.addresses.safe_point, pc);
-        if charge.is_some() {
-            self.poll(self.addresses.tier_check, pc);
+        let flags = self.reg(requests);
+        self.asm.cmp_mem_byte(flags, 0, 0);
+        self.asm.branch(Cond::Ne, slow);
+        if let (Some(address), Some(cell)) = (charge, cell) {
+            self.spend(cell, address as i64, weight);
+            self.asm.branch(Cond::Le, slow);
         }
-        self.asm.jump(target);
-        self.asm.bind(next);
+    }
+
+    pub(super) fn safepoint_tail(&mut self, stub: SafepointStub) {
+        self.asm.bind(stub.label);
+        if let Some(index) = stub.state {
+            self.store_state_at(index);
+        }
+        self.poll(self.addresses.safe_point, stub.pc);
+        if stub.charge {
+            self.poll(self.addresses.tier_check, stub.pc);
+        }
+        self.asm.jump(stub.target);
     }
 
     /// Leaves the flags of the old budget against `weight`.

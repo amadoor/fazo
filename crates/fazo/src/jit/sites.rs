@@ -139,16 +139,30 @@ pub(crate) fn calls_out(proto: &Proto) -> bool {
 pub(crate) fn loop_depths(proto: &Proto) -> Vec<u32> {
     let mut depths = vec![0u32; proto.code.len()];
     for (pc, &instruction) in proto.code.iter().enumerate() {
-        let target = match instruction {
-            Instruction::ForLoop { bx, .. } | Instruction::TForLoop { bx, .. } => pc + 1 - bx as usize,
-            Instruction::Jmp { sj } if sj < 0 => offset_pc(pc + 1, sj),
-            _ => continue,
+        let Some(target) = loop_start(pc, instruction) else {
+            continue;
         };
         for depth in &mut depths[target..=pc] {
             *depth += 1;
         }
     }
     depths
+}
+
+pub(crate) fn forward_jumps(proto: &Proto) -> usize {
+    proto.code.iter().filter(|&&instruction| matches!(instruction, Instruction::Jmp { sj } if sj >= 0)).count()
+}
+
+pub(crate) fn back_edges(proto: &Proto) -> usize {
+    proto.code.iter().enumerate().filter(|&(pc, &instruction)| loop_start(pc, instruction).is_some()).count()
+}
+
+fn loop_start(pc: usize, instruction: Instruction) -> Option<usize> {
+    match instruction {
+        Instruction::ForLoop { bx, .. } | Instruction::TForLoop { bx, .. } => Some(pc + 1 - bx as usize),
+        Instruction::Jmp { sj } if sj < 0 => Some(offset_pc(pc + 1, sj)),
+        _ => None,
+    }
 }
 
 fn lowered_at(proto: &Proto, pc: usize, instruction: Instruction) -> Lowered {

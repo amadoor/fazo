@@ -139,7 +139,8 @@ pub(crate) fn binary_operand_rep(op: BinOp) -> Rep {
 pub(crate) fn unary_operand_rep(op: UnOp) -> Option<Rep> {
     match op {
         UnOp::INeg | UnOp::IBnot | UnOp::IToF => Some(Rep::Int),
-        UnOp::FNeg => Some(Rep::Float),
+        UnOp::FNeg | UnOp::FSqrt => Some(Rep::Float),
+        UnOp::NumToF => Some(Rep::Boxed),
         UnOp::Not => Some(Rep::Bool),
         UnOp::Truthy | UnOp::Box | UnOp::Unbox => None,
     }

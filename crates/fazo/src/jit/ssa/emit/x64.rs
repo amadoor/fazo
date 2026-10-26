@@ -240,6 +240,23 @@ impl X64 {
         self.sse(Some(0xf2), opcode, dst, src);
     }
 
+    fn pooled(&mut self, opcode: u8, dst: u8, bits: u64) {
+        let index = match self.pool.iter().position(|&known| known == bits) {
+            Some(index) => index,
+            None => {
+                self.pool.push(bits);
+                self.pool.len() - 1
+            }
+        };
+        self.byte(0xf2);
+        if dst >= 8 {
+            self.byte(0x44);
+        }
+        self.bytes(&[0x0f, opcode, 0x05 | (dst & 7) << 3]);
+        self.pool_fixups.push((self.code.len() as u32, index as u32));
+        self.imm32(0);
+    }
+
     fn movaps(&mut self, dst: u8, src: u8) {
         self.sse(None, 0x28, dst, Rm::Reg(src));
     }
@@ -385,20 +402,21 @@ impl Asm for X64 {
             self.sse(None, 0x57, dst, Rm::Reg(dst));
             return;
         }
-        let index = match self.pool.iter().position(|&known| known == bits) {
-            Some(index) => index,
-            None => {
-                self.pool.push(bits);
-                self.pool.len() - 1
-            }
-        };
-        self.byte(0xf2);
-        if dst >= 8 {
-            self.byte(0x44);
+        self.pooled(0x10, dst, bits);
+    }
+
+    /// The constant is the instruction's RIP-relative memory operand, so it needs no register.
+    fn falu_const(&mut self, op: FAlu, dst: u8, left: u8, (bits, _scratch): (u64, u8)) {
+        if dst != left {
+            self.movaps(dst, left);
         }
-        self.bytes(&[0x0f, 0x10, 0x05 | (dst & 7) << 3]);
-        self.pool_fixups.push((self.code.len() as u32, index as u32));
-        self.imm32(0);
+        let opcode = match op {
+            FAlu::Add => 0x58,
+            FAlu::Mul => 0x59,
+            FAlu::Sub => 0x5c,
+            FAlu::Div => 0x5e,
+        };
+        self.pooled(opcode, dst, bits);
     }
 
     fn float_to_bits(&mut self, dst: u8, src: u8) {
@@ -507,6 +525,23 @@ impl Asm for X64 {
         self.pop(RDX);
     }
 
+    /// `DIV` takes its dividend in `rdx:rax`, so `rdx` is kept on the stack around it.
+    fn unsigned_rem(&mut self, dst: u8, x_reg: u8, y_reg: u8) {
+        self.push(RDX);
+        self.mov_rr(R11, y_reg);
+        self.mov_rr(RAX, x_reg);
+        self.alu_rr(Alu::Xor, RDX, RDX);
+        self.op(None, Size::Qword, &[0xf7], 6, Rm::Reg(R11));
+        if dst == RDX {
+            self.mov_rr(R11, RDX);
+            self.group_imm(group(Alu::Add), Size::Qword, Rm::Reg(RSP), 8);
+            self.mov_rr(RDX, R11);
+            return;
+        }
+        self.mov_rr(dst, RDX);
+        self.pop(RDX);
+    }
+
     fn add_mem(&mut self, dst: u8, base: u8, disp: i32) {
         self.op(None, Size::Qword, &[0x03], dst, Rm::Mem(base, disp));
     }
@@ -595,6 +630,10 @@ impl Asm for X64 {
         self.op(None, Size::Qword, &[0x0f, 0xba], 7, Rm::Reg(R11));
         self.byte(63);
         self.movq_to_float(dst, R11);
+    }
+
+    fn fsqrt(&mut self, dst: u8, src: u8) {
+        self.sse(Some(0xf2), 0x51, dst, Rm::Reg(src));
     }
 
     /// `ROUNDSD` is SSE4.1, which `compile` requires; mode 9 rounds toward negative infinity without the precision

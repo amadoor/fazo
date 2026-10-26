@@ -40,15 +40,16 @@ pub(crate) fn run(func: &mut Func) {
         return;
     }
     let tables: Vec<Val> = func.blocks.iter().flat_map(|block| block.insts.iter().copied()).filter(|&value| matches!(func.op(value), Op::NewTable { .. })).collect();
+    let mut known = users(func);
     for table in tables {
-        let users = users(func);
-        let Some(candidate) = candidate(func, &users, table) else {
+        let Some(candidate) = candidate(func, &known, table) else {
             continue;
         };
         let Some(positions) = state_positions(func, &candidate) else {
             continue;
         };
         sink(func, &candidate, &positions);
+        known = users(func);
     }
 }
 

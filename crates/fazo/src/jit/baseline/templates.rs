@@ -4,7 +4,7 @@
 use std::mem::offset_of;
 
 use super::masm::{Alu, Cond, Division, FAlu, FCond, FReg, Imm, Masm, Reg, Target, Width, ext, slot};
-use crate::jit::{FrameLayout, JitCtx, TableLayout, layout::{lua_frame, upvalue}};
+use crate::jit::{FrameLayout, JitCtx, TableLayout, layout::{lua_frame, upvalue}, ssa::ir::{KIND_FLOAT, KIND_INT}};
 use crate::vm::exec_layout;
 
 pub(crate) const NIL: i32 = 0;
@@ -846,6 +846,7 @@ fn arith(m: &mut dyn Masm, op: ArithKind, rhs: Rhs) {
         m.load(Width::U64, Reg::T2, Reg::Base, payload(slot::B));
         m.int_to_float(FReg::F0, Reg::T2);
         rhs_float(m, rhs, FReg::F1);
+        record_kinds(m, MIXED, if rhs == Rhs::Reg { KIND_INT | KIND_FLOAT } else { KIND_INT });
         m.jump(float_op);
     } else {
         m.jump(slow());
@@ -863,10 +864,12 @@ fn arith(m: &mut dyn Masm, op: ArithKind, rhs: Rhs) {
         m.branch(Cond::Ne, slow());
         m.load(Width::U64, Reg::T2, Reg::Base, payload(slot::C));
         m.int_to_float(FReg::F1, Reg::T2);
+        record_kinds(m, MIXED, KIND_INT | KIND_FLOAT);
         m.jump(float_op);
         m.bind(right_float);
     }
     rhs_float(m, rhs, FReg::F1);
+    record_kinds(m, 0, KIND_FLOAT);
 
     m.bind(float_op);
     let fop = match op {
@@ -881,6 +884,15 @@ fn arith(m: &mut dyn Masm, op: ArithKind, rhs: Rhs) {
     m.store_f(FReg::F0, Reg::Base, payload(slot::A));
     m.jump(Target::Ext(ext::SKIP));
 }
+
+/// Records the operand kinds this path took in one of the instruction's cells, as Sparkplug's arithmetic updates the
+/// operation's feedback slot (V8 src/baseline/baseline-compiler.cc, `VisitAdd`).
+fn record_kinds(m: &mut dyn Masm, cell: i64, kinds: u8) {
+    m.mov_imm(Reg::T5, reg(slot::U));
+    m.store_imm(Width::U8, Reg::T5, fixed(cell), i32::from(kinds));
+}
+
+const MIXED: i64 = 1;
 
 fn int_arith(m: &mut dyn Masm, op: ArithKind, rhs: Rhs) {
     match op {

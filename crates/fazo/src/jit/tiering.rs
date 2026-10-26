@@ -13,8 +13,12 @@ use crate::{
 /// Bytecode predicts a graph's size poorly, so Peak compiles are also estimated from Optimizing code.
 const COMPILE_IR_PER_UNIT: i64 = 1_823_874;
 const COMPILE_IR_PER_CLASS: Sizes = [0, 876_703, 0, 495_796, 0, 0];
-const OPTIMIZING_IR_PER_UNIT: i64 = 131_031;
-const OPTIMIZING_IR_PER_CLASS: Sizes = [69_677, 30_045, 8_188, 76_111, 0, 0];
+const OPTIMIZING_IR_PER_UNIT: i64 = 166_137;
+const OPTIMIZING_IR_PER_CLASS: Sizes = [0, 19_195, 0, 21_132, 1_771, 63_939];
+/// Each loop adds blocks, parameters and fixpoint rounds to every pass.
+const OPTIMIZING_IR_PER_LOOP: i64 = 187_708;
+/// Each forward jump adds blocks, edges and exit states.
+const OPTIMIZING_IR_PER_JUMP: i64 = 88_707;
 /// Peak compile Ir per byte of the prototype's Optimizing code.
 const PEAK_IR_PER_OPTIMIZING_BYTE: i64 = 3_096;
 const LOOP_WEIGHT: i64 = 8;
@@ -116,6 +120,9 @@ pub(crate) struct Estimate {
     pub(crate) weight: i64,
     /// Includes the inlined callees' bytecodes, since the compile pays for them.
     pub(crate) sizes: Sizes,
+    /// Inlined callees have none, since the inlining policy takes no loops.
+    pub(crate) loops: i64,
+    pub(crate) jumps: i64,
 }
 
 impl Estimate {
@@ -160,9 +167,16 @@ pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>], lookup: &Lookup
         gain = gain.saturating_add(site_gain.saturating_mul(scale));
         weight = weight.saturating_add(scale);
     }
-    let (per_unit, per_class) = if peak { (COMPILE_IR_PER_UNIT, COMPILE_IR_PER_CLASS) } else { (OPTIMIZING_IR_PER_UNIT, OPTIMIZING_IR_PER_CLASS) };
-    let cost = sizes.iter().zip(per_class).fold(per_unit, |cost, (&size, per)| cost.saturating_add(size.saturating_mul(per)));
-    Estimate { cost, gain, weight: weight.max(1), sizes }
+    let loops = super::sites::back_edges(proto) as i64;
+    let jumps = super::sites::forward_jumps(proto) as i64;
+    let (per_unit, per_class, per_loop, per_jump) = if peak {
+        (COMPILE_IR_PER_UNIT, COMPILE_IR_PER_CLASS, 0, 0)
+    } else {
+        (OPTIMIZING_IR_PER_UNIT, OPTIMIZING_IR_PER_CLASS, OPTIMIZING_IR_PER_LOOP, OPTIMIZING_IR_PER_JUMP)
+    };
+    let fixed = per_unit.saturating_add(loops.saturating_mul(per_loop)).saturating_add(jumps.saturating_mul(per_jump));
+    let cost = sizes.iter().zip(per_class).fold(fixed, |cost, (&size, per)| cost.saturating_add(size.saturating_mul(per)));
+    Estimate { cost, gain, weight: weight.max(1), sizes, loops, jumps }
 }
 
 /// Cranelift is slower than Optimizing except on table construction and wide calls.
@@ -229,7 +243,7 @@ fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Loo
 }
 
 fn inlined_builtin(builtin: Builtin) -> bool {
-    matches!(builtin, Builtin::Type | Builtin::RawEqual | Builtin::RawGet | Builtin::GetMetatable | Builtin::SetMetatable)
+    matches!(builtin, Builtin::Type | Builtin::RawEqual | Builtin::RawGet | Builtin::GetMetatable | Builtin::SetMetatable | Builtin::Sqrt)
 }
 
 fn depth_weight(depth: u32) -> i64 {

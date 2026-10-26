@@ -325,6 +325,12 @@ impl Asm for A64 {
         self.asm().mvn(r(dst), r(src));
     }
 
+    fn unsigned_rem(&mut self, dst: u8, x_reg: u8, y_reg: u8) {
+        let q = r(SCRATCH2);
+        self.asm().udiv(q, r(x_reg), r(y_reg));
+        self.asm().msub(r(dst), q, r(y_reg), r(x_reg));
+    }
+
     /// Follows Baseline's `floor_div`: `SDIV` truncates, so the remainder is corrected when its sign differs.
     fn floor_div(&mut self, op: Division, dst: u8, x_reg: u8, y_reg: u8) {
         let done = self.buffer.get_label();
@@ -407,6 +413,10 @@ impl Asm for A64 {
 
     fn fneg(&mut self, dst: u8, src: u8) {
         self.asm().fneg(f(dst), f(src));
+    }
+
+    fn fsqrt(&mut self, dst: u8, src: u8) {
+        self.asm().fsqrt(f(dst), f(src));
     }
 
     fn ffloor(&mut self, dst: u8, src: u8) {

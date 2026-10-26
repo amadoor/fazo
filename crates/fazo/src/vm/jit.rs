@@ -396,6 +396,10 @@ impl Vm {
         if inline_caches {
             self.jit_keep_added_shapes(proto);
         }
+        let function = self.heap.protos.live_mut(proto);
+        if function.exec.arith_kinds.is_empty() {
+            function.exec.arith_kinds = function.code.iter().flat_map(|_| [std::cell::Cell::new(0), std::cell::Cell::new(0)]).collect();
+        }
         let function = self.heap.protos.live(proto);
         if charges {
             self.jit_peak_wait(proto, peak_wait);
@@ -511,7 +515,7 @@ impl Vm {
         self.jit_trace_sites(proto);
         let avoid = self.heap.protos.live(proto).jit.avoid.clone();
         let insufficient = self.heap.protos.live(proto).jit.insufficient.clone();
-        let observed = self.heap.protos.live(proto).jit.observed.clone();
+        let observed = observed_kinds(self.heap.protos.live(proto));
         let nodes = self.jit_node_hints(proto);
         let running_floats = if at.is_some() { self.jit_running_floats(proto) } else { Vec::new() };
         let environment = self.jit_environment(proto);
@@ -561,12 +565,14 @@ impl Vm {
                     let length = self.heap.protos.live(proto).code.len();
                     let clif_insts = unit.size();
                     let line = format!(
-                        "{} estimate (cost {}, gain {} per {} bytecodes, after {executed}; {length} bytecodes, sizes {:?}, {clif_insts} {})",
+                        "{} estimate (cost {}, gain {} per {} bytecodes, after {executed}; {length} bytecodes, sizes {:?}, loops {}, jumps {}, {clif_insts} {})",
                         tier.name(),
                         estimate.cost,
                         estimate.gain,
                         estimate.weight,
                         estimate.sizes,
+                        estimate.loops,
+                        estimate.jumps,
                         if tier == Tier::Peak { "Cranelift instructions" } else { "code bytes" }
                     );
                     self.jit_trace(proto, &line);
@@ -1993,6 +1999,18 @@ fn trace_source(chunkname: &[u8]) -> &[u8] {
         Some(b'@' | b'=') => &chunkname[1..],
         _ => chunkname,
     }
+}
+
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn observed_kinds(function: &Proto) -> Vec<(u32, u8)> {
+    let mut observed = function.jit.observed.clone();
+    for (site, [float, mixed]) in function.exec.arith_kinds.as_chunks::<2>().0.iter().enumerate() {
+        let (site, kinds) = (site as u32, float.get() | mixed.get());
+        if kinds != 0 && !observed.iter().any(|&(known, _)| known == site) {
+            observed.push((site, kinds));
+        }
+    }
+    observed
 }
 
 /// True when the site saw number kinds it had not; a recompile then guesses them rather than giving up the site, as V8 widens `kSignedSmall` to `kNumber` (src/objects/feedback-vector.h, `BinaryOperationHint`).

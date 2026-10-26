@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use super::insert;
 use crate::jit::ssa::{
     check::{binary_operand_rep, unary_operand_rep},
-    ir::{BlockId, Closure, Func, Op, PureFn, Rep, Type, UnOp, Val},
+    ir::{BlockId, Closure, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
 };
 
 pub(crate) fn run(func: &mut Func) {
@@ -80,51 +80,101 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
     }
 }
 
+/// A conversion serves every block its block dominates, as V8 keeps a node's converted alternatives in its `NodeInfo`
+/// (src/maglev/maglev-graph-builder.cc, `GetTaggedValue`).
 fn convert(func: &mut Func) {
-    for block in func.reverse_postorder() {
-        let mut cache: HashMap<(Val, Rep), Val> = HashMap::new();
-        let mut position = 0;
-        while position < func.block(block).insts.len() {
-            let value = func.block(block).insts[position];
-            let wants = required(func, value);
-            let mut op = func.op(value).clone();
-            let mut inserted = 0;
-            let mut index = 0;
-            let mut conversions = Vec::new();
-            op.map_operands(|operand| {
-                let wanted = wants.get(index).copied().flatten();
-                index += 1;
-                match wanted {
-                    Some(rep) if func.rep(operand) != rep => {
-                        conversions.push((operand, rep));
-                        operand
-                    }
-                    _ => operand,
-                }
-            });
-            let mut converted = Vec::new();
-            for (operand, rep) in conversions {
-                let replacement = conversion(func, &mut cache, (block, position + inserted), operand, rep, &mut inserted);
-                converted.push((operand, rep, replacement));
-            }
-            let mut index = 0;
-            op.map_operands(|operand| {
-                let wanted = wants.get(index).copied().flatten();
-                index += 1;
-                match wanted {
-                    Some(rep) => converted.iter().find(|&&(from, to, _)| from == operand && to == rep).map_or(operand, |&(_, _, to)| to),
-                    None => operand,
-                }
-            });
-            func.inst_mut(value).op = op;
-            position += inserted + 1;
+    let idom = func.dominators();
+    let order = func.reverse_postorder();
+    let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
+    let mut roots = Vec::new();
+    for &block in &order {
+        match idom[block.0 as usize] {
+            Some(parent) if parent.0 != u32::MAX && parent != block => children[parent.0 as usize].push(block),
+            _ => roots.push(block),
         }
-        convert_edges(func, block, &mut cache);
+    }
+    let mut cache = Cache::default();
+    for root in roots {
+        let mut stack: Vec<(BlockId, Option<usize>)> = vec![(root, None)];
+        while let Some((block, undo)) = stack.pop() {
+            if let Some(mark) = undo {
+                cache.restore(mark);
+                continue;
+            }
+            stack.push((block, Some(cache.added.len())));
+            convert_block(func, block, &mut cache);
+            for &child in children[block.0 as usize].iter().rev() {
+                stack.push((child, None));
+            }
+        }
     }
 }
 
-fn conversion(func: &mut Func, cache: &mut HashMap<(Val, Rep), Val>, (block, position): (BlockId, usize), operand: Val, rep: Rep, inserted: &mut usize) -> Val {
-    if let Some(&known) = cache.get(&(operand, rep)) {
+#[derive(Default)]
+struct Cache {
+    known: HashMap<(Val, Rep), Val>,
+    added: Vec<(Val, Rep)>,
+}
+
+impl Cache {
+    fn get(&self, key: (Val, Rep)) -> Option<Val> {
+        self.known.get(&key).copied()
+    }
+
+    fn insert(&mut self, key: (Val, Rep), value: Val) {
+        self.known.insert(key, value);
+        self.added.push(key);
+    }
+
+    fn restore(&mut self, mark: usize) {
+        for key in self.added.drain(mark..) {
+            self.known.remove(&key);
+        }
+    }
+}
+
+fn convert_block(func: &mut Func, block: BlockId, cache: &mut Cache) {
+    let mut position = 0;
+    while position < func.block(block).insts.len() {
+        let value = func.block(block).insts[position];
+        let wants = required(func, value);
+        let mut op = func.op(value).clone();
+        let mut inserted = 0;
+        let mut index = 0;
+        let mut conversions = Vec::new();
+        op.map_operands(|operand| {
+            let wanted = wants.get(index).copied().flatten();
+            index += 1;
+            match wanted {
+                Some(rep) if func.rep(operand) != rep => {
+                    conversions.push((operand, rep));
+                    operand
+                }
+                _ => operand,
+            }
+        });
+        let mut converted = Vec::new();
+        for (operand, rep) in conversions {
+            let replacement = conversion(func, cache, (block, position + inserted), operand, rep, &mut inserted);
+            converted.push((operand, rep, replacement));
+        }
+        let mut index = 0;
+        op.map_operands(|operand| {
+            let wanted = wants.get(index).copied().flatten();
+            index += 1;
+            match wanted {
+                Some(rep) => converted.iter().find(|&&(from, to, _)| from == operand && to == rep).map_or(operand, |&(_, _, to)| to),
+                None => operand,
+            }
+        });
+        func.inst_mut(value).op = op;
+        position += inserted + 1;
+    }
+    convert_edges(func, block, cache);
+}
+
+fn conversion(func: &mut Func, cache: &mut Cache, (block, position): (BlockId, usize), operand: Val, rep: Rep, inserted: &mut usize) -> Val {
+    if let Some(known) = cache.get((operand, rep)) {
         return known;
     }
     let ty = func.ty(operand);
@@ -135,8 +185,13 @@ fn conversion(func: &mut Func, cache: &mut HashMap<(Val, Rep), Val>, (block, pos
     value
 }
 
-fn convert_edges(func: &mut Func, block: BlockId, cache: &mut HashMap<(Val, Rep), Val>) {
+/// Conversions go before a branch's trailing comparison, so the backend can still fuse the two.
+fn convert_edges(func: &mut Func, block: BlockId, cache: &mut Cache) {
     let mut term = func.block(block).term.clone();
+    let compared = match term {
+        Term::Branch { cond, .. } if func.block(block).insts.last() == Some(&cond) => 1,
+        _ => 0,
+    };
     for edge in term.edges_mut() {
         let params = func.block(edge.block).params.clone();
         for (arg, param) in edge.args.iter_mut().zip(params) {
@@ -144,7 +199,7 @@ fn convert_edges(func: &mut Func, block: BlockId, cache: &mut HashMap<(Val, Rep)
             if func.rep(*arg) == rep {
                 continue;
             }
-            let end = func.block(block).insts.len();
+            let end = func.block(block).insts.len() - compared;
             let mut inserted = 0;
             *arg = conversion(func, cache, (block, end), *arg, rep, &mut inserted);
         }

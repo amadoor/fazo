@@ -75,6 +75,10 @@ pub(crate) struct Exec {
     budget: Pointer<std::cell::Cell<i64>>,
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     entry: Pointer<std::cell::Cell<usize>>,
+    /// Two cells per instruction (float, mixed) so each path stores a constant instead of merging; written by Baseline code
+    /// at a fixed address (V8 feedback-vector.h, `BinaryOperationHint`).
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) arith_kinds: Box<[std::cell::Cell<u8>]>,
 }
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

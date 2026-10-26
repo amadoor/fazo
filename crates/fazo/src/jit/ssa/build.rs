@@ -126,6 +126,21 @@ struct Builder<'a, 'f> {
     current: Option<BlockId>,
 }
 
+#[derive(Clone, Copy)]
+enum Reduced {
+    Helper(BuiltinFn),
+    Sqrt,
+}
+
+fn helper_type(function: BuiltinFn) -> Type {
+    match function {
+        BuiltinFn::Type => Type::of_tag(4),
+        BuiltinFn::RawEqual => Type::BOOL,
+        BuiltinFn::SetMetatable => Type::TABLE,
+        BuiltinFn::RawGet | BuiltinFn::GetMetatable => Type::ANY,
+    }
+}
+
 impl<'a> Builder<'a, '_> {
     fn frame(&self, proto: &'a Proto, base: u32, chain: Vec<InlineFrame>, site: Option<u32>, caller: Option<(u32, i32)>) -> Frame<'a> {
         let captured = if chain.is_empty() {
@@ -1401,7 +1416,7 @@ impl<'a> Builder<'a, '_> {
     }
 
     /// Follows V8 Maglev's `TryReduceBuiltin` (src/maglev/maglev-graph-builder.cc).
-    fn builtin_candidate(&self, proto: &Proto, pc: usize, (b, c): (u8, u8)) -> Option<(BuiltinFn, u64)> {
+    fn builtin_candidate(&self, proto: &Proto, pc: usize, (b, c): (u8, u8)) -> Option<(Reduced, u64)> {
         if !self.facts.inline_caches || b == 0 || c == 0 {
             return None;
         }
@@ -1412,36 +1427,40 @@ impl<'a> Builder<'a, '_> {
             return None;
         };
         let (function, arguments) = match (self.facts.builtin_of)(native)? {
-            Builtin::Type => (BuiltinFn::Type, 1),
-            Builtin::RawEqual => (BuiltinFn::RawEqual, 2),
-            Builtin::RawGet => (BuiltinFn::RawGet, 2),
-            Builtin::GetMetatable => (BuiltinFn::GetMetatable, 1),
-            Builtin::SetMetatable => (BuiltinFn::SetMetatable, 2),
+            Builtin::Type => (Reduced::Helper(BuiltinFn::Type), 1),
+            Builtin::RawEqual => (Reduced::Helper(BuiltinFn::RawEqual), 2),
+            Builtin::RawGet => (Reduced::Helper(BuiltinFn::RawGet), 2),
+            Builtin::GetMetatable => (Reduced::Helper(BuiltinFn::GetMetatable), 1),
+            Builtin::SetMetatable => (Reduced::Helper(BuiltinFn::SetMetatable), 2),
+            Builtin::Sqrt => (Reduced::Sqrt, 1),
             _ => return None,
         };
         (u32::from(b) - 1 == arguments).then_some((function, native.packed()))
     }
 
     /// A builtin that refuses its arguments deoptimizes to the generic call's frame state.
-    fn builtin_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8), (function, native): (BuiltinFn, u64)) -> usize {
+    fn builtin_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8), (reduced, native): (Reduced, u64)) -> usize {
         let state = self.state_at(frame, pc);
         let callee = self.read(frame, a);
         let callee = self.emit(Op::GuardType { value: callee, ty: Type::of_tag(7), state }, Type::of_tag(7), Rep::Payload);
         self.effect(Op::GuardEq { value: callee, expected: native, state });
         let args: Box<[Val]> = (1..b).map(|offset| self.read(frame, a + offset)).collect();
-        let ty = match function {
-            BuiltinFn::Type => Type::of_tag(4),
-            BuiltinFn::RawEqual => Type::BOOL,
-            BuiltinFn::SetMetatable => Type::TABLE,
-            BuiltinFn::RawGet | BuiltinFn::GetMetatable => Type::ANY,
+        let result = match reduced {
+            Reduced::Helper(function) => self.emit(Op::Builtin { function, args, state }, helper_type(function), Rep::Boxed),
+            Reduced::Sqrt => self.sqrt(args[0], state),
         };
-        let result = self.emit(Op::Builtin { function, args, state }, ty, Rep::Boxed);
         self.write(frame, a, result);
         let nil = self.constant(Const::Nil);
         for offset in 1..c.saturating_sub(1) {
             self.write(frame, a + offset, nil);
         }
         pc + 1
+    }
+
+    /// Follows Maglev's `Float64Sqrt` (src/maglev/maglev-ir.h); an integer argument deoptimizes, and the site then calls the builtin.
+    fn sqrt(&mut self, argument: Val, state: StateId) -> Val {
+        let float = self.emit(Op::GuardType { value: argument, ty: Type::FLOAT, state }, Type::FLOAT, Rep::Boxed);
+        self.emit(Op::Unary(UnOp::FSqrt, float), Type::FLOAT, Rep::Float)
     }
 
     /// Follows Maglev's `BuildInlineFunction`.

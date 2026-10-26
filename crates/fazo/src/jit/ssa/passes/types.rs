@@ -24,7 +24,8 @@ pub(crate) fn propagate(func: &mut Func) {
     while changed {
         changed = false;
         for &block in &order {
-            for value in func.block(block).insts.clone() {
+            for index in 0..func.block(block).insts.len() {
+                let value = func.block(block).insts[index];
                 let ty = transfer(func, value);
                 if func.inst(value).ty != ty {
                     func.inst_mut(value).ty = ty;
@@ -38,16 +39,21 @@ pub(crate) fn propagate(func: &mut Func) {
 
 fn flow_edges(func: &mut Func, block: BlockId) -> bool {
     let mut changed = false;
-    let edges: Vec<(BlockId, Vec<Val>)> = func.block(block).term.edges().into_iter().map(|edge| (edge.block, edge.args.clone())).collect();
-    for (target, args) in edges {
-        let params = func.block(target).params.clone();
-        for (param, arg) in params.into_iter().zip(args) {
+    let mut index = 0;
+    while let Some(edge) = func.block(block).term.edge(index) {
+        let target = edge.block;
+        for position in 0..edge.args.len().min(func.block(target).params.len()) {
+            let Some(edge) = func.block(block).term.edge(index) else {
+                break;
+            };
+            let (arg, param) = (edge.args[position], func.block(target).params[position]);
             let merged = func.ty(param).union(func.ty(arg));
             if merged != func.ty(param) {
                 func.inst_mut(param).ty = merged;
                 changed = true;
             }
         }
+        index += 1;
     }
     changed
 }
@@ -217,14 +223,16 @@ impl Site {
     }
 
     fn float(&mut self, func: &mut Func, operand: Val) -> Val {
-        if func.ty(operand) == Type::FLOAT {
+        let ty = func.ty(operand);
+        if ty == Type::FLOAT {
             return operand;
         }
         if let Op::Const(Const::Int(integer)) = func.op(operand) {
             let float = *integer as f64;
             return self.add(func, Op::Const(Const::Float(float)), Type::FLOAT, Rep::Float);
         }
-        self.add(func, Op::Unary(UnOp::IToF, operand), Type::FLOAT, Rep::Float)
+        let conversion = if ty == Type::INT { UnOp::IToF } else { UnOp::NumToF };
+        self.add(func, Op::Unary(conversion, operand), Type::FLOAT, Rep::Float)
     }
 }
 
@@ -236,12 +244,14 @@ fn kind(ty: Type) -> Option<Type> {
 }
 
 fn specialize_arith(func: &mut Func, (block, position): (BlockId, usize), value: Val, (op, left, right, state): (NumOp, Val, Val, StateId)) -> usize {
-    let (Some(left_kind), Some(right_kind)) = (kind(func.ty(left)), kind(func.ty(right))) else {
-        return 0;
-    };
+    let (left_ty, right_ty) = (func.ty(left), func.ty(right));
     let mut site = Site { block, position, inserted: 0 };
-    let integers = left_kind == Type::INT && right_kind == Type::INT;
-    let new = if integers { integer_op(func, &mut site, op, (left, right), state) } else { float_op(func, &mut site, op, (left, right)) };
+    let new = match (kind(left_ty), kind(right_ty)) {
+        (Some(Type::INT), Some(Type::INT)) => integer_op(func, &mut site, op, (left, right), state),
+        (Some(_), Some(_)) => float_op(func, &mut site, op, (left, right)),
+        _ if always_float(op, left_ty, right_ty) => float_op(func, &mut site, op, (left, right)),
+        _ => return 0,
+    };
     let Some((new, ty)) = new else {
         return site.inserted;
     };
@@ -251,6 +261,12 @@ fn specialize_arith(func: &mut Func, (block, position): (BlockId, usize), value:
     inst.ty = ty;
     inst.rep = rep;
     site.inserted
+}
+
+/// Follows V8 Maglev's `CheckedNumberToFloat64` (src/maglev/maglev-ir.h): a float result converts an operand that may be either kind.
+fn always_float(op: NumOp, left: Type, right: Type) -> bool {
+    let numbers = |ty: Type| !ty.is_none() && ty.within(Type::NUM);
+    numbers(left) && numbers(right) && arith_type(op, left, right) == Type::FLOAT
 }
 
 fn integer_op(func: &mut Func, site: &mut Site, op: NumOp, (left, right): (Val, Val), state: StateId) -> Option<(Op, Type)> {

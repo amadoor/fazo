@@ -185,6 +185,23 @@ fn type_propagation_specializes_integer_and_mixed_arithmetic() {
 }
 
 #[test]
+fn type_propagation_converts_a_number_of_either_kind_when_the_result_is_a_float() {
+    let (mut func, block) = straight_line();
+    let s = state(&mut func, 1);
+    let loaded = func.append(block, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let number = func.append(block, Op::GuardType { value: loaded, ty: Type::NUM, state: s }, Type::NUM, Rep::Boxed);
+    let half = constant(&mut func, block, Const::Float(0.5));
+    let sum = func.append(block, Op::Arith { op: NumOp::Add, left: number, right: half, state: s }, Type::NUM, Rep::Boxed);
+    let both = func.append(block, Op::Arith { op: NumOp::Add, left: number, right: number, state: s }, Type::NUM, Rep::Boxed);
+    returns(&mut func, block, sum);
+    types::run(&mut func);
+    assert!(matches!(func.op(sum), Op::Binary(BinOp::FAdd, _, right) if *right == half), "{func}");
+    assert!(ops(&func, block).iter().any(|op| matches!(op, Op::Unary(UnOp::NumToF, operand) if *operand == number)), "{func}");
+    assert!(matches!(func.op(both), Op::Arith { .. }), "two operands of either kind may add to an integer:
+{func}");
+}
+
+#[test]
 fn type_propagation_guards_integer_division_by_zero_and_drops_proven_guards() {
     let (mut func, block) = straight_line();
     let s = state(&mut func, 1);
@@ -224,6 +241,20 @@ fn folding_uses_lua_arithmetic() {
     assert_eq!(func.op(modulo), &Op::Const(Const::Int(2)), "-7 % 3 is 2 in Lua");
     assert_eq!(func.op(quotient), &Op::Const(Const::Int(-3)), "-7 // 3 is -3 in Lua");
     assert_eq!(func.op(sum), &Op::Const(Const::Int(-1)));
+}
+
+#[test]
+fn folding_takes_square_roots_and_converts_numbers() {
+    let (mut func, block) = straight_line();
+    let two = constant(&mut func, block, Const::Float(2.0));
+    let three = constant(&mut func, block, Const::Int(3));
+    let root = func.append(block, Op::Unary(UnOp::FSqrt, two), Type::FLOAT, Rep::Float);
+    let converted = func.append(block, Op::Unary(UnOp::NumToF, three), Type::FLOAT, Rep::Float);
+    let sum = func.append(block, Op::Binary(BinOp::FAdd, root, converted), Type::FLOAT, Rep::Float);
+    returns(&mut func, block, sum);
+    fold::run(&mut func);
+    assert_eq!(func.op(root), &Op::Const(Const::Float(2.0f64.sqrt())));
+    assert_eq!(func.op(converted), &Op::Const(Const::Float(3.0)));
 }
 
 #[test]
@@ -298,6 +329,34 @@ fn representation_selection_unboxes_loop_parameters_and_boxes_at_stores() {
     assert!(reps.iter().all(|&rep| rep == Rep::Int), "every loop parameter is an unboxed integer: {reps:?}\n{func}");
     let ops = all_ops(&func);
     assert!(ops.iter().any(|op| matches!(op, Op::Unary(UnOp::Box, _))), "the returned sum is boxed for its register");
+}
+
+#[test]
+fn representation_selection_reuses_a_dominating_conversion_and_keeps_a_branch_comparison_last() {
+    let mut func = Func::default();
+    let entry = func.new_block();
+    let left = func.new_block();
+    let join = func.new_block();
+    func.entry = Some(entry);
+    let s = state(&mut func, 1);
+    let loaded = func.append(entry, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let float = func.append(entry, Op::GuardType { value: loaded, ty: Type::FLOAT, state: s }, Type::FLOAT, Rep::Boxed);
+    let sum = func.append(entry, Op::Binary(BinOp::FAdd, float, float), Type::FLOAT, Rep::Float);
+    let zero = constant(&mut func, entry, Const::Float(0.0));
+    let less = func.append(entry, Op::Binary(BinOp::FCmp(Cc::Lt), sum, zero), Type::BOOL, Rep::Bool);
+    let param = func.add_param(join, Type::ANY, Rep::Boxed);
+    func.block_mut(entry).term = Term::Branch { cond: less, then: Edge { block: join, args: vec![sum] }, other: Edge::to(left) };
+    func.append(left, Op::StoreReg { slot: 2, value: sum }, Type::NONE, Rep::None);
+    func.block_mut(left).term = Term::Jump(Edge { block: join, args: vec![sum] });
+    func.append(join, Op::StoreReg { slot: 3, value: param }, Type::NONE, Rep::None);
+    func.block_mut(join).term = Term::Return { pc: 9, first: 0, count: 0, close: false };
+    repr::run(&mut func);
+    check::check(&func, true).expect("every operand has the representation its op reads");
+    let boxes = all_ops(&func).into_iter().filter(|op| matches!(op, Op::Unary(UnOp::Box, operand) if *operand == sum)).count();
+    assert_eq!(boxes, 1, "the entry's box serves the block it dominates:
+{func}");
+    assert_eq!(func.block(entry).insts.last(), Some(&less), "the comparison stays next to its branch:
+{func}");
 }
 
 #[test]

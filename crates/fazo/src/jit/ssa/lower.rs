@@ -761,9 +761,21 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 let x = self.one(operand);
                 Word::One(self.builder.ins().fneg(x))
             }
+            UnOp::FSqrt => {
+                let x = self.one(operand);
+                Word::One(self.builder.ins().sqrt(x))
+            }
             UnOp::IToF => {
                 let x = self.one(operand);
                 Word::One(self.builder.ins().fcvt_from_sint(types::F64, x))
+            }
+            UnOp::NumToF => {
+                let (tag_word, payload) = self.pair(operand);
+                let tag = self.tag_of(tag_word);
+                let is_int = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, INT_TAG);
+                let converted = self.builder.ins().fcvt_from_sint(types::F64, payload);
+                let float = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), payload);
+                Word::One(self.builder.ins().select(is_int, converted, float))
             }
         }
     }

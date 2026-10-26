@@ -291,6 +291,16 @@ mod x64_encoding {
     }
 
     #[test]
+    fn unsigned_remainder_keeps_rdx() {
+        let lines = listing(|a| a.unsigned_rem(12, 13, 2));
+        assert_eq!(lines.first().map(String::as_str), Some("push rdx"));
+        assert!(lines.iter().any(|line| line == "div r11"), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("pop rdx"));
+        let into_rdx = listing(|a| a.unsigned_rem(2, 13, 12));
+        assert_eq!(into_rdx.last().map(String::as_str), Some("mov rdx,r11"), "{into_rdx:?}");
+    }
+
+    #[test]
     fn float_comparisons_test_parity_for_unordered_operands() {
         let lines = listing(|a| a.fset(FCond::Eq, 12, 1, 2));
         assert!(lines.contains(&"setnp r11b".to_string()), "{lines:?}");
@@ -325,6 +335,13 @@ mod x64_encoding {
         let instructions: Vec<Instruction> = (&mut decoder).into_iter().collect();
         assert!(instructions.iter().all(|i| !i.is_invalid()), "{code:02x?}");
         instructions
+    }
+
+    fn pooled(build: impl FnOnce(&mut X64)) -> Instruction {
+        let mut asm = X64::new();
+        build(&mut asm);
+        let code = asm.finish().expect("the code assembles");
+        Decoder::with_ip(64, &code, 0, DecoderOptions::NONE).decode()
     }
 
     fn one(build: impl FnOnce(&mut X64)) -> Instruction {
@@ -442,6 +459,9 @@ mod x64_encoding {
         assert_eq!(regs(&one(|x| x.bits_to_float(a, b))), vec![xmm(a), gpq(b)]);
         assert_eq!(regs(&one(|x| x.float_to_bits(a, b))), vec![gpq(a), xmm(b)]);
         assert_eq!(regs(&one(|x| x.ffloor(a, b))), vec![xmm(a), xmm(b)]);
+        assert_eq!(regs(&one(|x| x.fsqrt(a, b))), vec![xmm(a), xmm(b)]);
+        let i = pooled(|x| x.falu_const(FAlu::Mul, a, a, (1.5f64.to_bits(), b)));
+        assert_eq!((i.mnemonic(), regs(&i), i.is_ip_rel_memory_operand()), (Mnemonic::Mulsd, vec![xmm(a)], true));
         assert_eq!(regs(&one(|x| x.zext32(a, b))), vec![gpd(a), gpd(b)]);
         assert_eq!(regs(&decoded(|x| x.int_to_float(a, b))[1]), vec![xmm(a), gpq(b)]);
         if a != b {
@@ -644,12 +664,19 @@ mod a64_encoding {
     fn float_forms() {
         assert_eq!(listing(|a| a.falu(FAlu::Div, 0, 1, 0)), ["fdiv d0, d1, d0"]);
         assert_eq!(listing(|a| a.fneg(0, 1)), ["fneg d0, d1"]);
+        assert_eq!(listing(|a| a.fsqrt(0, 1)), ["fsqrt d0, d1"]);
+        assert_eq!(listing(|a| a.falu_const(FAlu::Sub, 0, 1, (0, 2))).last().map(String::as_str), Some("fsub d0, d1, d2"));
         assert!(listing(|a| a.ffloor(0, 1))[0].starts_with("frintm"));
         assert_eq!(listing(|a| a.bits_to_float(0, 9)), ["fmov d0, x9"]);
         assert_eq!(listing(|a| a.float_to_bits(9, 0)), ["fmov x9, d0"]);
         assert_eq!(listing(|a| a.int_to_float(0, 9)), ["scvtf d0, x9"]);
         assert_eq!(listing(|a| a.fset(FCond::Lt, 3, 0, 1)), ["fcmp d0, d1", "cset x3, mi"]);
         assert_eq!(listing(|a| a.fset(FCond::Le, 3, 0, 1)), ["fcmp d0, d1", "cset x3, ls"]);
+    }
+
+    #[test]
+    fn unsigned_remainder_divides_and_multiplies_back() {
+        assert_eq!(listing(|a| a.unsigned_rem(3, 4, 5)), ["udiv x17, x4, x5", "msub x3, x17, x5, x4"]);
     }
 
     #[test]
