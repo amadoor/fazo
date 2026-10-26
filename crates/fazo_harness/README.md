@@ -56,17 +56,20 @@ first `cargo test` needs network access. Once the cache exists they work offline
 - `lua`: the PUC-Rio Lua version the results compare against.
 - `tests.<suite>.<run>`: `pass`, `fail` and `skip` counts and the names of the failing files or cases, for the
   suites `official`, `cases`, `syntax`, `cli` and `generated`. The run is the `--jit` tier (`normal`,
-  `interpreter`, `baseline`, `peak`), or the name given with `--entry` (`gc-stress`, `debug`). A
+  `interpreter`, `baseline`, `optimizing`, `peak`), or the name given with `--entry` (`gc-stress`, `debug`). A
   generated failure is named `<profile>/<seed>`. A case or seed that runs past its deadline is a failure
   named `<case> (timeout)`. `skip` counts out-of-scope official files, command-line
   cases with a known gap, and generated programs PUC Lua rejects.
 - `bytecode`: written by `cargo xtask bytecode`.
 - `perf` and `operations`: written by `cargo xtask perf`, in Valgrind instructions net of the empty script.
-  `perf.<workload>` holds `puc`, `fazo` (normal tiering), `baseline` (`-X tier=baseline`), `peak`
-  (`-X force=peak`), `interpreter` (`-X tier=interpreter`), `luajit` (JIT on) and `luajit_interpreter`
-  (`-joff`). A workload LuaJIT cannot run has `null` LuaJIT numbers and the reason in `luajit_missing`.
-  `operations.<op>` holds the per-statement count for `puc`, `fazo` (the interpreter), `baseline`, `peak`
-  and `luajit`, and the interpreter's budget from `perf/ops/budgets.txt`.
+  `perf.<workload>` holds `puc`, `fazo` (normal tiering), `baseline` (`-X tier=baseline`), `optimizing`
+  (`-X force=optimizing`), `peak` (`-X force=peak`), `interpreter` (`-X tier=interpreter`), `luajit` (JIT
+  on) and `luajit_interpreter` (`-joff`), and `split`: normal tiering's Ir inside compiles (`compile`),
+  before the first Optimizing or Peak code runs (`before_optimized`), and the rest (`steady`). A workload
+  LuaJIT cannot run has `null` LuaJIT numbers and the reason in `luajit_missing`. `operations.<op>` holds
+  the per-statement count for `puc`, `fazo` (the interpreter), `baseline`, `optimizing`, `peak` and
+  `luajit`, and the interpreter's budget from `perf/ops/budgets.txt`. `compile_cost` holds the Ir per
+  bytecode of a 500-statement function compiled by Peak, by Optimizing and by LuaJIT.
 
 Each run reads the file, replaces only its own entries and writes it back.
 
@@ -125,15 +128,18 @@ the PUC ratio and the operation budgets fail the run.
 needs neither Valgrind nor the reference cache. It runs:
 
 - `cargo test -p fazo --lib`;
-- every workload in `perf/` under `-X force=peak`, under `-X force=peak stress-exit=3 stress-ic`, and
-  under default tiering, each compared with its output under `-X tier=interpreter`;
-- every per-operation script in `perf/ops/` under `-X force=peak`, compared with the interpreter;
+- every workload in `perf/` under `-X force=peak`, `-X force=optimizing`, each of those with
+  `stress-exit=3 stress-ic`, and under default tiering, each compared with its output under
+  `-X tier=interpreter`;
+- every per-operation script in `perf/ops/` under `-X force=peak` and `-X force=optimizing`, compared with
+  the interpreter;
 - a deopt and recompile report from the JIT's own counters (`-X jitstats`), which counts as a failure any
-  deopt site that fired 8 times or more, any prototype compiled by Peak 6 times or more, and any prototype
+  deopt site that fired 8 times or more, any prototype compiled by Optimizing and Peak 6 times or more, and any prototype
   recompiled 8 times or more;
 - `seeds` generated programs per generator profile (Full, Metatables and Core; default 100) under
-  `-X force=peak`, compared with the interpreter;
-- the official `math`, `calls`, `nextvar`, `coroutine` and `sort` tests under `-X force=peak`.
+  `-X force=peak` and `-X force=optimizing`, compared with the interpreter;
+- the official `math`, `calls`, `nextvar`, `coroutine` and `sort` tests under `-X force=peak` and
+  `-X force=optimizing`.
 
 It builds fazo with the `profiling` profile and prints each step's time and every failure.
 

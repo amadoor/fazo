@@ -138,7 +138,7 @@ impl BaselineUnit {
         self.start
     }
 
-    fn install(code: &[u8], trailer: Option<super::unwind::Trailer>, budget: Arc<CodeBudget>) -> Option<Self> {
+    pub(crate) fn install(code: &[u8], trailer: Option<super::unwind::Trailer>, budget: Arc<CodeBudget>) -> Option<Self> {
         let len = code.len().max(1).next_multiple_of(PAGE);
         budget.reserve(len).ok()?;
         let Ok(start) = sys::reserve(len) else {

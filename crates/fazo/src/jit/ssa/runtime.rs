@@ -134,6 +134,11 @@ extern "C" fn safe_point(ctx: *mut JitCtx, target: u32) -> i64 {
     })
 }
 
+/// Optimizing code out of budget asks whether Peak pays now.
+pub(crate) extern "C" fn tier_check(ctx: *mut JitCtx, pc: u32) -> i64 {
+    with_vm(ctx, |ctx, vm| vm.jit_tier_check(ctx, pc as usize, crate::Tier::Optimizing))
+}
+
 extern "C" fn resume(ctx: *mut JitCtx, pc: i64) -> i64 {
     with_vm(ctx, |_, vm| {
         vm.save_pc(pc as usize);

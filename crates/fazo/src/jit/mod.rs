@@ -62,7 +62,7 @@ pub(crate) use memory::CodeBudget;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use unit::{Compiler, JitUnit};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use compile::{CompileFacts, compile};
+pub(crate) use compile::{CompileFacts, compile, compile_optimizing};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use ssa::build::NodeHint;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -97,21 +97,21 @@ impl Tier {
         }
     }
 
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Interpreter => Self::Baseline,
+            Self::Baseline => Self::Optimizing,
+            Self::Optimizing | Self::Peak => Self::Peak,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Interpreter => "interpreter",
             Self::Baseline => "baseline",
             Self::Optimizing => "optimizing",
             Self::Peak => "peak",
-        }
-    }
-
-    /// Optimizing is not built, so it resolves to Baseline.
-    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub(crate) fn built(self) -> Self {
-        match self {
-            Self::Optimizing => Self::Baseline,
-            other => other,
         }
     }
 }
@@ -302,6 +302,9 @@ pub(crate) struct ProtoJit {
     pub(crate) deopts: u32,
     pub(crate) deopt_sites: Vec<(u32, u32)>,
     pub(crate) peak_compiles: u32,
+    pub(crate) optimizing_compiles: u32,
+    /// Estimated bytecodes compiled per tier, Optimizing then Peak; `-X jitstats` reports them to fit compile cost.
+    pub(crate) compiled_bytecodes: [i64; 2],
     /// Bytecodes the Peak budgets handed out so far stand for, the work the payoff estimate weighs the compile against.
     pub(crate) peak_executed: i64,
     pub(crate) float_guess: bool,
@@ -344,7 +347,7 @@ impl ProtoJit {
     pub(crate) fn tier(&self) -> Tier {
         match (self.failed || self.hidden, &self.unit, &self.baseline) {
             (true, _, _) => Tier::Interpreter,
-            (false, Some(_), _) => Tier::Peak,
+            (false, Some(unit), _) => unit.tier(),
             (false, None, Some(_)) => Tier::Baseline,
             (false, None, None) => Tier::Interpreter,
         }

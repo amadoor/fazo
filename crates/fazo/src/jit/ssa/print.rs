@@ -215,6 +215,6 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::Materialize { object } => format!("materialize {}", virtual_text(object)),
         Op::GuardAbsent { table, bit, state } => format!("guard.absent {} bit{bit} s{}", v(table), state.0),
         Op::CallLua { pc, a, b, c } => format!("call @{pc} r{a} b{b} c{c}"),
-        Op::Safepoint { pc, state } => format!("safepoint @{pc} s{}", state.0),
+        Op::Safepoint { pc, weight, state } => format!("safepoint @{pc} x{weight} s{}", state.0),
     }
 }

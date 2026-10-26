@@ -337,6 +337,8 @@ const MODES: &[&[&str]] = &[
     &["stress-threshold=100000", "stress-exit=7"],
     &["force=baseline", "stress-ic"],
     &["force=peak", "stress-ic", "stress-exit=3"],
+    &["force=optimizing"],
+    &["force=optimizing", "stress-ic", "stress-exit=3"],
 ];
 
 const INTERPRETER: &[&str] = &["tier=interpreter"];
@@ -519,9 +521,10 @@ fn compiled_ir_size(statements: usize) -> usize {
         type_names: [0; 8],
         sink_allocations: true,
         running_floats: &[],
+        tier_budget: None,
     };
     let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
-    unit.unit.ir_insts()
+    unit.size()
 }
 
 #[test]

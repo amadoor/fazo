@@ -61,6 +61,8 @@ pub struct Tiers {
     pub baseline: Option<Suite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak: Option<Suite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizing: Option<Suite>,
     #[serde(default, rename = "gc-stress", skip_serializing_if = "Option::is_none")]
     pub gc_stress: Option<Suite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +76,7 @@ impl Tiers {
             Run::Interpreter => &mut self.interpreter,
             Run::Baseline => &mut self.baseline,
             Run::Peak => &mut self.peak,
+            Run::Optimizing => &mut self.optimizing,
             Run::GcStress => &mut self.gc_stress,
             Run::Debug => &mut self.debug,
         }
@@ -86,6 +89,7 @@ pub enum Run {
     Interpreter,
     Baseline,
     Peak,
+    Optimizing,
     GcStress,
     Debug,
 }
@@ -97,6 +101,7 @@ impl Run {
             "interpreter" => Some(Self::Interpreter),
             "baseline" => Some(Self::Baseline),
             "peak" => Some(Self::Peak),
+            "optimizing" => Some(Self::Optimizing),
             "gc-stress" => Some(Self::GcStress),
             "debug" => Some(Self::Debug),
             _ => None,
@@ -140,8 +145,12 @@ pub struct Workload {
     pub puc: i64,
     pub fazo: i64,
     pub baseline: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizing: Option<i64>,
     pub peak: i64,
     pub interpreter: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<Split>,
     pub luajit: Option<i64>,
     pub luajit_interpreter: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,10 +164,19 @@ pub struct Operation {
     #[serde(default)]
     pub baseline: f64,
     #[serde(default)]
+    pub optimizing: f64,
+    #[serde(default)]
     pub peak: f64,
     #[serde(default)]
     pub luajit: f64,
     pub budget: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Split {
+    pub compile: i64,
+    pub before_optimized: i64,
+    pub steady: i64,
 }
 
 /// Peak compile Ir per bytecode for one function of `statements` global updates run 200 times, and LuaJIT's on the same code.
@@ -166,6 +184,8 @@ pub struct Operation {
 pub struct CompileCost {
     pub statements: u32,
     pub peak_per_bytecode: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizing_per_bytecode: Option<f64>,
     pub luajit_per_bytecode: f64,
     pub peak_per_statement: f64,
     pub luajit_per_statement: f64,
@@ -267,6 +287,7 @@ mod tests {
       "puc": 157.0,
       "fazo": 158.0,
       "baseline": 21.0,
+      "optimizing": 0.0,
       "peak": 12.5,
       "luajit": 0.0,
       "budget": 161.0
@@ -284,8 +305,10 @@ mod tests {
                     puc: 161_182_880,
                     fazo: 119_494_966,
                     baseline: 132_675_213,
+                    optimizing: None,
                     peak: 239_120_413,
                     interpreter: 177_381_266,
+                    split: None,
                     luajit: Some(20_412_555),
                     luajit_interpreter: Some(98_120_437),
                     luajit_missing: None,
@@ -297,8 +320,10 @@ mod tests {
                     puc: 1000,
                     fazo: 900,
                     baseline: 950,
+                    optimizing: None,
                     peak: 800,
                     interpreter: 1100,
+                    split: None,
                     luajit: None,
                     luajit_interpreter: None,
                     luajit_missing: Some("no generational collector".to_owned()),
@@ -306,7 +331,7 @@ mod tests {
             );
             board.operations.insert(
                 "call0".to_owned(),
-                Operation { puc: 157.0, fazo: 158.0, baseline: 21.0, peak: 12.5, luajit: 0.0, budget: 161.0 },
+                Operation { puc: 157.0, fazo: 158.0, baseline: 21.0, optimizing: 0.0, peak: 12.5, luajit: 0.0, budget: 161.0 },
             );
             *board.tests.official.entry(Run::Interpreter) =
                 Some(Suite { pass: 30, fail: 1, skip: 2, failures: vec!["coroutine.lua".to_owned()] });

@@ -42,6 +42,7 @@ pub(crate) struct Env<'a> {
     pub(crate) call_depth_limit: u32,
     pub(crate) points: &'a [DeoptPoint],
     pub(crate) stress_exits: bool,
+    pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -705,7 +706,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 Word::None
             }
             Op::CallLua { pc, a, b, c } => Word::One(self.call_lua(pc as usize, (a, b, c))),
-            Op::Safepoint { pc, state } => {
+            Op::Safepoint { pc, state, .. } => {
                 self.safepoint(pc, state);
                 Word::None
             }

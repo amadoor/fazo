@@ -121,8 +121,10 @@ fn all_ops(func: &Func) -> Vec<Op> {
 
 #[test]
 fn an_empty_function_optimizes() {
-    let mut func = Func::default();
-    super::optimize(&mut func, true).expect("an empty function stays valid");
+    for pipeline in [super::PEAK, super::OPTIMIZING] {
+        let mut func = Func::default();
+        super::optimize(&mut func, pipeline, true).expect("an empty function stays valid");
+    }
 }
 
 #[test]
@@ -132,7 +134,7 @@ fn the_builder_keeps_a_numeric_loop_in_block_parameters() {
     assert_eq!(func.loops.len(), 1, "one loop");
     assert!(func.loops[0].counted.is_some(), "the integer loop with a constant step is counted");
     assert!(!func.osr.is_empty(), "the loop header can be entered from the interpreter");
-    super::optimize(&mut func, true).expect("the passes keep the graph valid");
+    super::optimize(&mut func, super::PEAK, true).expect("the passes keep the graph valid");
     let ops = all_ops(&func);
     assert!(ops.iter().any(|op| matches!(op, Op::Binary(BinOp::IAdd, ..))), "the sum is an integer add:\n{func}");
     assert!(!ops.iter().any(|op| matches!(op, Op::Arith { .. })), "no generic arithmetic is left:\n{func}");

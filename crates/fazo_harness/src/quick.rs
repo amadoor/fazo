@@ -15,9 +15,12 @@ const WORKLOAD_DEADLINE: Duration = Duration::from_secs(120);
 const OFFICIAL_DEADLINE: Duration = Duration::from_secs(300);
 const OFFICIAL_FILES: [&str; 5] = ["math.lua", "calls.lua", "nextvar.lua", "coroutine.lua", "sort.lua"];
 const INTERPRETER: &[&str] = &["-X", "tier=interpreter"];
-const MODES: [(&str, &[&str]); 3] = [
+const FORCED: [(&str, &[&str]); 2] = [("force=peak", &["-X", "force=peak"]), ("force=optimizing", &["-X", "force=optimizing"])];
+const MODES: [(&str, &[&str]); 5] = [
     ("force=peak", &["-X", "force=peak", "-X", "jitstats"]),
     ("force=peak stress", &["-X", "force=peak", "-X", "stress-exit=3", "-X", "stress-ic", "-X", "jitstats"]),
+    ("force=optimizing", &["-X", "force=optimizing", "-X", "jitstats"]),
+    ("force=optimizing stress", &["-X", "force=optimizing", "-X", "stress-exit=3", "-X", "stress-ic", "-X", "jitstats"]),
     ("default", &["-X", "jitstats"]),
 ];
 /// A storm counts even when output is right; a recursive prototype deoptimizes once per retired frame, so the site limit sits above the recompile limit.
@@ -101,12 +104,18 @@ fn operations(fazo: &Path, report: &mut Report) {
             let args: Vec<&str> = flags.iter().copied().chain([script.as_str()]).collect();
             reference::execute(fazo, &args, &dir, reference::scaled(WORKLOAD_DEADLINE))
         };
-        let (Ok(expected), Ok(forced)) = (run(INTERPRETER), run(&["-X", "force=peak"])) else {
+        let Ok(expected) = run(INTERPRETER) else {
             report.failures.push(format!("ops/{script}: could not run"));
             continue;
         };
-        if !forced.success || forced.stdout != expected.stdout {
-            report.failures.push(format!("ops/{script} (force=peak): {}", String::from_utf8_lossy(reference::first_line(&forced.stderr))));
+        for (mode, flags) in FORCED {
+            let Ok(forced) = run(flags) else {
+                report.failures.push(format!("ops/{script} ({mode}): could not run"));
+                continue;
+            };
+            if !forced.success || forced.stdout != expected.stdout {
+                report.failures.push(format!("ops/{script} ({mode}): {}", String::from_utf8_lossy(reference::first_line(&forced.stderr))));
+            }
         }
     }
 }
@@ -140,7 +149,7 @@ fn jit_stats(stderr: &[u8]) -> (String, Vec<String>) {
         };
         let field = |key: &str| fields.split(' ').find_map(|part| part.strip_prefix(key)).unwrap_or("");
         let number = |key: &str| field(key).parse::<u32>().unwrap_or(0);
-        let counts = [number("peak="), number("deopts="), number("recompiles="), number("declines=")];
+        let counts = [number("peak=") + number("optimizing="), number("deopts="), number("recompiles="), number("declines=")];
         for (total, count) in totals.iter_mut().zip(counts) {
             *total += count;
         }
@@ -152,7 +161,7 @@ fn jit_stats(stderr: &[u8]) -> (String, Vec<String>) {
             storms.push(format!("{name} {fields}"));
         }
     }
-    let summary = format!("peak {} deopts {} recompiles {} declines {}", totals[0], totals[1], totals[2], totals[3]);
+    let summary = format!("optimized {} deopts {} recompiles {} declines {}", totals[0], totals[1], totals[2], totals[3]);
     (summary, storms)
 }
 
@@ -163,16 +172,18 @@ fn generated(seeds: u64, report: &mut Report) {
             let source = generator::program_for(seed, profile);
             differential::set_jit_mode(JitMode::Interpreter);
             let expected = differential::run_fazo(source.as_bytes(), "t");
-            differential::set_jit_mode(JitMode::Peak);
-            let peak = differential::run_fazo(source.as_bytes(), "t");
-            checked += 1;
-            if !same(&expected, &peak) {
-                report.failures.push(format!("seed {profile:?}/{seed}: force=peak differs from the interpreter"));
+            for (mode, name) in [(JitMode::Peak, "force=peak"), (JitMode::Optimizing, "force=optimizing")] {
+                differential::set_jit_mode(mode);
+                let forced = differential::run_fazo(source.as_bytes(), "t");
+                if !same(&expected, &forced) {
+                    report.failures.push(format!("seed {profile:?}/{seed}: {name} differs from the interpreter"));
+                }
             }
+            checked += 1;
         }
     }
     differential::set_jit_mode(JitMode::Normal);
-    report.lines.push(format!("generated programs: {checked} under force=peak"));
+    report.lines.push(format!("generated programs: {checked} under force=peak and force=optimizing"));
 }
 
 fn same(left: &Outcome, right: &Outcome) -> bool {
@@ -187,16 +198,16 @@ fn official_files(fazo: &Path, report: &mut Report) {
             return;
         }
     };
-    for name in OFFICIAL_FILES {
-        let args = ["-X", "force=peak", "-e", official::PORTABLE_MODE, name];
+    for (name, (mode, flags)) in OFFICIAL_FILES.iter().flat_map(|&name| FORCED.map(|forced| (name, forced))) {
+        let args = [flags[0], flags[1], "-e", official::PORTABLE_MODE, name];
         let verdict = match reference::execute(fazo, &args, &suite, reference::scaled(OFFICIAL_DEADLINE)) {
             Ok(captured) if captured.success => None,
             Ok(captured) => Some(String::from_utf8_lossy(&reference::error_message(fazo, &captured)).into_owned()),
             Err(error) => Some(error),
         };
         match verdict {
-            None => report.lines.push(format!("official {name}: pass")),
-            Some(reason) => report.failures.push(format!("official {name} (force=peak): {reason}")),
+            None => report.lines.push(format!("official {name} ({mode}): pass")),
+            Some(reason) => report.failures.push(format!("official {name} ({mode}): {reason}")),
         }
     }
 }

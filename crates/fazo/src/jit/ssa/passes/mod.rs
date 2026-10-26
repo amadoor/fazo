@@ -13,9 +13,9 @@ mod tests;
 
 use super::ir::{BlockId, Func, Op, Rep, Type, Val};
 
-type Pass = (&'static str, fn(&mut Func));
+pub(crate) type Pass = (&'static str, fn(&mut Func));
 
-const PASSES: [Pass; 11] = [
+pub(crate) const PEAK: &[Pass] = &[
     ("types", types::run),
     ("forward", forward::run),
     ("fold", fold::run),
@@ -29,10 +29,24 @@ const PASSES: [Pass; 11] = [
     ("dce", dce::run),
 ];
 
+/// Peak's pipeline without the last `fold`, whose compile was not repaid under `force=optimizing`. Keeping the first `types` avoids a boxed accumulator in spectral-norm under default tiering.
+pub(crate) const OPTIMIZING: &[Pass] = &[
+    ("types", types::run),
+    ("forward", forward::run),
+    ("fold", fold::run),
+    ("types", types::run),
+    ("fold", fold::run),
+    ("escape", escape::run),
+    ("repr", repr::run),
+    ("hoist", hoist::run),
+    ("bounds", bounds::run),
+    ("dce", dce::run),
+];
+
 /// Follows V8's `--maglev-verify-graph`.
-pub(crate) fn optimize(func: &mut Func, verify: bool) -> Result<(), String> {
+pub(crate) fn optimize(func: &mut Func, pipeline: &[Pass], verify: bool) -> Result<(), String> {
     let mut reps_selected = false;
-    for (name, pass) in PASSES {
+    for &(name, pass) in pipeline {
         let before = verify.then(|| func.clone());
         pass(func);
         reps_selected |= name == "repr";

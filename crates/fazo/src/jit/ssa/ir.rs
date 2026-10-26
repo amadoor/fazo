@@ -275,7 +275,8 @@ pub(crate) enum Op {
     Materialize { object: Box<Virtual> },
     GuardAbsent { table: Val, bit: u8, state: StateId },
     CallLua { pc: u32, a: u8, b: u8, c: u8 },
-    Safepoint { pc: u32, state: StateId },
+    /// `weight` is the loop's length in bytecodes, the work one iteration stands for.
+    Safepoint { pc: u32, weight: u32, state: StateId },
 }
 
 impl Op {

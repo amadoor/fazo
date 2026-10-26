@@ -32,6 +32,8 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) type_names: [u64; 8],
     pub(crate) sink_allocations: bool,
     pub(crate) running_floats: &'a [bool],
+    /// The cell Optimizing code charges its work to, when it may tier up to Peak.
+    pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
 }
 
 /// The compiled unit, and the optimized graph's text when `dump` asks for it.
@@ -39,7 +41,7 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     let (Some(layout), Some(frames)) = (facts.layout, facts.frames) else {
         return Err(unsupported("the table and frame layouts are unknown"));
     };
-    let func = optimized(proto, facts)?;
+    let func = optimized(proto, facts, passes::PEAK)?;
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
     let env = lower::Env {
@@ -49,6 +51,7 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         call_depth_limit: facts.call_depth_limit,
         points: &points,
         stress_exits: facts.stress_exits,
+        tier_budget: None,
     };
     let symbols = lower::symbols();
     let unit = JitUnit::compile(compiler, budget, &symbols, |module, function, context| lower::define(module, function, context, &func, &env))?;
@@ -57,10 +60,46 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         entries.push(0);
     }
     let shapes = func.shapes.clone();
-    Ok((PeakUnit { unit, _points: points, entries, shapes }, text))
+    Ok((PeakUnit { code: ssa::Code::Cranelift { unit: Box::new(unit), _points: points }, entries, shapes }, text))
 }
 
-pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitResult<ssa::ir::Func> {
+pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, facts: &CompileFacts<'a>, dump: bool) -> JitResult<(PeakUnit, Option<String>)> {
+    let (Some(layout), Some(frames)) = (facts.layout, facts.frames) else {
+        return Err(unsupported("the table and frame layouts are unknown"));
+    };
+    let func = optimized(proto, facts, passes::OPTIMIZING)?;
+    let text = dump.then(|| func.to_string());
+    let points = ssa::points(&func);
+    let env = lower::Env {
+        layout,
+        frames,
+        calls: &facts.calls,
+        call_depth_limit: facts.call_depth_limit,
+        points: &[],
+        stress_exits: facts.stress_exits,
+        tier_budget: facts.tier_budget,
+    };
+    let native = native(&func, &env, points, (budget, dump)).ok_or_else(|| unsupported("the Optimizing backend declined the graph"))?;
+    let text = text.map(|text| format!("{text}code {}\n", native.listing.as_deref().unwrap_or_default()));
+    let mut entries: Vec<u32> = func.osr.iter().map(|&(pc, _)| pc).collect();
+    if func.entry.is_some() {
+        entries.push(0);
+    }
+    let shapes = func.shapes.clone();
+    Ok((PeakUnit { code: ssa::Code::Native(native), entries, shapes }, text))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn native(func: &ssa::ir::Func, env: &lower::Env<'_>, points: Box<[ssa::DeoptPoint]>, (budget, listing): (Arc<CodeBudget>, bool)) -> Option<ssa::emit::Native> {
+    ssa::emit::compile(func, env, points, budget, listing)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn native(_func: &ssa::ir::Func, _env: &lower::Env<'_>, _points: Box<[ssa::DeoptPoint]>, _budget: (Arc<CodeBudget>, bool)) -> Option<ssa::emit::Native> {
+    None
+}
+
+pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, pipeline: &[passes::Pass]) -> JitResult<ssa::ir::Func> {
     let builder_facts = build::Facts {
         inline_caches: facts.inline_caches,
         avoid: facts.avoid,
@@ -79,7 +118,7 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitRe
     func.type_names = Some(facts.type_names);
     func.sink_allocations = facts.sink_allocations;
     ssa::check::check(&func, false).map_err(|message| unsupported(&format!("built graph: {message}")))?;
-    passes::optimize(&mut func, cfg!(debug_assertions)).map_err(|message| unsupported(&format!("optimized graph {message}")))?;
+    passes::optimize(&mut func, pipeline, cfg!(debug_assertions)).map_err(|message| unsupported(&format!("optimized graph {message}")))?;
     ssa::check::check(&func, true).map_err(|message| unsupported(&format!("optimized graph: {message}")))?;
     Ok(func)
 }

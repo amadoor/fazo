@@ -2,6 +2,7 @@
 
 pub(crate) mod build;
 pub(crate) mod check;
+pub(crate) mod emit;
 pub(crate) mod flow;
 pub(crate) mod ir;
 pub(crate) mod lower;
@@ -19,17 +20,38 @@ pub(crate) struct DeoptPoint {
     pub(crate) lazy: bool,
 }
 
-/// The points outlive the code, which addresses them.
+pub(crate) enum Code {
+    Cranelift { unit: Box<super::JitUnit>, _points: Box<[DeoptPoint]> },
+    Native(emit::Native),
+}
+
+/// Optimized code of either tier; the points and exits outlive the code, which addresses them.
 pub(crate) struct PeakUnit {
-    pub(crate) unit: super::JitUnit,
-    pub(crate) _points: Box<[DeoptPoint]>,
+    pub(crate) code: Code,
     pub(crate) entries: Vec<u32>,
     pub(crate) shapes: Vec<crate::arena::Ref<crate::shape::Shape>>,
 }
 
 impl PeakUnit {
     pub(crate) fn entry(&self) -> *const u8 {
-        self.unit.entry()
+        match &self.code {
+            Code::Cranelift { unit, .. } => unit.entry(),
+            Code::Native(native) => native.entry(),
+        }
+    }
+
+    pub(crate) fn tier(&self) -> crate::Tier {
+        match self.code {
+            Code::Cranelift { .. } => crate::Tier::Peak,
+            Code::Native(_) => crate::Tier::Optimizing,
+        }
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        match &self.code {
+            Code::Cranelift { unit, .. } => unit.ir_insts(),
+            Code::Native(native) => native.bytes,
+        }
     }
 
     pub(crate) fn enters_at(&self, pc: usize) -> bool {

@@ -14,6 +14,7 @@ const EMPTY_SCRIPT: &str = "empty.lua";
 const INTERPRETER_ONLY: &[&str] = &["-X", "tier=interpreter"];
 const BASELINE_ONLY: &[&str] = &["-X", "tier=baseline"];
 const PEAK_ONLY: &[&str] = &["-X", "force=peak"];
+const OPTIMIZING_ONLY: &[&str] = &["-X", "force=optimizing"];
 const OPERATIONS_DIR: &str = "ops";
 const BUDGETS_FILE: &str = "budgets.txt";
 const OPERATIONS_PER_RUN: f64 = 2_000_000.0;
@@ -28,8 +29,18 @@ const COMPILE_CALLS: u32 = 200;
 /// `aaa = aaa + 1` is GETTABUP, ADDI, MMBINI and SETTABUP in Lua 5.5, and GGET, ADDVN and GSET in LuaJIT (`luajit -bl`).
 const FAZO_BYTECODES_PER_STATEMENT: f64 = 4.0;
 const LUAJIT_BYTECODES_PER_STATEMENT: f64 = 3.0;
-/// Callgrind counts only inside Peak's compile entry point, under either symbol spelling.
-const PEAK_COMPILE_SYMBOLS: [&str; 2] = ["*4fazo3jit7compile7compile", "fazo::jit::compile::compile"];
+/// Callgrind counts only inside `Vm::jit_compile_optimized_at`, which every Optimizing and Peak compile goes through.
+const OPTIMIZED_COMPILE_SYMBOL: &str = "*2Vm24jit_compile_optimized_at";
+const PEAK_COMPILE_SYMBOLS: &[&str] = &["*4fazo3jit7compile7compile", "fazo::jit::compile::compile"];
+const OPTIMIZING_COMPILE_SYMBOLS: &[&str] = &["*4fazo3jit7compile18compile_optimizing*", "fazo::jit::compile::compile_optimizing"];
+const ALL_COMPILE_SYMBOLS: &[&str] = &[
+    "*4fazo3jit7compile7compile",
+    "fazo::jit::compile::compile",
+    "*4fazo3jit7compile18compile_optimizing*",
+    "fazo::jit::compile::compile_optimizing",
+    "*4fazo3jit8baseline7compile*",
+    "fazo::jit::baseline::compile",
+];
 const NO_GENERATIONAL_COLLECTOR: &str =
     "LuaJIT 2.1 has no generational collector: collectgarbage(\"generational\") is an invalid option";
 
@@ -101,6 +112,7 @@ struct OperationCounts {
     puc: f64,
     interpreter: f64,
     baseline: f64,
+    optimizing: f64,
     peak: f64,
     luajit: f64,
 }
@@ -121,8 +133,11 @@ struct Counts {
     puc: f64,
     fazo: f64,
     baseline: f64,
+    optimizing: f64,
     peak: f64,
     interpreter: f64,
+    compile: f64,
+    before_optimized: f64,
     luajit: Option<LuajitCounts>,
 }
 
@@ -223,8 +238,11 @@ impl Counts {
             puc: run(&interpreters.puc, &[], "puc", script)?,
             fazo: run(&interpreters.fazo, &[], "fazo", script)?,
             baseline: run(&interpreters.fazo, BASELINE_ONLY, "baseline", script)?,
+            optimizing: run(&interpreters.fazo, OPTIMIZING_ONLY, "optimizing", script)?,
             peak: run(&interpreters.fazo, PEAK_ONLY, "peak", script)?,
             interpreter: run(&interpreters.fazo, INTERPRETER_ONLY, "interpreter", script)?,
+            compile: inside(&interpreters.fazo, &[], ALL_COMPILE_SYMBOLS, (out_dir, &format!("compile-{label}")), (script, scripts.arguments))?,
+            before_optimized: before_first(&interpreters.fazo, (out_dir, &format!("before-{label}")), (script, scripts.arguments))?,
             luajit,
         })
     }
@@ -238,8 +256,11 @@ impl Counts {
             puc: self.puc - empty.puc,
             fazo: self.fazo - empty.fazo,
             baseline: self.baseline - empty.baseline,
+            optimizing: self.optimizing - empty.optimizing,
             peak: self.peak - empty.peak,
             interpreter: self.interpreter - empty.interpreter,
+            compile: self.compile - empty.compile,
+            before_optimized: self.before_optimized - empty.before_optimized,
             luajit,
         }
     }
@@ -262,8 +283,10 @@ fn workload_entry(measurement: &Measurement) -> report::Workload {
         puc: whole(counts.puc),
         fazo: whole(counts.fazo),
         baseline: whole(counts.baseline),
+        optimizing: Some(whole(counts.optimizing)),
         peak: whole(counts.peak),
         interpreter: whole(counts.interpreter),
+        split: Some(counts.split()),
         luajit: counts.luajit.map(|luajit| whole(luajit.jit)),
         luajit_interpreter: counts.luajit.map(|luajit| whole(luajit.interpreter)),
         luajit_missing: measurement.workload.luajit_missing().map(str::to_owned),
@@ -276,6 +299,7 @@ fn operation_entry(operation: &Operation) -> report::Operation {
         puc: tenths(counts.puc),
         fazo: tenths(counts.interpreter),
         baseline: tenths(counts.baseline),
+        optimizing: tenths(counts.optimizing),
         peak: tenths(counts.peak),
         luajit: tenths(counts.luajit),
         budget: tenths(operation.budget.budget_ir),
@@ -299,8 +323,15 @@ fn summary(measurements: &[Measurement], operations: &[Operation]) -> String {
         let counts = &operation.counts;
         let _ = writeln!(
             text,
-            "{}: PUC {:.1}, interpreter {:.1}, baseline {:.1}, peak {:.1}, LuaJIT {:.1}, budget {:.1}",
-            operation.budget.name, counts.puc, counts.interpreter, counts.baseline, counts.peak, counts.luajit, operation.budget.budget_ir,
+            "{}: PUC {:.1}, interpreter {:.1}, baseline {:.1}, optimizing {:.1}, peak {:.1}, LuaJIT {:.1}, budget {:.1}",
+            operation.budget.name,
+            counts.puc,
+            counts.interpreter,
+            counts.baseline,
+            counts.optimizing,
+            counts.peak,
+            counts.luajit,
+            operation.budget.budget_ir,
         );
     }
     text
@@ -317,16 +348,32 @@ fn workload_line(measurement: &Measurement) -> String {
         ),
         (None, reason) => format!("no LuaJIT number ({})", reason.unwrap_or_default()),
     };
+    let split = counts.split();
     format!(
-        "{}: PUC {:.0}, fazo {:.0}, baseline {:.0}, peak {:.0}, interpreter {:.0}, fazo/PUC {:.3}, {luajit}",
+        "{}: PUC {:.0}, fazo {:.0}, baseline {:.0}, optimizing {:.0}, peak {:.0}, interpreter {:.0}, fazo/PUC {:.3}, {luajit}, \
+         split compile {} before optimized {} steady {}",
         measurement.workload.name,
         counts.puc,
         counts.fazo,
         counts.baseline,
+        counts.optimizing,
         counts.peak,
         counts.interpreter,
         measurement.instruction_ratio(),
+        split.compile,
+        split.before_optimized,
+        split.steady,
     )
+}
+
+impl Counts {
+    fn split(&self) -> report::Split {
+        report::Split {
+            compile: whole(self.compile),
+            before_optimized: whole(self.before_optimized),
+            steady: whole(self.fazo - self.compile - self.before_optimized),
+        }
+    }
 }
 
 impl Measurement {
@@ -472,6 +519,7 @@ impl OperationCounts {
             puc: run(&interpreters.puc, &[], "puc")?,
             interpreter: run(&interpreters.fazo, INTERPRETER_ONLY, "interpreter")?,
             baseline: run(&interpreters.fazo, BASELINE_ONLY, "baseline")?,
+            optimizing: run(&interpreters.fazo, OPTIMIZING_ONLY, "optimizing")?,
             peak: run(&interpreters.fazo, PEAK_ONLY, "peak")?,
             luajit: run(&interpreters.luajit, &[], "luajit")?,
         })
@@ -482,6 +530,7 @@ impl OperationCounts {
             puc: per_operation(self.puc, empty.puc),
             interpreter: per_operation(self.interpreter, empty.interpreter),
             baseline: per_operation(self.baseline, empty.baseline),
+            optimizing: per_operation(self.optimizing, empty.optimizing),
             peak: per_operation(self.peak, empty.peak),
             luajit: per_operation(self.luajit, empty.luajit),
         }
@@ -498,8 +547,10 @@ fn per_operation(instructions: f64, empty: f64) -> f64 {
 fn measure_compile_cost(interpreters: &Interpreters, out_dir: &Path) -> Result<report::CompileCost, String> {
     let full = write_compile_chunk(out_dir, COMPILE_STATEMENTS)?;
     let empty = write_compile_chunk(out_dir, 0)?;
-    let peak = |script: &Path, label: &str| measure_inside(&interpreters.fazo, PEAK_ONLY, out_dir, label, script);
+    let peak = |script: &Path, label: &str| inside(&interpreters.fazo, PEAK_ONLY, PEAK_COMPILE_SYMBOLS, (out_dir, label), (script, &[]));
     let peak_ir = peak(&full, "compile-peak")? - peak(&empty, "compile-peak-empty")?;
+    let optimizing = |script: &Path, label: &str| inside(&interpreters.fazo, OPTIMIZING_ONLY, OPTIMIZING_COMPILE_SYMBOLS, (out_dir, label), (script, &[]));
+    let optimizing_ir = optimizing(&full, "compile-optimizing")? - optimizing(&empty, "compile-optimizing-empty")?;
     let luajit = |script: &Path, label: &str| -> Result<f64, String> {
         let on = measure(&interpreters.luajit, &[], out_dir, label, script, &[])?;
         let off = measure(&interpreters.luajit, LUAJIT_JIT_OFF, out_dir, &format!("{label}-off"), script, &[])?;
@@ -510,6 +561,7 @@ fn measure_compile_cost(interpreters: &Interpreters, out_dir: &Path) -> Result<r
     Ok(report::CompileCost {
         statements: COMPILE_STATEMENTS,
         peak_per_bytecode: tenths(peak_ir / (statements * FAZO_BYTECODES_PER_STATEMENT)),
+        optimizing_per_bytecode: Some(tenths(optimizing_ir / (statements * FAZO_BYTECODES_PER_STATEMENT))),
         luajit_per_bytecode: tenths(luajit_ir / (statements * LUAJIT_BYTECODES_PER_STATEMENT)),
         peak_per_statement: tenths(peak_ir / statements),
         luajit_per_statement: tenths(luajit_ir / statements),
@@ -528,14 +580,18 @@ fn write_compile_chunk(out_dir: &Path, statements: u32) -> Result<std::path::Pat
 }
 
 fn compile_cost_line(cost: &report::CompileCost) -> String {
+    let optimizing = cost.optimizing_per_bytecode.unwrap_or_default();
     format!(
-        "compile cost ({} statements): Peak {:.0} Ir per bytecode ({:.0} per statement), LuaJIT {:.0} ({:.0}), Peak/LuaJIT {:.2} per bytecode",
+        "compile cost ({} statements): Peak {:.0} Ir per bytecode ({:.0} per statement), Optimizing {:.0}, LuaJIT {:.0} ({:.0}), \
+         Peak/LuaJIT {:.2}, Optimizing/LuaJIT {:.2} per bytecode",
         cost.statements,
         cost.peak_per_bytecode,
         cost.peak_per_statement,
+        optimizing,
         cost.luajit_per_bytecode,
         cost.luajit_per_statement,
         cost.peak_per_bytecode / cost.luajit_per_bytecode,
+        optimizing / cost.luajit_per_bytecode,
     )
 }
 
@@ -665,23 +721,49 @@ fn measure(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, scr
         .ok_or_else(|| format!("cachegrind output for {label} has no Ir total"))
 }
 
-fn measure_inside(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, script: &Path) -> Result<f64, String> {
+/// Callgrind dumps before each `OPTIMIZED_COMPILE_SYMBOL` call, so the first dump holds the work before the first compile, or the whole run when nothing compiles.
+fn before_first(interpreter: &str, (out_dir, label): (&Path, &str), (script, arguments): (&Path, &[&str])) -> Result<f64, String> {
     let out = out_dir.join(format!("{label}.callgrind"));
-    let mut args = vec!["--tool=callgrind".to_owned(), format!("--callgrind-out-file={}", guest_path(&out))];
-    args.extend(PEAK_COMPILE_SYMBOLS.iter().map(|symbol| format!("--toggle-collect={symbol}")));
+    let first = out_dir.join(format!("{label}.callgrind.1"));
+    let _ = fs::remove_file(&first);
+    let mut args = vec![
+        "--tool=callgrind".to_owned(),
+        format!("--callgrind-out-file={}", guest_path(&out)),
+        format!("--dump-before={OPTIMIZED_COMPILE_SYMBOL}"),
+    ];
     args.push(interpreter.to_owned());
-    args.extend(arguments_for(options, script, &[]));
+    args.extend(arguments_for(&[], script, arguments));
     let output = host_command("valgrind", &args)
         .output()
         .map_err(|error| format!("starting valgrind: {error}"))?;
     if !output.status.success() {
         return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
     }
-    let text = fs::read_to_string(&out).map_err(|error| format!("reading {}: {error}", out.display()))?;
+    let path = if first.exists() { first } else { out };
+    callgrind_total(&path, label)
+}
+
+fn callgrind_total(path: &Path, label: &str) -> Result<f64, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
     text.lines()
         .find_map(|line| line.strip_prefix("totals: ").or_else(|| line.strip_prefix("summary: ")))
         .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
         .ok_or_else(|| format!("callgrind output for {label} has no total"))
+}
+
+fn inside(interpreter: &str, options: &[&str], symbols: &[&str], (out_dir, label): (&Path, &str), (script, arguments): (&Path, &[&str])) -> Result<f64, String> {
+    let out = out_dir.join(format!("{label}.callgrind"));
+    let mut args = vec!["--tool=callgrind".to_owned(), format!("--callgrind-out-file={}", guest_path(&out))];
+    args.extend(symbols.iter().map(|symbol| format!("--toggle-collect={symbol}")));
+    args.push(interpreter.to_owned());
+    args.extend(arguments_for(options, script, arguments));
+    let output = host_command("valgrind", &args)
+        .output()
+        .map_err(|error| format!("starting valgrind: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
+    }
+    callgrind_total(&out, label)
 }
 
 fn read_totals(path: &Path) -> Result<BTreeMap<String, f64>, String> {

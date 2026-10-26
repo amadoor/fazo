@@ -231,7 +231,7 @@ fn jit_mode(args: &[String]) -> Result<(), String> {
             differential::set_jit_mode(mode);
             Ok(())
         }
-        None => Err("--jit needs normal, interpreter, baseline or peak".to_string()),
+        None => Err("--jit needs normal, interpreter, baseline, optimizing or peak".to_string()),
     }
 }
 
@@ -242,11 +242,12 @@ fn entry(args: &[String]) -> Result<Run, String> {
             differential::JitMode::Interpreter => Run::Interpreter,
             differential::JitMode::Baseline => Run::Baseline,
             differential::JitMode::Peak => Run::Peak,
+            differential::JitMode::Optimizing => Run::Optimizing,
         });
     };
     args.get(position + 1)
         .and_then(|name| Run::from_name(name))
-        .ok_or_else(|| "--entry needs normal, interpreter, baseline, peak, gc-stress or debug".to_string())
+        .ok_or_else(|| "--entry needs normal, interpreter, baseline, optimizing, peak, gc-stress or debug".to_string())
 }
 
 fn seed_count(args: &[String]) -> Result<u64, String> {

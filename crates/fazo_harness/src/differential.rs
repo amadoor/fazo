@@ -91,6 +91,7 @@ pub enum JitMode {
     Interpreter,
     Baseline,
     Peak,
+    Optimizing,
 }
 
 impl JitMode {
@@ -100,6 +101,7 @@ impl JitMode {
             "interpreter" => Some(Self::Interpreter),
             "baseline" => Some(Self::Baseline),
             "peak" => Some(Self::Peak),
+            "optimizing" => Some(Self::Optimizing),
             _ => None,
         }
     }
@@ -110,6 +112,7 @@ impl JitMode {
             Self::Interpreter => &["-X", "tier=interpreter"],
             Self::Baseline => &["-X", "force=baseline"],
             Self::Peak => &["-X", "force=peak"],
+            Self::Optimizing => &["-X", "force=optimizing"],
         }
     }
 }
@@ -126,6 +129,7 @@ pub fn jit_mode() -> JitMode {
         1 => JitMode::Interpreter,
         2 => JitMode::Baseline,
         3 => JitMode::Peak,
+        4 => JitMode::Optimizing,
         _ => JitMode::Normal,
     }
 }

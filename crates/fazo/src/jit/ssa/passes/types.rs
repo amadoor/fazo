@@ -138,10 +138,11 @@ fn speculate_operands(func: &mut Func, refined: &mut Refined, (block, position):
     let fallback = match observed {
         Some(KIND_INT) => Type::INT,
         Some(KIND_FLOAT) => Type::FLOAT,
+        Some(_) => Type::NUM,
         _ if func.float_guess => Type::FLOAT,
         _ => Type::INT,
     };
-    let guess = kind(func.ty(left)).or(kind(func.ty(right))).unwrap_or(fallback);
+    let guess = if fallback == Type::NUM { fallback } else { kind(func.ty(left)).or(kind(func.ty(right))).unwrap_or(fallback) };
     let mut inserted = 0;
     let mut guarded = |func: &mut Func, operand: Val| {
         let ty = func.ty(operand);

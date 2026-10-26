@@ -247,5 +247,5 @@ pub(super) extern "C" fn tier_check(ctx: *mut JitCtx, pc: u32) -> i64 {
     // SAFETY: the context and VM pointers are valid for the duration of the call.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
-    vm.jit_tier_check(ctx, pc as usize)
+    vm.jit_tier_check(ctx, pc as usize, crate::Tier::Baseline)
 }

@@ -706,7 +706,7 @@ impl<'a> Builder<'a, '_> {
                     return self.fallback(frame, pc);
                 };
                 if frame.flow.back_edges[pc] {
-                    self.safepoint(frame, target);
+                    self.safepoint(frame, pc, target);
                 }
                 self.jump_to(frame, target);
                 return next;
@@ -758,7 +758,7 @@ impl<'a> Builder<'a, '_> {
                 self.edge_to(frame, from, 0, fall);
                 self.regs = regs;
                 self.current = Some(back);
-                self.safepoint(frame, target);
+                self.safepoint(frame, pc, target);
                 self.jump_to(frame, target);
                 return next;
             }
@@ -829,12 +829,12 @@ impl<'a> Builder<'a, '_> {
         pc + 1
     }
 
-    fn safepoint(&mut self, frame: &Frame<'_>, target: usize) {
+    fn safepoint(&mut self, frame: &Frame<'_>, pc: usize, target: usize) {
         if frame.site.is_some() {
             return;
         }
         let state = self.state_at(frame, target);
-        self.effect(Op::Safepoint { pc: target as u32, state });
+        self.effect(Op::Safepoint { pc: target as u32, weight: (pc + 1 - target) as u32, state });
     }
 
     fn conditional(&mut self, frame: &mut Frame<'a>, pc: usize, cond: Val, k: bool) -> usize {
@@ -1534,7 +1534,7 @@ impl<'a> Builder<'a, '_> {
         let advanced = self.emit(Op::Binary(BinOp::IAdd, index, step), Type::INT, Rep::Int);
         self.write(frame, a, remaining);
         self.write(frame, a + 2, advanced);
-        self.safepoint(frame, target);
+        self.safepoint(frame, pc, target);
         self.jump_to(frame, target);
         pc + 1
     }
@@ -1552,7 +1552,7 @@ impl<'a> Builder<'a, '_> {
         self.end(Term::Switch { code, cases: vec![(target as u32, Edge::to(back)), ((pc + 1) as u32, Edge::to(BlockId(u32::MAX)))] });
         self.edge_to(frame, from, 1, pc + 1);
         self.current = Some(back);
-        self.safepoint(frame, target);
+        self.safepoint(frame, pc, target);
         self.jump_to(frame, target);
         pc + 1
     }

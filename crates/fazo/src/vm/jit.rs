@@ -164,11 +164,11 @@ impl Vm {
         let function = self.heap.protos.live_mut(proto);
         function.jit.never = false;
         function.jit.failed = false;
-        if tier.built() >= Tier::Baseline {
+        if tier >= Tier::Baseline {
             self.jit_compile(proto, Tier::Baseline);
         }
-        if tier.built() == Tier::Peak {
-            self.jit_compile(proto, Tier::Peak);
+        if tier >= Tier::Optimizing {
+            self.jit_compile(proto, tier);
         }
         self.jit_tier_of(proto)
     }
@@ -197,11 +197,11 @@ impl Vm {
     }
 
     pub(crate) fn jit_ceiling(&self) -> Tier {
-        self.options.tier.built()
+        self.options.tier
     }
 
     fn jit_forced(&self) -> Option<Tier> {
-        self.options.force.map(|tier| tier.built().min(self.jit_ceiling())).filter(|&tier| tier != Tier::Interpreter)
+        self.options.force.map(|tier| tier.min(self.jit_ceiling())).filter(|&tier| tier != Tier::Interpreter)
     }
 
     /// A prototype that never runs compiled gets a budget that does not run out. Compiled code can be entered at any instruction, through its dispatch.
@@ -224,7 +224,7 @@ impl Vm {
             return self.jit_resume_compiled(proto, pc);
         }
         if let Some(tier) = forced {
-            if tier == Tier::Peak && !function.jit.primed {
+            if tier >= Tier::Optimizing && !function.jit.primed {
                 function.jit.primed = true;
                 function.jit.budget().set(FORCED_PEAK_WAIT);
                 self.jit_watch_loop(proto, pc);
@@ -299,8 +299,8 @@ impl Vm {
     }
 
     fn jit_compile_entry(&mut self, proto: Ref<Proto>, tier: Tier, pc: usize) -> Option<CompiledEntry> {
-        let compiled = match tier.built().min(self.jit_ceiling()) {
-            Tier::Peak => self.jit_compile_peak_at(proto, Some(pc)),
+        let compiled = match tier.min(self.jit_ceiling()) {
+            tier @ (Tier::Peak | Tier::Optimizing) => self.jit_compile_optimized_at(proto, Some(pc), tier),
             _ => self.jit_compile(proto, tier),
         };
         if !compiled {
@@ -315,9 +315,10 @@ impl Vm {
 
     /// Falls back to the highest built tier below `tier`.
     pub(crate) fn jit_compile(&mut self, proto: Ref<Proto>, tier: Tier) -> bool {
-        match tier.built().min(self.jit_ceiling()) {
+        match tier.min(self.jit_ceiling()) {
             Tier::Interpreter => false,
-            Tier::Baseline | Tier::Optimizing => self.jit_compile_baseline(proto),
+            Tier::Baseline => self.jit_compile_baseline(proto),
+            Tier::Optimizing => self.jit_compile_optimized_at(proto, None, Tier::Optimizing),
             Tier::Peak => self.jit_compile_peak(proto),
         }
     }
@@ -364,7 +365,7 @@ impl Vm {
         let layout = *self.jit.layout.get_or_insert_with(crate::jit::TableLayout::probe);
         let interned = self.jit_interned_constants(proto);
         let declines = self.heap.protos.live(proto).jit.declines;
-        let peak_wait = if charges { crate::JitPolicy::backed_off(self.jit_peak_budget(proto), declines) } else { i64::MAX };
+        let peak_wait = if charges { crate::JitPolicy::backed_off(self.jit_peak_budget(proto, Tier::Baseline), declines) } else { i64::MAX };
         let inline_caches = !self.options.jit_stress.inline_caches_off;
         let frames = *self.jit.frames.get_or_insert_with(crate::jit::FrameLayout::probe);
         let calls = self.jit_call_targets(proto);
@@ -453,14 +454,14 @@ impl Vm {
     }
 
     fn jit_compile_peak(&mut self, proto: Ref<Proto>) -> bool {
-        self.jit_compile_peak_at(proto, None)
+        self.jit_compile_optimized_at(proto, None, Tier::Peak)
     }
 
-    /// A prototype that already runs in Baseline keeps it when this fails. `at` is the pc the running frame enters the code at, when one does.
-    fn jit_compile_peak_at(&mut self, proto: Ref<Proto>, at: Option<usize>) -> bool {
+    /// A failed compile leaves the prototype on the code it runs. `at` is the pc the running frame enters the code at.
+    fn jit_compile_optimized_at(&mut self, proto: Ref<Proto>, at: Option<usize>, tier: Tier) -> bool {
         let limit = self.options.jit_policy.recompile_limit;
         let function = self.heap.protos.live(proto);
-        if function.jit.unit.is_some() {
+        if function.jit.unit.as_ref().is_some_and(|unit| unit.tier() >= tier) {
             self.jit_reveal(proto);
             return true;
         }
@@ -468,14 +469,15 @@ impl Vm {
             return false;
         }
         let budget = self.jit_code_budget();
-        if self.jit.compiler.is_none() {
+        if tier == Tier::Peak && self.jit.compiler.is_none() {
             self.jit.compiler = crate::jit::Compiler::new().ok().map(Box::new);
         }
         let layout = *self.jit.layout.get_or_insert_with(crate::jit::TableLayout::probe);
         let frames = *self.jit.frames.get_or_insert_with(crate::jit::FrameLayout::probe);
         let calls = self.jit_call_targets(proto);
-        let estimate = self.jit_estimate(proto, &calls);
+        let estimate = self.jit_estimate(proto, &calls, tier);
         let executed = self.heap.protos.live(proto).jit.peak_executed;
+        let charges = tier == Tier::Optimizing && self.jit_ceiling() == Tier::Peak && self.jit_forced().is_none();
         let judged = self.options.jit_policy.peak.estimate_payoff && self.jit_forced().is_none();
         if judged && !estimate.pays_after(executed) {
             self.jit_decline_peak(proto, estimate);
@@ -519,16 +521,26 @@ impl Vm {
             type_names,
             sink_allocations: self.options.memory_limit.is_none(),
             running_floats: &running_floats,
+            tier_budget: charges.then(|| std::ptr::from_ref(heap.protos.live(proto).jit.tier_budget())),
         };
-        let compiled = self.jit.compiler.as_deref_mut().map(|compiler| crate::jit::compile(compiler, budget, heap.protos.live(proto), &facts, dump));
+        let compiled = if tier == Tier::Optimizing {
+            Some(crate::jit::compile_optimizing(budget, heap.protos.live(proto), &facts, dump))
+        } else {
+            self.jit.compiler.as_deref_mut().map(|compiler| crate::jit::compile(compiler, budget, heap.protos.live(proto), &facts, dump))
+        };
         let (unit, text) = match compiled {
             Some(Ok((unit, text))) => {
                 if self.options.jit_trace {
                     let length = self.heap.protos.live(proto).code.len();
-                    let clif_insts = unit.unit.ir_insts();
+                    let clif_insts = unit.size();
                     let line = format!(
-                        "peak estimate (cost {}, gain {} per {} bytecodes, after {executed}; {length} bytecodes, {clif_insts} Cranelift instructions)",
-                        estimate.cost, estimate.gain, estimate.weight
+                        "{} estimate (cost {}, gain {} per {} bytecodes, after {executed}; {length} bytecodes, sizes {:?}, {clif_insts} {})",
+                        tier.name(),
+                        estimate.cost,
+                        estimate.gain,
+                        estimate.weight,
+                        estimate.sizes,
+                        if tier == Tier::Peak { "Cranelift instructions" } else { "code bytes" }
                     );
                     self.jit_trace(proto, &line);
                 }
@@ -557,12 +569,19 @@ impl Vm {
             function.exec.feedback = vec![super::InlineCache::Uninitialized; function.code.len()];
         }
         function.jit.tier_budget().set(0);
-        function.jit.peak_compiles += 1;
+        function.jit.peak_executed = 0;
+        match tier {
+            Tier::Peak => function.jit.peak_compiles += 1,
+            _ => function.jit.optimizing_compiles += 1,
+        }
+        function.jit.compiled_bytecodes[usize::from(tier == Tier::Peak)] += estimate.bytecodes();
         let shapes = unit.shapes.clone();
-        function.jit.unit = Some(Box::new(unit));
+        if let Some(old) = function.jit.unit.replace(Box::new(unit)) {
+            function.jit.retired_peak.push(*old);
+        }
         self.jit_keep_shapes(proto, shapes);
         self.jit_reveal(proto);
-        self.jit_trace(proto, "peak");
+        self.jit_trace(proto, tier.name());
         true
     }
 
@@ -599,11 +618,11 @@ impl Vm {
             function.jit.retired_peak.push(*unit);
         }
         let deopts = function.jit.deopts;
-        let wait = if repeated { crate::JitPolicy::backed_off(self.jit_peak_budget(proto), deopts) } else { policy.peak.budget(0, divisor) };
+        let wait = if repeated { crate::JitPolicy::backed_off(self.jit_peak_budget(proto, Tier::Baseline), deopts) } else { policy.peak.budget(0, divisor) };
         self.jit_peak_wait(proto, wait);
         self.jit_reveal(proto);
-        if forced {
-            self.jit_compile_peak(proto);
+        if let Some(tier) = self.jit_forced().filter(|_| forced) {
+            self.jit_compile(proto, tier);
         }
         -EXIT_RELOAD
     }
@@ -649,8 +668,8 @@ impl Vm {
         }
     }
 
-    /// A prototype whose estimated gain pays a Peak compile compiles now, as V8's on-stack replacement does at a loop; one the estimate declines waits for a budget that doubles with each decline.
-    pub(crate) fn jit_tier_check(&mut self, ctx: &mut JitCtx, pc: usize) -> i64 {
+    /// Compiles now when the estimated gain pays the next tier's compile, as V8's on-stack replacement does at a loop; otherwise waits for a budget that doubles with each decline.
+    pub(crate) fn jit_tier_check(&mut self, ctx: &mut JitCtx, pc: usize, running: Tier) -> i64 {
         let proto = ctx.proto;
         let policy = self.options.jit_policy;
         let function = self.heap.protos.live(proto);
@@ -658,7 +677,7 @@ impl Vm {
         if self.tracing || function.jit.failed || function.jit.never {
             return pc as i64;
         }
-        if let Some(unit) = &function.jit.unit {
+        if let Some(unit) = function.jit.unit.as_ref().filter(|unit| unit.tier() > running) {
             if unit.enters_at(pc) {
                 self.save_pc(pc);
                 return -EXIT_RELOAD;
@@ -666,12 +685,13 @@ impl Vm {
             function.jit.tier_budget().set(i64::from(crate::jit::ENTRY_CHARGE) * 128);
             return pc as i64;
         }
-        let stale = function.jit.feedback_changes != function.jit.compiled_changes && function.jit.recompiles < policy.recompile_limit;
+        let stale = running == Tier::Baseline && function.jit.feedback_changes != function.jit.compiled_changes && function.jit.recompiles < policy.recompile_limit;
         if stale {
             return self.jit_recompile_at(proto, pc, true);
         }
         self.heap.protos.live_mut(proto).jit.prepared = false;
-        let declined = self.jit_ceiling() != Tier::Peak;
+        let target = running.next();
+        let declined = self.jit_ceiling() < target;
         if declined {
             self.jit_trace(proto, "peak declined");
             let function = self.heap.protos.live_mut(proto);
@@ -680,30 +700,37 @@ impl Vm {
                 return self.jit_recompile_at(proto, pc, false);
             }
             let declines = function.jit.declines;
-            let wait = crate::JitPolicy::backed_off(self.jit_peak_budget(proto), declines);
+            let wait = crate::JitPolicy::backed_off(self.jit_peak_budget(proto, running), declines);
             self.jit_peak_wait(proto, wait);
             return pc as i64;
         }
-        if !self.jit_compile_peak_at(proto, Some(pc)) {
+        if !self.jit_compile_optimized_at(proto, Some(pc), target) {
             return pc as i64;
         }
         self.save_pc(pc);
         -EXIT_RELOAD
     }
 
-    fn jit_estimate(&self, proto: Ref<Proto>, calls: &[Vec<crate::jit::CallTarget>]) -> crate::jit::tiering::Estimate {
+    fn jit_estimate(&self, proto: Ref<Proto>, calls: &[Vec<crate::jit::CallTarget>], target: Tier) -> crate::jit::tiering::Estimate {
         let heap = &self.heap;
         let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
         let builtin_of = |native: Ref<crate::object::Native>| heap.natives.try_get(native).and_then(|native| native.builtin);
         let lookup = crate::jit::tiering::Lookup { proto_of: &proto_of, builtin_of: &builtin_of };
-        crate::jit::tiering::of_proto(heap.protos.live(proto), calls, &lookup)
+        let function = heap.protos.live(proto);
+        let mut estimate = crate::jit::tiering::of_proto(function, calls, &lookup, target);
+        let optimizing = function.jit.unit.as_ref().filter(|unit| unit.tier() == Tier::Optimizing);
+        if let Some(unit) = optimizing.filter(|_| target == Tier::Peak) {
+            estimate.cost = crate::jit::tiering::peak_cost_from_optimizing(unit.size() as i64);
+        }
+        estimate
     }
 
-    /// The Baseline work after which a Peak compile breaks even by the bytecode estimate; with no predicted savings, as if each bytecode saved one instruction.
-    fn jit_peak_budget(&self, proto: Ref<Proto>) -> i64 {
+    /// Work after which the next compile breaks even by the bytecode estimate; with no predicted savings, each bytecode is taken to save one instruction.
+    fn jit_peak_budget(&self, proto: Ref<Proto>, running: Tier) -> i64 {
         let divisor = i64::from(self.options.jit_stress.threshold_divisor.max(1));
         let calls = self.jit_call_targets(proto);
-        let estimate = self.jit_estimate(proto, &calls);
+        let target = running.next().min(self.jit_ceiling());
+        let estimate = self.jit_estimate(proto, &calls, target);
         estimate.break_even().unwrap_or(estimate.cost) / divisor
     }
 
@@ -747,19 +774,23 @@ impl Vm {
         let mut lines: Vec<String> = Vec::new();
         for (_, function) in self.heap.protos.iter() {
             let jit = &function.jit;
-            if jit.peak_compiles == 0 && jit.deopts == 0 && jit.recompiles == 0 && jit.declines == 0 {
+            if jit.peak_compiles == 0 && jit.optimizing_compiles == 0 && jit.deopts == 0 && jit.recompiles == 0 && jit.declines == 0 {
                 continue;
             }
             let sites: Vec<String> = jit.deopt_sites.iter().map(|(site, count)| format!("{site}:{count}")).collect();
             lines.push(format!(
-                "jitstats {}:{} peak={} deopts={} recompiles={} declines={} sites={}
+                "jitstats {}:{} tier={} optimizing={} peak={} deopts={} recompiles={} declines={} bytecodes={}/{} sites={}
 ",
                 String::from_utf8_lossy(trace_source(&function.chunkname)).chars().take(60).collect::<String>(),
                 function.line_defined,
+                jit.tier().name(),
+                jit.optimizing_compiles,
                 jit.peak_compiles,
                 jit.deopts,
                 jit.recompiles,
                 jit.declines,
+                jit.compiled_bytecodes[0],
+                jit.compiled_bytecodes[1],
                 sites.join(",")
             ));
         }
@@ -1896,21 +1927,22 @@ fn trace_source(chunkname: &[u8]) -> &[u8] {
     }
 }
 
-/// True when the kinds are one number kind the site had not seen, so a recompile guesses it there instead of giving up the site.
+/// True when the site saw number kinds it had not; a recompile then guesses them rather than giving up the site, as V8 widens `kSignedSmall` to `kNumber` (src/objects/feedback-vector.h, `BinaryOperationHint`).
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn learn_kinds(observed: &mut Vec<(u32, u8)>, site: u32, kinds: u8) -> bool {
-    let uniform = kinds == KIND_INT || kinds == KIND_FLOAT;
+    if kinds & !(KIND_INT | KIND_FLOAT) != 0 {
+        return false;
+    }
     match observed.iter_mut().find(|(known, _)| *known == site) {
-        Some((_, known)) if *known == kinds || !uniform => false,
+        Some((_, known)) if *known | kinds == *known => false,
         Some((_, known)) => {
             *known |= kinds;
-            *known == KIND_INT || *known == KIND_FLOAT
+            true
         }
-        None if uniform => {
+        None => {
             observed.push((site, kinds));
             true
         }
-        None => false,
     }
 }
 
