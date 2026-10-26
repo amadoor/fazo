@@ -17,6 +17,10 @@ executable from the sources.
 The hashes are pinned in `src/reference.rs`. A download whose hash differs is a hard error and nothing
 is extracted.
 
+`cargo xtask perf` also measures LuaJIT 2.1 (MIT), pinned by commit in `src/perf.rs`:
+`a4c064539ea931274d407e1249b4bb575424a0f4` from `https://github.com/LuaJIT/LuaJIT.git`. Nothing from
+LuaJIT is checked into the repository.
+
 ## Cache location
 
 The cache is `fazo-reference` inside the cargo target directory: `$CARGO_TARGET_DIR/fazo-reference`, or
@@ -53,11 +57,16 @@ first `cargo test` needs network access. Once the cache exists they work offline
 - `tests.<suite>.<run>`: `pass`, `fail` and `skip` counts and the names of the failing files or cases, for the
   suites `official`, `cases`, `syntax`, `cli` and `generated`. The run is the `--jit` tier (`normal`,
   `interpreter`, `baseline`, `peak`), or the name given with `--entry` (`gc-stress`, `debug`). A
-  generated failure is named `<profile>/<seed>`. `skip` counts out-of-scope official files, command-line
+  generated failure is named `<profile>/<seed>`. A case or seed that runs past its deadline is a failure
+  named `<case> (timeout)`. `skip` counts out-of-scope official files, command-line
   cases with a known gap, and generated programs PUC Lua rejects.
 - `bytecode`: written by `cargo xtask bytecode`.
-- `perf` and `operations`: written by `cargo xtask perf`, in Valgrind instructions net of the empty script;
-  `operations` holds the per-statement count and the budget from `perf/ops/budgets.txt`.
+- `perf` and `operations`: written by `cargo xtask perf`, in Valgrind instructions net of the empty script.
+  `perf.<workload>` holds `puc`, `fazo` (normal tiering), `baseline` (`-X tier=baseline`), `peak`
+  (`-X force=peak`), `interpreter` (`-X tier=interpreter`), `luajit` (JIT on) and `luajit_interpreter`
+  (`-joff`). A workload LuaJIT cannot run has `null` LuaJIT numbers and the reason in `luajit_missing`.
+  `operations.<op>` holds the per-statement count for `puc`, `fazo` (the interpreter), `baseline`, `peak`
+  and `luajit`, and the interpreter's budget from `perf/ops/budgets.txt`.
 
 Each run reads the file, replaces only its own entries and writes it back.
 
@@ -83,6 +92,32 @@ Scripts run as `lua <name>` in a fresh folder, so messages carry the script's na
 as `lua -e "_port=true;_soft=true" <name>` in the suite folder. Stdout is compared exactly, with CRLF
 turned into LF on Windows. For errors the harness compares the first stderr line without the program
 name the interpreter prints before it; the traceback is not compared.
+
+Every run has a deadline that `--timeout-scale N` multiplies: 60 seconds for a hand-written case, syntax
+case or generated seed, 120 seconds for an official file or command-line case. Processes are killed at
+their deadline. fazo runs the cases, syntax cases and seeds in-process, and a timer thread stops them
+through the VM's interrupt handle.
+
+## Performance
+
+`cargo xtask perf` runs Valgrind's cachegrind through WSL on Windows and directly on Linux. It builds
+three interpreters in `FAZO_PERF_BUILD_DIR` (default `/tmp/fazo-perf`; a Windows path is turned into its
+`/mnt/<drive>/...` form):
+
+- PUC Lua 5.5.1 from the reference sources, as `bin/lua`;
+- fazo with the `profiling` profile, as `target/profiling/fazo`;
+- LuaJIT with `make amalg`, as `luajit-<commit>/src/luajit`. The sources come from `git archive` of the
+  pinned commit, taken from the checkout `FAZO_LUAJIT_DIR` names, or fetched into `luajit-git/` when it
+  is unset. LuaJIT is built without `-DLUAJIT_USE_VALGRIND`: that define discards Valgrind's translations
+  after each machine-code write (`src/lj_mcode.c`) and quiets memcheck reports, and Valgrind's default
+  `--smc-check=all-non-file` already retranslates code written into anonymous mappings.
+
+Each workload in `perf/` runs on every interpreter, and the run fails when an output differs from PUC
+Lua's. LuaJIT implements Lua 5.1, so a workload that needs Lua 5.5 has a `<name>.luajit.lua` beside it
+that does the same work in Lua 5.1: floats where the integers stay exact, and `bit.*` for bitwise
+operations. A workload with no such version reports why it has no LuaJIT number. The console prints
+fazo's ratio to PUC Lua and to LuaJIT, then lists the workloads where fazo is slower than LuaJIT; only
+the PUC ratio and the operation budgets fail the run.
 
 ## Command-line cases
 

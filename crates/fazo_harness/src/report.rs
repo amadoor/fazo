@@ -132,19 +132,29 @@ pub struct Bytecode {
     pub puc_instructions: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workload {
     pub puc: i64,
     pub fazo: i64,
     pub baseline: i64,
     pub peak: i64,
     pub interpreter: i64,
+    pub luajit: Option<i64>,
+    pub luajit_interpreter: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luajit_missing: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
     pub puc: f64,
     pub fazo: f64,
+    #[serde(default)]
+    pub baseline: f64,
+    #[serde(default)]
+    pub peak: f64,
+    #[serde(default)]
+    pub luajit: f64,
     pub budget: f64,
 }
 
@@ -224,20 +234,28 @@ mod tests {
       "fazo": 119494966,
       "baseline": 132675213,
       "peak": 239120413,
-      "interpreter": 177381266
+      "interpreter": 177381266,
+      "luajit": 20412555,
+      "luajit_interpreter": 98120437
     },
-    "integer loop": {
+    "garbage collector (generational)": {
       "puc": 1000,
       "fazo": 900,
       "baseline": 950,
       "peak": 800,
-      "interpreter": 1100
+      "interpreter": 1100,
+      "luajit": null,
+      "luajit_interpreter": null,
+      "luajit_missing": "no generational collector"
     }
   },
   "operations": {
     "call0": {
       "puc": 157.0,
       "fazo": 158.0,
+      "baseline": 21.0,
+      "peak": 12.5,
+      "luajit": 0.0,
       "budget": 161.0
     }
   }
@@ -249,10 +267,34 @@ mod tests {
         let first = updated(None, |board| {
             board.perf.insert(
                 "fib".to_owned(),
-                Workload { puc: 161_182_880, fazo: 119_494_966, baseline: 132_675_213, peak: 239_120_413, interpreter: 177_381_266 },
+                Workload {
+                    puc: 161_182_880,
+                    fazo: 119_494_966,
+                    baseline: 132_675_213,
+                    peak: 239_120_413,
+                    interpreter: 177_381_266,
+                    luajit: Some(20_412_555),
+                    luajit_interpreter: Some(98_120_437),
+                    luajit_missing: None,
+                },
             );
-            board.perf.insert("integer loop".to_owned(), Workload { puc: 1000, fazo: 900, baseline: 950, peak: 800, interpreter: 1100 });
-            board.operations.insert("call0".to_owned(), Operation { puc: 157.0, fazo: 158.0, budget: 161.0 });
+            board.perf.insert(
+                "garbage collector (generational)".to_owned(),
+                Workload {
+                    puc: 1000,
+                    fazo: 900,
+                    baseline: 950,
+                    peak: 800,
+                    interpreter: 1100,
+                    luajit: None,
+                    luajit_interpreter: None,
+                    luajit_missing: Some("no generational collector".to_owned()),
+                },
+            );
+            board.operations.insert(
+                "call0".to_owned(),
+                Operation { puc: 157.0, fazo: 158.0, baseline: 21.0, peak: 12.5, luajit: 0.0, budget: 161.0 },
+            );
             *board.tests.official.entry(Run::Interpreter) =
                 Some(Suite { pass: 30, fail: 1, skip: 2, failures: vec!["coroutine.lua".to_owned()] });
             *board.tests.official.entry(Run::Normal) = Some(Suite { pass: 1, fail: 1, skip: 0, failures: vec!["stale.lua".to_owned()] });
@@ -265,6 +307,15 @@ mod tests {
         })
         .expect("the scoreboard reads back");
         assert_eq!(second, EXPECTED);
+    }
+
+    #[test]
+    fn a_scoreboard_from_before_the_luajit_columns_reads() {
+        let old = r#"{"lua": "5.5.1", "perf": {"fib": {"puc": 1, "fazo": 2, "baseline": 3, "peak": 4, "interpreter": 5}},
+            "operations": {"call0": {"puc": 1.0, "fazo": 2.0, "budget": 3.0}}}"#;
+        let text = updated(Some(old), |_| {}).expect("the older scoreboard reads");
+        assert!(text.contains("\"luajit\": null"), "{text}");
+        assert!(!text.contains("luajit_missing"), "{text}");
     }
 
     #[test]

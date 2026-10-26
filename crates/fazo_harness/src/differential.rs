@@ -1,11 +1,15 @@
 use std::{
     fs,
     panic::{self, AssertUnwindSafe},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
-use fazo::{Options, Vm};
+use fazo::{Options, RequestHandle, Vm};
 
 use crate::reference::{self, WorkDir, first_line};
 
@@ -17,6 +21,7 @@ pub const CASE_DEADLINE: Duration = Duration::from_secs(60);
 pub struct Outcome {
     pub output: Vec<u8>,
     pub error: Option<Vec<u8>>,
+    pub timed_out: bool,
 }
 
 impl Outcome {
@@ -24,6 +29,7 @@ impl Outcome {
         Self {
             output: normalize_nan_text(&self.output),
             error: self.error.map(|text| normalize_nan_text(&normalize_error(&text, chunk_name))),
+            timed_out: self.timed_out,
         }
     }
 
@@ -46,6 +52,10 @@ impl Comparison {
     pub fn matches(&self) -> bool {
         self.fazo == self.reference
     }
+
+    pub fn timed_out(&self) -> bool {
+        self.fazo.timed_out
+    }
 }
 
 pub fn compare(source: &[u8]) -> Result<Comparison, String> {
@@ -64,10 +74,12 @@ pub fn run_reference(source: &[u8], chunk_name: &str) -> Result<Outcome, String>
         Ok(captured) => Outcome {
             output: captured.stdout.clone(),
             error: (!captured.success).then(|| reference::error_message(&lua.lua, &captured)),
+            timed_out: false,
         },
         Err(error) => Outcome {
             output: Vec::new(),
             error: Some(error.into_bytes()),
+            timed_out: false,
         },
     };
     Ok(outcome)
@@ -140,17 +152,52 @@ pub fn run_fazo_with_standard_libraries(source: &[u8], chunk_name: &str) -> Outc
 }
 
 fn run_fazo_with(options: Options, source: &[u8], chunk_name: &str) -> Outcome {
+    run_fazo_until(options, source, chunk_name, reference::scaled(CASE_DEADLINE))
+}
+
+fn run_fazo_until(options: Options, source: &[u8], chunk_name: &str, deadline: Duration) -> Outcome {
     let mut vm = Vm::new(options);
     vm.use_generational_collector();
     let chunkname = format!("@{chunk_name}");
+    let timer = Deadline::start(vm.interrupt_handle(), deadline);
+
     let attempt = panic::catch_unwind(AssertUnwindSafe(|| vm.run_script(chunkname.as_bytes(), source)));
+    let expired = timer.finish();
+    let timed_out = expired && matches!(&attempt, Ok(Err(error)) if error.is_interrupted());
     let error = match attempt {
+        _ if timed_out => Some(format!("timeout after {} seconds", deadline.as_secs()).into_bytes()),
         Ok(result) => result.err().map(|error| first_line(&vm.error_message(&error)).to_vec()),
         Err(panic) => Some(format!("PANIC: {}", panic_text(panic.as_ref())).into_bytes()),
     };
     Outcome {
         output: vm.take_output(),
         error,
+        timed_out,
+    }
+}
+
+/// Interrupts the VM from a timer thread once the deadline passes; finishing first stops the timer.
+struct Deadline {
+    stop: Sender<()>,
+    timer: JoinHandle<bool>,
+}
+
+impl Deadline {
+    fn start(interrupt: RequestHandle, deadline: Duration) -> Self {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let timer = thread::spawn(move || match stopped.recv_timeout(deadline) {
+            Err(RecvTimeoutError::Timeout) => {
+                interrupt.request();
+                true
+            }
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+        });
+        Self { stop, timer }
+    }
+
+    fn finish(self) -> bool {
+        let _ = self.stop.send(());
+        self.timer.join().unwrap_or(false)
     }
 }
 
@@ -220,7 +267,22 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_NAME, normalize_error, run_reference};
+    use std::time::Duration;
+
+    use super::{CHUNK_NAME, fazo_options, normalize_error, run_fazo_until, run_reference};
+
+    #[test]
+    fn an_in_process_run_past_its_deadline_is_interrupted_and_timed_out() {
+        let outcome = run_fazo_until(fazo_options(), b"print('started') while true do end", CHUNK_NAME, Duration::from_millis(50));
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.output, b"started
+");
+        assert!(outcome.error.is_some_and(|error| error.starts_with(b"timeout after")));
+
+        let finished = run_fazo_until(fazo_options(), b"print(1)", CHUNK_NAME, Duration::from_secs(60));
+        assert!(!finished.timed_out);
+        assert_eq!(finished.error, None);
+    }
 
     #[test]
     fn position_prefix_is_stripped_only_for_its_chunk() {

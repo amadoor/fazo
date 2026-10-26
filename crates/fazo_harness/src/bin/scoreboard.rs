@@ -27,6 +27,7 @@ enum Verdict {
     Pass,
     KnownPucBug(&'static str),
     Fail(String),
+    TimedOut,
 }
 
 impl Verdict {
@@ -39,8 +40,20 @@ impl Verdict {
             Verdict::Pass => "pass".to_string(),
             Verdict::KnownPucBug(reason) => format!("pass: known PUC 5.5.1 bug, {reason}"),
             Verdict::Fail(reason) => format!("fail: {reason}"),
+            Verdict::TimedOut => "fail: timeout".to_string(),
         }
     }
+
+    fn failure_name(&self, name: &str) -> String {
+        match self {
+            Verdict::TimedOut => timed_out_name(name),
+            _ => name.to_string(),
+        }
+    }
+}
+
+fn timed_out_name(name: &str) -> String {
+    format!("{name} (timeout)")
 }
 
 /// Cases where PUC Lua 5.5.1 has a bug that lua.org lists, so a mismatch is recorded rather than failed.
@@ -83,6 +96,7 @@ struct SeedReport {
     matched: u64,
     rejected: u64,
     mismatching_seeds: Vec<u64>,
+    timed_out_seeds: Vec<u64>,
 }
 
 /// Windows' 1 MiB main-thread stack is too small; Linux and macOS use 8 MiB.
@@ -315,7 +329,7 @@ fn verdict_suite<'a>(rows: impl Iterator<Item = (&'a str, &'a Verdict)>) -> Suit
             suite.record_pass();
             continue;
         }
-        suite.record_fail(name);
+        suite.record_fail(verdict.failure_name(name));
     }
     suite
 }
@@ -344,6 +358,9 @@ fn generated_suite(reports: &[SeedReport]) -> Suite {
         suite.skip += report.rejected as usize;
         for seed in &report.mismatching_seeds {
             suite.record_fail(format!("{}/{seed}", profile_key(report.profile)));
+        }
+        for seed in &report.timed_out_seeds {
+            suite.record_fail(timed_out_name(&format!("{}/{seed}", profile_key(report.profile))));
         }
     }
     suite
@@ -490,6 +507,9 @@ fn verdict(comparison: &Comparison) -> Verdict {
     if comparison.matches() {
         return Verdict::Pass;
     }
+    if comparison.timed_out() {
+        return Verdict::TimedOut;
+    }
     Verdict::Fail(describe_mismatch(comparison))
 }
 
@@ -507,6 +527,7 @@ fn seed_report(seeds: u64, profile: Profile) -> Result<SeedReport, String> {
         matched: 0,
         rejected: 0,
         mismatching_seeds: Vec::new(),
+        timed_out_seeds: Vec::new(),
     };
     for seed in 0..seeds {
         let source = generator::program_for(seed, profile);
@@ -523,6 +544,10 @@ fn record_seed(report: &mut SeedReport, seed: u64, comparison: &Comparison) {
     }
     if comparison.matches() {
         report.matched += 1;
+        return;
+    }
+    if comparison.timed_out() {
+        report.timed_out_seeds.push(seed);
         return;
     }
     report.mismatching_seeds.push(seed);
