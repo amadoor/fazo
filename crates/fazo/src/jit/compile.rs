@@ -21,7 +21,7 @@ use crate::{
     proto::Proto,
     value::Value as LuaValue,
     vm::{
-        Event,
+        Event, exec_layout,
         ic::{ABSENT, Entry, InlineCache, MethodEntry},
     },
 };
@@ -512,6 +512,19 @@ struct Lowering<'a> {
     helpers: Helpers,
 }
 
+#[derive(Clone, Copy)]
+enum Callee<'t> {
+    Known(&'t CallTarget),
+    Any,
+}
+
+#[derive(Clone, Copy)]
+struct CalleeValues {
+    upvalues: Value,
+    constants: Value,
+    proto: Value,
+}
+
 struct DirectCalls<'a> {
     frames: FrameLayout,
     calls: &'a [Vec<CallTarget>],
@@ -600,6 +613,13 @@ impl<'a> Lowering<'a> {
             return Vec::new();
         }
         field_entries(self.proto, pc)
+    }
+
+    fn add_entries(&self, pc: usize) -> Vec<Entry> {
+        if !self.caches {
+            return Vec::new();
+        }
+        add_entries(self.proto, pc)
     }
 
     fn method_entries(&self, pc: usize) -> Vec<MethodEntry> {
@@ -832,7 +852,7 @@ impl<'a> Lowering<'a> {
             Instruction::NewTable { a, b, c, k } => self.lower_new_table(pc, a, b, c, k),
             Instruction::Closure { a, bx } => self.fast_helper(pc, FAST_CLOSURE, [u32::from(a), bx, 0], pc + 1),
             Instruction::Return0 { .. } => self.lower_return(pc, 0, 0),
-            Instruction::TailCall { .. } => self.control_helper(pc, FAST_TAIL_CALL, [0, 0, 0], None),
+            Instruction::TailCall { a, b, k, .. } => self.lower_tail_call(pc, a, b, k),
             Instruction::Pow { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, u32::from(b), u32::from(c)),
             Instruction::PowK { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, u32::from(b), CONSTANT_BIT | u32::from(c)),
             Instruction::Shl { a, b, c } => self.arith_helper(pc, a, ArithOp::Shl, u32::from(b), u32::from(c)),
@@ -841,6 +861,10 @@ impl<'a> Lowering<'a> {
             Instruction::ShrI { a, b, sc } => self.arith_helper(pc, a, ArithOp::Shr, u32::from(b), IMMEDIATE_BIT | (sc as u32 & 0x3fff_ffff)),
             Instruction::Return { a, b, k: false, .. } if b != 0 => self.lower_return(pc, a, u32::from(b) - 1),
             Instruction::Return { a, k: false, .. } => self.control_helper(pc, FAST_RETURN, [u32::from(a), u32::MAX, 0], None),
+            Instruction::Return { a, b, .. } if b != 0 => {
+                self.close_in_place(pc);
+                self.lower_return(pc, a, u32::from(b) - 1);
+            }
             Instruction::Return { .. } => self.call_step(pc),
             Instruction::ForPrep { a, bx } => self.for_prep_helper(pc, a, bx),
             Instruction::Return1 { a } => self.lower_return(pc, a, 1),
@@ -862,8 +886,30 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Only megamorphic sites take the generic call; emitting it at every site costs compile work.
     fn lower_call(&mut self, pc: usize, a: u8, b: u8, c: u8) {
         let arguments = [u32::from(a), u32::from(b), u32::from(c)];
+        let targets = self.call_targets(pc);
+        let megamorphic = self.caches && matches!(self.proto.exec.feedback.get(pc), Some(InlineCache::Megamorphic));
+        if b == 0 || self.direct.is_none() || (targets.is_empty() && !megamorphic) {
+            return self.control_helper(pc, FAST_CALL, arguments, Some(pc + 1));
+        }
+        let helper = self.builder.create_block();
+        let any = if megamorphic { self.builder.create_block() } else { helper };
+        let (closure, matched) = self.match_callee(a, &targets, (any, helper));
+        for (target, &block) in targets.iter().zip(&matched) {
+            self.builder.switch_to_block(block);
+            self.direct_call(pc, (a, b, c), Callee::Known(target), closure, helper);
+        }
+        if megamorphic {
+            self.builder.switch_to_block(any);
+            self.direct_call(pc, (a, b, c), Callee::Any, closure, helper);
+        }
+        self.builder.switch_to_block(helper);
+        self.control_helper(pc, FAST_CALL, arguments, Some(pc + 1));
+    }
+
+    fn call_targets(&self, pc: usize) -> Vec<CallTarget> {
         let mut targets = self.direct.as_ref().and_then(|direct| direct.calls.get(pc)).cloned().unwrap_or_default();
         let mut seen = Vec::with_capacity(targets.len());
         targets.retain(|target| {
@@ -871,12 +917,11 @@ impl<'a> Lowering<'a> {
             seen.push(target.proto);
             fresh
         });
-        if targets.is_empty() || b == 0 || c == 0 {
-            return self.control_helper(pc, FAST_CALL, arguments, Some(pc + 1));
-        }
-        let helper = self.builder.create_block();
-        let check = self.builder.create_block();
+        targets
+    }
 
+    fn match_callee(&mut self, a: u8, targets: &[CallTarget], (unmatched, helper): (Block, Block)) -> (Value, Vec<Block>) {
+        let check = self.builder.create_block();
         let base = self.registers();
         let tag = self.builder.ins().load(types::I8, self.value_flags, base, slot(a));
         let is_closure = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, CLOSURE_TAG);
@@ -892,17 +937,124 @@ impl<'a> Lowering<'a> {
         for (target, &block) in targets.iter().zip(&matched) {
             self.continue_unless(proto, IntCC::Equal, target.proto as i64, block);
         }
-        self.builder.ins().jump(helper, &[]);
+        self.builder.ins().jump(unmatched, &[]);
+        (closure, matched)
+    }
+
+    fn lower_tail_call(&mut self, pc: usize, a: u8, b: u8, k: bool) {
+        let targets = self.call_targets(pc);
+        if targets.is_empty() || b == 0 || self.proto.is_vararg || self.direct.is_none() {
+            return self.control_helper(pc, FAST_TAIL_CALL, [0, 0, 0], None);
+        }
+        if k {
+            self.close_in_place(pc);
+        }
+        let helper = self.builder.create_block();
+        let (closure, matched) = self.match_callee(a, &targets, (helper, helper));
         for (target, &block) in targets.iter().zip(&matched) {
             self.builder.switch_to_block(block);
-            self.direct_call(pc, (a, b, c), target, closure, helper);
+            self.direct_tail_call(a, b, target, closure, helper);
         }
         self.builder.switch_to_block(helper);
-        self.control_helper(pc, FAST_CALL, arguments, Some(pc + 1));
+        self.control_helper(pc, FAST_TAIL_CALL, [0, 0, 0], None);
+    }
+
+    /// The helper answers this instruction's pc once the frame's upvalues are closed; anything else is where the frame continues.
+    fn close_in_place(&mut self, pc: usize) {
+        let result = self.call_fast(pc, FAST_CLOSE, [0, 0, 0]);
+        let after = self.builder.create_block();
+        let closed = self.builder.ins().icmp_imm_s(IntCC::Equal, result, pc as i64);
+        self.builder.ins().brif(closed, after, &[], self.dispatch, &[BlockArg::Value(result)]);
+        self.builder.switch_to_block(after);
+    }
+
+    fn direct_tail_call(&mut self, a: u8, b: u8, target: &CallTarget, closure: Value, helper: Block) {
+        let Some(direct) = self.direct.as_ref() else {
+            self.builder.ins().jump(helper, &[]);
+            return;
+        };
+        let frames = direct.frames;
+        let depth_limit = direct.depth_limit;
+        let signature = direct.signature;
+        let context = self.callee_context();
+        let flags = self.frame_flags;
+        let arguments = u32::from(b) - 1;
+        let register_count = u64::from(arguments) + u64::from(target.max_stack);
+        let span = register_count.max(crate::vm::REGISTER_SPAN as u64) as i64;
+
+        let cell = self.builder.ins().iconst(types::I64, target.entry as i64);
+        let entry = self.builder.ins().load(types::I64, flags, cell, 0);
+        self.continue_unless(entry, IntCC::Equal, 0, helper);
+        let depth_pointer = self.context_pointer(offset_of!(JitCtx, call_depth));
+        let depth = self.builder.ins().load(types::I32, flags, depth_pointer, 0);
+        self.continue_unless(depth, IntCC::UnsignedGreaterThanOrEqual, i64::from(depth_limit), helper);
+        let thread = self.context_pointer(offset_of!(JitCtx, thread));
+        let count = self.builder.ins().load(types::I64, flags, thread, frames.frames_len);
+        let data = self.builder.ins().load(types::I64, flags, thread, frames.frames_data);
+        let frame_offset = self.builder.ins().imul_imm_s(count, frames.frame_size);
+        let end = self.builder.ins().iadd(data, frame_offset);
+        let frame = self.builder.ins().iadd_imm_s(end, -frames.frame_size);
+        let status = self.builder.ins().load(types::I32, flags, frame, frames.field(lua_frame::STATUS));
+        let own = self.builder.ins().band_imm_u(status, i64::from(lua_frame::OWN_CALLER));
+        self.continue_unless(own, IntCC::NotEqual, 0, helper);
+        let stack_len = self.builder.ins().load(types::I64, flags, thread, frames.stack_len);
+        let caller_base = self.builder.ins().load(types::I64, self.context_flags, self.ctx, offset_of!(JitCtx, base) as i32);
+        let needed = self.builder.ins().iadd_imm_s(caller_base, span);
+        let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, needed, stack_len);
+        self.branch_unless(short, helper);
+        let top = self.builder.ins().iadd_imm_s(caller_base, register_count as i64);
+        self.continue_unless(top, IntCC::UnsignedGreaterThan, crate::vm::MAX_STACK_SLOTS as i64, helper);
+
+        let base = self.registers();
+        for index in 0..=arguments as i32 {
+            self.copy_value(base, slot(a) + index * VALUE_SIZE, base, (index - 1) * VALUE_SIZE);
+        }
+        let nil = self.builder.ins().iconst(types::I8, NIL_TAG);
+        for parameter in arguments..u32::from(target.num_params) {
+            self.builder.ins().store(self.value_flags, nil, base, parameter as i32 * VALUE_SIZE);
+        }
+        self.replace_lua_frame(frame, closure, status, frames);
+        let callee = self.known_callee(target, closure);
+        self.fill_callee_context(context, callee, base, (0, caller_base, closure), None);
+        let deeper = self.builder.ins().iadd_imm_s(depth, 1);
+        self.builder.ins().store(flags, deeper, depth_pointer, 0);
+        let callee_context = self.builder.ins().stack_addr(self.pointer, context, 0);
+        let start = self.builder.ins().iconst(types::I32, 0);
+        let call = self.builder.ins().call_indirect(signature, entry, &[callee_context, start]);
+        let code = self.builder.inst_results(call)[0];
+        let depth_pointer = self.context_pointer(offset_of!(JitCtx, call_depth));
+        self.builder.ins().store(flags, depth, depth_pointer, 0);
+
+        let returned = self.builder.create_block();
+        let other = self.builder.create_block();
+        let is_returned = self.builder.ins().icmp_imm_s(IntCC::Equal, code, super::EXIT_RETURNED);
+        self.builder.ins().brif(is_returned, returned, &[], other, &[]);
+        self.builder.switch_to_block(returned);
+        let thread = self.builder.ins().stack_load(self.pointer, types::I64, context, offset_of!(JitCtx, thread) as i32);
+        self.refresh_from_callee(context, thread, 0);
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(other);
+        self.builder.ins().return_(&[code]);
+    }
+
+    fn replace_lua_frame(&mut self, frame: Value, closure: Value, status: Value, frames: FrameLayout) {
+        let flags = self.frame_flags;
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().store(flags, closure, frame, frames.field(lua_frame::CLOSURE));
+        for word in 0..lua_frame::CACHE_WORDS {
+            let offset = frames.field(lua_frame::CACHE + word * std::mem::size_of::<usize>());
+            self.builder.ins().store(flags, zero, frame, offset);
+        }
+        let kept = self.builder.ins().band_imm_u(status, i64::from(lua_frame::TAIL_KEEPS));
+        let tail = self.builder.ins().bor_imm_u(kept, i64::from(lua_frame::TAIL));
+        let wide = self.builder.ins().uextend(types::I64, tail);
+        let pc_status = self.builder.ins().ishl_imm_u(wide, i64::from(lua_frame::STATUS_SHIFT));
+        self.builder.ins().store(flags, pc_status, frame, frames.field(lua_frame::PC));
+        self.builder.ins().store(flags, zero, frame, frames.field(lua_frame::NVARARGS));
     }
 
     /// Mirrors `Vm::jit_call_compiled`; any exit other than a return in place goes to `Vm::jit_after_call`.
-    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), target: &CallTarget, closure: Value, helper: Block) {
+    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, closure: Value, helper: Block) {
         let Some(direct) = self.direct.as_ref() else {
             self.builder.ins().jump(helper, &[]);
             return;
@@ -914,11 +1066,20 @@ impl<'a> Lowering<'a> {
         let flags = self.frame_flags;
         let arguments = u32::from(b) - 1;
         let wanted = i64::from(c) - 1;
-        let register_count = u64::from(arguments) + u64::from(target.max_stack);
-        let span = register_count.max(crate::vm::REGISTER_SPAN as u64) as i64;
         let callee_offset = (i32::from(a) + 1) * VALUE_SIZE;
 
-        let cell = self.builder.ins().iconst(types::I64, target.entry as i64);
+        let exec = match callee {
+            Callee::Known(_) => None,
+            Callee::Any => {
+                let address = self.closure_address(closure);
+                Some(self.builder.ins().load(types::I64, self.heap_flags, address, exec_layout::CLOSURE_CODE as i32))
+            }
+        };
+        let cell = match (callee, exec) {
+            (Callee::Known(target), _) => self.builder.ins().iconst(types::I64, target.entry as i64),
+            (Callee::Any, Some(exec)) => self.builder.ins().load(types::I64, self.heap_flags, exec, exec_layout::ENTRY as i32),
+            (Callee::Any, None) => unreachable!("a generic call reads its callee's Exec"),
+        };
         let entry = self.builder.ins().load(types::I64, flags, cell, 0);
         self.continue_unless(entry, IntCC::Equal, 0, helper);
         let depth_pointer = self.context_pointer(offset_of!(JitCtx, call_depth));
@@ -928,22 +1089,14 @@ impl<'a> Lowering<'a> {
         let stack_len = self.builder.ins().load(types::I64, flags, thread, frames.stack_len);
         let caller_base = self.builder.ins().load(types::I64, self.context_flags, self.ctx, offset_of!(JitCtx, base) as i32);
         let callee_base = self.builder.ins().iadd_imm_s(caller_base, i64::from(a) + 1);
-        let needed = self.builder.ins().iadd_imm_s(callee_base, span);
-        let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, needed, stack_len);
-        self.branch_unless(short, helper);
-        let top = self.builder.ins().iadd_imm_s(callee_base, register_count as i64);
-        self.continue_unless(top, IntCC::UnsignedGreaterThan, crate::vm::MAX_STACK_SLOTS as i64, helper);
+        self.check_callee_stack(callee, exec, (arguments, callee_base, stack_len), helper);
         let count = self.builder.ins().load(types::I64, flags, thread, frames.frames_len);
         let capacity = self.builder.ins().load(types::I64, flags, thread, frames.frames_capacity);
         let full = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, count, capacity);
         self.branch_unless(full, helper);
 
         let base = self.registers();
-        let nil = self.builder.ins().iconst(types::I8, NIL_TAG);
-        for parameter in arguments..u32::from(target.num_params) {
-            let offset = callee_offset + parameter as i32 * VALUE_SIZE;
-            self.builder.ins().store(self.value_flags, nil, base, offset);
-        }
+        self.clear_parameters(callee, exec, base, (arguments, callee_offset));
         let data = self.builder.ins().load(types::I64, flags, thread, frames.frames_data);
         let frame_offset = self.builder.ins().imul_imm_s(count, frames.frame_size);
         let frame = self.builder.ins().iadd(data, frame_offset);
@@ -953,7 +1106,18 @@ impl<'a> Lowering<'a> {
         self.push_lua_frame(frame, closure, callee_base, wanted);
         let pushed = self.builder.ins().iadd_imm_s(count, 1);
         self.builder.ins().store(flags, pushed, thread, frames.frames_len);
-        self.fill_callee_context(context, target, base, (callee_offset, callee_base, closure), wanted);
+        let values = match (callee, exec) {
+            (Callee::Known(target), _) => self.known_callee(target, closure),
+            (Callee::Any, exec) => {
+                let exec = exec.expect("a generic call reads its callee's Exec");
+                CalleeValues {
+                    upvalues: self.closure_upvalues(closure),
+                    constants: self.builder.ins().load(types::I64, self.heap_flags, exec, exec_layout::CONSTANTS as i32),
+                    proto: self.builder.ins().load(types::I64, self.heap_flags, exec, exec_layout::PROTO as i32),
+                }
+            }
+        };
+        self.fill_callee_context(context, values, base, (callee_offset, callee_base, closure), Some(wanted));
         let deeper = self.builder.ins().iadd_imm_s(depth, 1);
         self.builder.ins().store(flags, deeper, depth_pointer, 0);
         let callee_context = self.builder.ins().stack_addr(self.pointer, context, 0);
@@ -983,6 +1147,66 @@ impl<'a> Lowering<'a> {
         let call = self.builder.ins().call(after, &[self.ctx, pc_value, code, before, zero]);
         let result = self.builder.inst_results(call)[0];
         self.dispatch_result(result, Some(pc + 1));
+    }
+
+    /// The callee's registers and the interpreter's register span fit the stack, and its frame fits `MAX_STACK_SLOTS`.
+    fn check_callee_stack(&mut self, callee: Callee<'_>, exec: Option<Value>, (arguments, callee_base, stack_len): (u32, Value, Value), helper: Block) {
+        let span = crate::vm::REGISTER_SPAN as i64;
+        let top = match (callee, exec) {
+            (Callee::Known(target), _) => {
+                let register_count = i64::from(arguments) + i64::from(target.max_stack);
+                let needed = self.builder.ins().iadd_imm_s(callee_base, register_count.max(span));
+                let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, needed, stack_len);
+                self.branch_unless(short, helper);
+                self.builder.ins().iadd_imm_s(callee_base, register_count)
+            }
+            (Callee::Any, exec) => {
+                let exec = exec.expect("a generic call reads its callee's Exec");
+                let max_stack = self.builder.ins().uload8(types::I64, self.heap_flags, exec, exec_layout::MAX_STACK as i32);
+                let registers = self.builder.ins().iadd_imm_s(max_stack, i64::from(arguments));
+                let top = self.builder.ins().iadd(callee_base, registers);
+                let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, top, stack_len);
+                self.branch_unless(short, helper);
+                let needed = self.builder.ins().iadd_imm_s(callee_base, span);
+                let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, needed, stack_len);
+                self.branch_unless(short, helper);
+                top
+            }
+        };
+        self.continue_unless(top, IntCC::UnsignedGreaterThan, crate::vm::MAX_STACK_SLOTS as i64, helper);
+    }
+
+    /// Follows `luaD_precall` in ldo.c.
+    fn clear_parameters(&mut self, callee: Callee<'_>, exec: Option<Value>, base: Value, (arguments, callee_offset): (u32, i32)) {
+        let nil = self.builder.ins().iconst(types::I8, NIL_TAG);
+        let exec = match callee {
+            Callee::Known(target) => {
+                for parameter in arguments..u32::from(target.num_params) {
+                    let offset = callee_offset + parameter as i32 * VALUE_SIZE;
+                    self.builder.ins().store(self.value_flags, nil, base, offset);
+                }
+                return;
+            }
+            Callee::Any => exec.expect("a generic call reads its callee's Exec"),
+        };
+        let fill = self.builder.create_block();
+        let store = self.builder.create_block();
+        let filled = self.builder.create_block();
+        self.builder.append_block_param(fill, types::I64);
+        let parameters = self.builder.ins().uload8(types::I64, self.heap_flags, exec, exec_layout::NUM_PARAMS as i32);
+        let first = self.builder.ins().iconst(types::I64, i64::from(arguments));
+        self.builder.ins().jump(fill, &[BlockArg::Value(first)]);
+        self.builder.switch_to_block(fill);
+        let index = self.builder.block_params(fill)[0];
+        let done = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, parameters);
+        self.builder.ins().brif(done, filled, &[], store, &[]);
+        self.builder.switch_to_block(store);
+        let offset = self.builder.ins().imul_imm_s(index, i64::from(VALUE_SIZE));
+        let slot = self.builder.ins().iadd(base, offset);
+        self.builder.ins().store(self.value_flags, nil, slot, callee_offset);
+        let next = self.builder.ins().iadd_imm_s(index, 1);
+        self.builder.ins().jump(fill, &[BlockArg::Value(next)]);
+        self.builder.switch_to_block(filled);
     }
 
     /// Calls do not overlap, so one stack slot serves every call site.
@@ -1019,7 +1243,8 @@ impl<'a> Lowering<'a> {
         self.builder.ins().store(flags, zero, frame, frames.field(lua_frame::NVARARGS));
     }
 
-    fn fill_callee_context(&mut self, context: StackSlot, target: &CallTarget, base: Value, (callee_offset, callee_base, closure): (i32, Value, Value), wanted: i64) {
+    /// `wanted` is `None` for a tail call, whose callee returns where this frame would.
+    fn fill_callee_context(&mut self, context: StackSlot, callee: CalleeValues, base: Value, (callee_offset, callee_base, closure): (i32, Value, Value), wanted: Option<i64>) {
         let copied = [
             offset_of!(JitCtx, requests),
             offset_of!(JitCtx, tables),
@@ -1036,23 +1261,31 @@ impl<'a> Lowering<'a> {
             self.builder.ins().stack_store(self.pointer, value, context, offset as i32);
         }
         let registers = self.builder.ins().iadd_imm_s(base, i64::from(callee_offset));
-        let upvalues = if target.has_upvalues { self.closure_upvalues(closure) } else { self.builder.ins().iconst(types::I64, 0) };
-        let constants = self.builder.ins().iconst(types::I64, target.constants as i64);
-        let proto = self.builder.ins().iconst(types::I64, target.proto as i64);
-        let results = self.builder.ins().iconst(types::I32, wanted);
+        let results = match wanted {
+            Some(wanted) => self.builder.ins().iconst(types::I32, wanted),
+            None => self.builder.ins().load(types::I32, self.context_flags, self.ctx, offset_of!(JitCtx, direct_results) as i32),
+        };
         let ret_offset = self.builder.ins().iconst(types::I64, -i64::from(VALUE_SIZE));
         let set = [
             (offset_of!(JitCtx, registers), registers),
-            (offset_of!(JitCtx, upvalues), upvalues),
-            (offset_of!(JitCtx, constants), constants),
+            (offset_of!(JitCtx, upvalues), callee.upvalues),
+            (offset_of!(JitCtx, constants), callee.constants),
             (offset_of!(JitCtx, closure), closure),
             (offset_of!(JitCtx, base), callee_base),
-            (offset_of!(JitCtx, proto), proto),
+            (offset_of!(JitCtx, proto), callee.proto),
             (offset_of!(JitCtx, direct_results), results),
             (offset_of!(JitCtx, ret_offset), ret_offset),
         ];
         for (offset, value) in set {
             self.builder.ins().stack_store(self.pointer, value, context, offset as i32);
+        }
+    }
+
+    fn known_callee(&mut self, target: &CallTarget, closure: Value) -> CalleeValues {
+        CalleeValues {
+            upvalues: if target.has_upvalues { self.closure_upvalues(closure) } else { self.builder.ins().iconst(types::I64, 0) },
+            constants: self.builder.ins().iconst(types::I64, target.constants as i64),
+            proto: self.builder.ins().iconst(types::I64, target.proto as i64),
         }
     }
 
@@ -1139,20 +1372,48 @@ impl<'a> Lowering<'a> {
         self.branch_on(pc, condition, k, None);
     }
 
-    /// A frame a compiled call entered that wants exactly these results is finished in place; other returns use the helper.
+    /// Follows `moveresults` in ldo.c.
     fn lower_return(&mut self, pc: usize, first: u8, count: u32) {
         let helper = self.builder.create_block();
-        let copy = self.builder.create_block();
-        let check_none = self.builder.create_block();
+        let exact = self.builder.create_block();
+        let other = self.builder.create_block();
+        let wide = self.builder.create_block();
+        let place = self.builder.create_block();
         let done = self.builder.create_block();
+        let frames = self.direct.as_ref().map(|direct| direct.frames);
         let results = self.builder.ins().load(types::I32, self.context_flags, self.ctx, offset_of!(JitCtx, direct_results) as i32);
 
-        let exact = self.builder.ins().icmp_imm_s(IntCC::Equal, results, i64::from(count));
-        self.builder.ins().brif(exact, copy, &[], check_none, &[]);
-        self.builder.switch_to_block(check_none);
+        let is_exact = self.builder.ins().icmp_imm_s(IntCC::Equal, results, i64::from(count));
+        self.builder.ins().brif(is_exact, exact, &[], other, &[]);
+        self.builder.switch_to_block(exact);
+        self.copy_results(first, count);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(other);
+        self.builder.set_cold_block(other);
         let none = self.builder.ins().icmp_imm_s(IntCC::Equal, results, 0);
-        self.builder.ins().brif(none, done, &[], helper, &[]);
-        self.builder.switch_to_block(copy);
+        self.branch_unless(none, done);
+        let small = self.builder.ins().icmp_imm_s(IntCC::UnsignedLessThanOrEqual, results, i64::from(u8::MAX));
+        self.builder.ins().brif(small, place, &[], wide, &[]);
+        self.builder.switch_to_block(wide);
+        self.builder.set_cold_block(wide);
+        if frames.is_some() {
+            let open = self.builder.ins().icmp_imm_s(IntCC::Equal, results, -1);
+            self.builder.ins().brif(open, place, &[], helper, &[]);
+        } else {
+            self.builder.ins().jump(helper, &[]);
+        }
+        self.builder.switch_to_block(place);
+        self.builder.set_cold_block(place);
+        let destination = self.copy_results(first, count);
+        self.fill_results(results, destination, count, frames, done);
+        self.builder.switch_to_block(done);
+        let code = self.builder.ins().iconst(types::I64, super::EXIT_RETURNED);
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(helper);
+        self.control_helper(pc, FAST_RETURN, [u32::from(first), count, 0], None);
+    }
+
+    fn copy_results(&mut self, first: u8, count: u32) -> Value {
         let base = self.registers();
         let offset = self.builder.ins().load(types::I64, self.context_flags, self.ctx, offset_of!(JitCtx, ret_offset) as i32);
         let destination = self.builder.ins().iadd(base, offset);
@@ -1160,12 +1421,40 @@ impl<'a> Lowering<'a> {
             let register = first as i32 + index as i32;
             self.copy_value(base, register * VALUE_SIZE, destination, index as i32 * VALUE_SIZE);
         }
-        self.builder.ins().jump(done, &[]);
-        self.builder.switch_to_block(done);
-        let code = self.builder.ins().iconst(types::I64, super::EXIT_RETURNED);
-        self.builder.ins().return_(&[code]);
-        self.builder.switch_to_block(helper);
-        self.control_helper(pc, FAST_RETURN, [u32::from(first), count, 0], None);
+        destination
+    }
+
+    /// Follows `moveresults` in ldo.c for a count other than the one the frame returns.
+    fn fill_results(&mut self, results: Value, destination: Value, count: u32, frames: Option<FrameLayout>, done: Block) {
+        let fill = self.builder.create_block();
+        let store_nil = self.builder.create_block();
+        self.builder.append_block_param(fill, types::I32);
+        let start = self.builder.ins().iconst(types::I32, i64::from(count));
+        if let Some(frames) = frames {
+            let open_block = self.builder.create_block();
+            let open = self.builder.ins().icmp_imm_s(IntCC::Equal, results, -1);
+            self.builder.ins().brif(open, open_block, &[], fill, &[BlockArg::Value(start)]);
+            self.builder.switch_to_block(open_block);
+            let caller_base = self.builder.ins().load(types::I64, self.context_flags, self.ctx, offset_of!(JitCtx, base) as i32);
+            let top = self.builder.ins().iadd_imm_s(caller_base, i64::from(count) - 1);
+            let thread = self.context_pointer(offset_of!(JitCtx, thread));
+            self.builder.ins().store(self.frame_flags, top, thread, frames.top);
+            self.builder.ins().jump(done, &[]);
+        } else {
+            self.builder.ins().jump(fill, &[BlockArg::Value(start)]);
+        }
+        self.builder.switch_to_block(fill);
+        let index = self.builder.block_params(fill)[0];
+        let filled = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, results);
+        self.builder.ins().brif(filled, done, &[], store_nil, &[]);
+        self.builder.switch_to_block(store_nil);
+        let wide = self.builder.ins().uextend(types::I64, index);
+        let offset = self.builder.ins().imul_imm_s(wide, i64::from(VALUE_SIZE));
+        let slot = self.builder.ins().iadd(destination, offset);
+        let nil = self.builder.ins().iconst(types::I8, NIL_TAG);
+        self.builder.ins().store(self.value_flags, nil, slot, 0);
+        let next = self.builder.ins().iadd_imm_s(index, 1);
+        self.builder.ins().jump(fill, &[BlockArg::Value(next)]);
     }
 
     fn load_constant(&mut self, pc: usize, a: u8, index: u32, next: usize) {
@@ -1740,7 +2029,8 @@ impl<'a> Lowering<'a> {
     }
 
     fn set_field(&mut self, pc: usize, a: u8, b: u8, c: u8, k: bool) {
-        let entries: Vec<Entry> = self.field_entries(pc).into_iter().filter(|entry| entry.slot != ABSENT).collect();
+        let mut entries: Vec<Entry> = self.field_entries(pc).into_iter().filter(|entry| entry.slot != ABSENT).collect();
+        entries.extend(self.add_entries(pc));
         let Some(layout) = self.layout.filter(|_| !entries.is_empty()) else {
             return self.fast_helper(pc, FAST_SET_FIELD, [a.into(), b.into(), operand_index(c, k)], pc + 1);
         };
@@ -1748,6 +2038,9 @@ impl<'a> Lowering<'a> {
 
         let table = self.table_in_register(layout, a, miss);
         self.shape_switch(layout, table, &entries, miss, |lowering, entry| {
+            if entry.adds_key() {
+                return lowering.add_field(pc, layout, (table, a), entry, (c, k), miss);
+            }
             let address = lowering.slot_address(layout, table, entry.slot);
             let tag = lowering.builder.ins().load(types::I8, lowering.heap_flags, address, 0);
             let present = lowering.builder.ins().icmp_imm_s(IntCC::NotEqual, tag, NIL_TAG);
@@ -1762,6 +2055,34 @@ impl<'a> Lowering<'a> {
         });
         self.builder.switch_to_block(miss);
         self.fast_helper(pc, FAST_SET_FIELD, [a.into(), b.into(), operand_index(c, k)], pc + 1);
+    }
+
+    fn add_field(&mut self, pc: usize, layout: TableLayout, (table, a): (Value, u8), entry: Entry, (c, k): (u8, bool), miss: Block) {
+        let tag = self.builder.ins().uload32(self.heap_flags, table, layout.metatable_tag);
+        self.continue_unless(tag, IntCC::NotEqual, i64::from(layout.metatable_none), miss);
+        let base = self.registers();
+        let index = self.builder.ins().uload32(self.value_flags, base, slot(a) + PAYLOAD_OFFSET);
+        let marks = self.context_pointer(offset_of!(JitCtx, table_marks));
+        let mark_address = self.builder.ins().iadd(marks, index);
+        let mark = self.builder.ins().uload8(types::I64, self.heap_flags, mark_address, 0);
+        let black = self.builder.ins().band_imm_s(mark, i64::from(crate::gc::BLACK));
+        self.continue_unless(black, IntCC::NotEqual, 0, miss);
+        let capacity = self.builder.ins().load(types::I64, self.heap_flags, table, layout.slots_capacity);
+        self.continue_unless(capacity, IntCC::UnsignedLessThanOrEqual, i64::from(entry.slot), miss);
+        let value = self.store_operand(c, k);
+        let value_tag = self.builder.ins().band_imm_s(value.0, 0xff);
+        self.continue_unless(value_tag, IntCC::Equal, NIL_TAG, miss);
+
+        let length = self.builder.ins().iconst(types::I64, i64::from(entry.slot) + 1);
+        self.builder.ins().store(self.heap_flags, length, table, layout.slots_len);
+        let next = self.builder.ins().iconst(types::I64, entry.next.packed() as i64);
+        self.builder.ins().store(self.heap_flags, next, table, layout.shape);
+        let present = self.builder.ins().iconst(types::I8, 0);
+        self.builder.ins().store(self.heap_flags, present, table, layout.absent);
+        let address = self.slot_address(layout, table, entry.slot);
+        self.builder.ins().store(self.heap_flags, value.0, address, 0);
+        self.builder.ins().store(self.heap_flags, value.1, address, PAYLOAD_OFFSET);
+        self.jump_to(pc + 1);
     }
 
     /// Only a collectable value stored into a black table needs the barrier helper.

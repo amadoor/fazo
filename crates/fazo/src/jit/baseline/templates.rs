@@ -5,6 +5,7 @@ use std::mem::offset_of;
 
 use super::masm::{Alu, Cond, Division, FAlu, FCond, FReg, Imm, Masm, Reg, Target, Width, ext, slot};
 use crate::jit::{FrameLayout, JitCtx, TableLayout, layout::{lua_frame, upvalue}};
+use crate::vm::exec_layout;
 
 pub(crate) const NIL: i32 = 0;
 pub(crate) const BOOL: i32 = 1;
@@ -40,9 +41,10 @@ pub(crate) struct Env {
     pub(crate) depth_limit: u32,
 }
 
-pub(crate) const CALL_AREA: usize = std::mem::size_of::<JitCtx>() + 16;
+pub(crate) const CALL_AREA: usize = std::mem::size_of::<JitCtx>() + 32;
 const SPILL_COUNT: usize = std::mem::size_of::<JitCtx>();
 const SPILL_ENTRY: usize = SPILL_COUNT + 8;
+const SPILL_EXEC: usize = SPILL_COUNT + 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HelperId {
@@ -135,17 +137,21 @@ pub(crate) enum Key {
     SetUpval,
     ReturnCheck,
     ReturnCopy,
+    ReturnFill,
+    ReturnWide,
     ReturnDone,
     StepStub,
     SharedStep,
     CallCheck,
     CallEnter { upvalues: bool },
+    CallAnyCheck,
+    CallAnyEnter,
     TailCheck,
     ClearAt,
     TailEnter { upvalues: bool },
 }
 
-pub(crate) const KEY_COUNT: usize = 279;
+pub(crate) const KEY_COUNT: usize = 283;
 const HELPER_SLOTS: u8 = 19;
 
 impl Key {
@@ -188,6 +194,10 @@ impl Key {
             Key::MethodStart => 274,
             Key::MethodHop => 275,
             Key::MethodFinish => 276,
+            Key::ReturnFill => 279,
+            Key::CallAnyCheck => 280,
+            Key::CallAnyEnter => 281,
+            Key::ReturnWide => 282,
             Key::EqTag(tag) => 28 + tag as usize,
             Key::ArrayGet { constant_key } => 31 + usize::from(constant_key),
             Key::ArraySet { constant_key, constant_value } => 33 + 2 * usize::from(constant_key) + usize::from(constant_value),
@@ -276,7 +286,9 @@ pub(crate) fn build(key: Key, m: &mut dyn Masm, env: &Env) {
         Key::GetUpval => get_upval(m),
         Key::SetUpval => set_upval(m),
         Key::ReturnCheck => return_check(m),
+        Key::ReturnWide => return_wide(m, env),
         Key::ReturnCopy => copy(m, Reg::Base, reg(slot::A), Reg::T2, reg(slot::B)),
+        Key::ReturnFill => return_fill(m, env),
         Key::ReturnDone => {
             m.mov_imm(Reg::Ret, fixed(crate::jit::EXIT_RETURNED));
             m.jump(Target::Ext(ext::EXIT));
@@ -292,7 +304,9 @@ pub(crate) fn build(key: Key, m: &mut dyn Masm, env: &Env) {
             m.jump(Target::Ext(ext::DISPATCH));
         }
         Key::CallCheck => call_check(m, env),
-        Key::CallEnter { upvalues } => call_enter(m, env, upvalues),
+        Key::CallEnter { upvalues } => call_enter(m, env, Callee::Known { upvalues }),
+        Key::CallAnyCheck => call_any_check(m, env),
+        Key::CallAnyEnter => call_enter(m, env, Callee::Any),
         Key::TailCheck => tail_check(m, env),
         Key::ClearAt => m.store_imm(Width::U8, Reg::T2, reg(slot::A), NIL),
         Key::TailEnter { upvalues } => tail_enter(m, env, upvalues),
@@ -344,7 +358,13 @@ fn frame_field(frames: FrameLayout, offset: usize) -> Imm {
     fixed(i64::from(frames.field(offset)))
 }
 
-fn call_enter(m: &mut dyn Masm, env: &Env, upvalues: bool) {
+#[derive(Clone, Copy)]
+enum Callee {
+    Known { upvalues: bool },
+    Any,
+}
+
+fn call_enter(m: &mut dyn Masm, env: &Env, callee: Callee) {
     let frames = frames(env);
     let area = m.callee_context();
     let at = |offset: usize| fixed(i64::from(area) + offset as i64);
@@ -354,7 +374,7 @@ fn call_enter(m: &mut dyn Masm, env: &Env, upvalues: bool) {
     m.store(Width::U64, Reg::T2, Reg::T5, at(SPILL_COUNT));
     m.store(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
     push_frame(m, frames, at(SPILL_COUNT));
-    fill_context(m, frames, upvalues, area);
+    fill_context(m, frames, callee, area);
     m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
     m.load(Width::U32, Reg::T0, Reg::T2, fixed(0));
     m.alu_imm(Alu::Add, Reg::T0, 1);
@@ -432,7 +452,7 @@ fn push_frame(m: &mut dyn Masm, frames: FrameLayout, count: Imm) {
     m.store(Width::U64, Reg::T2, Reg::T1, fixed(i64::from(frames.frames_len)));
 }
 
-fn fill_context(m: &mut dyn Masm, frames: FrameLayout, upvalues: bool, area: i32) {
+fn fill_context(m: &mut dyn Masm, frames: FrameLayout, callee: Callee, area: i32) {
     let at = |offset: usize| fixed(i64::from(area) + offset as i64);
     for offset in COPIED {
         m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset));
@@ -441,23 +461,99 @@ fn fill_context(m: &mut dyn Masm, frames: FrameLayout, upvalues: bool, area: i32
     m.mov_imm(Reg::T2, reg(slot::V));
     m.alu(Alu::Add, Reg::T2, Reg::Base);
     m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, registers)));
-    if upvalues {
+    if matches!(callee, Callee::Known { upvalues: false }) {
+        m.store_imm(Width::U64, Reg::T5, at(offset_of!(JitCtx, upvalues)), 0);
+    } else {
         closure_at(m, Reg::T2, Reg::T0, Reg::Base, reg(slot::A));
         m.load(Width::U64, Reg::T2, Reg::T2, fixed(i64::from(frames.closure_upvalues)));
         m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, upvalues)));
-    } else {
-        m.store_imm(Width::U64, Reg::T5, at(offset_of!(JitCtx, upvalues)), 0);
     }
-    m.mov_imm(Reg::T2, reg(slot::K));
-    m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, constants)));
+    match callee {
+        Callee::Known { .. } => {
+            m.mov_imm(Reg::T2, reg(slot::K));
+            m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, constants)));
+            m.mov_imm(Reg::T2, reg(slot::Y));
+            m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, proto)));
+        }
+        Callee::Any => {
+            m.load(Width::U64, Reg::T0, Reg::T5, at(SPILL_EXEC));
+            m.load(Width::U64, Reg::T2, Reg::T0, fixed(exec_layout::CONSTANTS as i64));
+            m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, constants)));
+            m.load(Width::U64, Reg::T2, Reg::T0, fixed(exec_layout::PROTO as i64));
+            m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, proto)));
+        }
+    }
     m.load(Width::U64, Reg::T2, Reg::Base, payload(slot::A));
     m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, closure)));
     m.store(Width::U64, Reg::T4, Reg::T5, at(offset_of!(JitCtx, base)));
-    m.mov_imm(Reg::T2, reg(slot::Y));
-    m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, proto)));
     m.mov_imm(Reg::T2, reg(slot::C));
     m.store(Width::U32, Reg::T2, Reg::T5, at(offset_of!(JitCtx, direct_results)));
     m.store_imm(Width::U64, Reg::T5, at(offset_of!(JitCtx, ret_offset)), -(std::mem::size_of::<crate::value::Value>() as i32));
+}
+
+/// Follows LuaJIT's `BC_CALL`, which reads the callee's frame facts from its prototype.
+/// Leaves `T1` the thread, `T2` the frame count, `T3` the caller's base and `T4` the entry, as `CallCheck` does.
+fn call_any_check(m: &mut dyn Masm, env: &Env) {
+    let frames = frames(env);
+    let area = m.callee_context();
+    let at = |offset: usize| fixed(i64::from(area) + offset as i64);
+    let fill = m.new_label();
+    let filled = m.new_label();
+
+    m.load(Width::U8, Reg::T0, Reg::Base, reg(slot::A));
+    m.cmp_imm(Reg::T0, CLOSURE);
+    m.branch(Cond::Ne, slow());
+    closure_address(m, Reg::T0, Reg::T5);
+    m.load(Width::U64, Reg::T0, Reg::T0, fixed(exec_layout::CLOSURE_CODE as i64));
+    m.load(Width::U64, Reg::T4, Reg::T0, fixed(exec_layout::ENTRY as i64));
+    m.load(Width::U64, Reg::T4, Reg::T4, fixed(0));
+    m.cmp_imm(Reg::T4, 0);
+    m.branch(Cond::Eq, slow());
+    m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
+    m.load(Width::U32, Reg::T1, Reg::T1, fixed(0));
+    m.cmp_imm(Reg::T1, env.depth_limit as i32);
+    m.branch(Cond::AboveEq, slow());
+    m.stack_address(Reg::T5, 0);
+    m.store(Width::U64, Reg::T0, Reg::T5, at(SPILL_EXEC));
+    m.store(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
+
+    m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, thread)));
+    m.load(Width::U64, Reg::T2, Reg::T1, fixed(i64::from(frames.stack_len)));
+    m.load(Width::U64, Reg::T3, Reg::Ctx, context(offset_of!(JitCtx, base)));
+    m.load(Width::U8, Reg::T0, Reg::T0, fixed(exec_layout::MAX_STACK as i64));
+    m.mov_imm(Reg::T5, reg(slot::W));
+    m.alu(Alu::Add, Reg::T0, Reg::T5);
+    m.alu(Alu::Add, Reg::T0, Reg::T3);
+    m.mov_imm(Reg::T5, fixed(crate::vm::MAX_STACK_SLOTS as i64));
+    m.cmp(Reg::T0, Reg::T5);
+    m.branch(Cond::Above, slow());
+    m.cmp(Reg::T0, Reg::T2);
+    m.branch(Cond::Above, slow());
+    m.mov_imm(Reg::T5, Imm::hole_plus(slot::B, crate::vm::REGISTER_SPAN as i32));
+    m.alu(Alu::Add, Reg::T5, Reg::T3);
+    m.cmp(Reg::T5, Reg::T2);
+    m.branch(Cond::Above, slow());
+    m.load(Width::U64, Reg::T2, Reg::T1, fixed(i64::from(frames.frames_len)));
+    m.load(Width::U64, Reg::T0, Reg::T1, fixed(i64::from(frames.frames_capacity)));
+    m.cmp(Reg::T2, Reg::T0);
+    m.branch(Cond::AboveEq, slow());
+
+    m.stack_address(Reg::T5, 0);
+    m.load(Width::U64, Reg::T0, Reg::T5, at(SPILL_EXEC));
+    m.load(Width::U8, Reg::T0, Reg::T0, fixed(exec_layout::NUM_PARAMS as i64));
+    m.mov_imm(Reg::T5, reg(slot::U));
+    m.bind(fill);
+    m.cmp(Reg::T5, Reg::T0);
+    m.branch(Cond::AboveEq, filled);
+    m.mov(Reg::T4, Reg::T5);
+    m.shl_imm(Reg::T4, 4);
+    m.alu(Alu::Add, Reg::T4, Reg::Base);
+    m.store_imm(Width::U8, Reg::T4, reg(slot::V), NIL);
+    m.alu_imm(Alu::Add, Reg::T5, 1);
+    m.jump(fill);
+    m.bind(filled);
+    m.stack_address(Reg::T5, 0);
+    m.load(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
 }
 
 fn callee_check(m: &mut dyn Masm, env: &Env) {
@@ -1450,6 +1546,7 @@ fn hash_set(m: &mut dyn Masm, env: &Env, constant_value: bool) {
     barrier(m, slot::A);
 }
 
+/// The common exact count falls through; other counts take `TARGET`, the cold `ReturnWide`.
 fn return_check(m: &mut dyn Masm) {
     let exact = m.new_label();
     m.load(Width::U32, Reg::T0, Reg::Ctx, context(offset_of!(JitCtx, direct_results)));
@@ -1458,8 +1555,53 @@ fn return_check(m: &mut dyn Masm) {
     m.branch(Cond::Eq, exact);
     m.cmp_imm(Reg::T0, 0);
     m.branch(Cond::Eq, Target::Ext(ext::TRUE));
-    m.jump(slow());
+    m.jump(Target::Ext(ext::TARGET));
     m.bind(exact);
     m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, ret_offset)));
     m.alu(Alu::Add, Reg::T2, Reg::Base);
+}
+
+fn return_wide(m: &mut dyn Masm, env: &Env) {
+    let place = m.new_label();
+    m.cmp_imm(Reg::T0, i32::from(u8::MAX));
+    m.branch(Cond::BelowEq, place);
+    if env.frames.is_none() {
+        m.jump(slow());
+    } else {
+        m.mov_imm(Reg::T1, fixed(i64::from(u32::MAX)));
+        m.cmp(Reg::T0, Reg::T1);
+        m.branch(Cond::Ne, slow());
+    }
+    m.bind(place);
+    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, ret_offset)));
+    m.alu(Alu::Add, Reg::T2, Reg::Base);
+}
+
+/// Follows `moveresults` in ldo.c: missing results become nil, and a caller taking all of them gets `top` after the last.
+fn return_fill(m: &mut dyn Masm, env: &Env) {
+    let fill = m.new_label();
+    m.load(Width::U32, Reg::T0, Reg::Ctx, context(offset_of!(JitCtx, direct_results)));
+    m.mov_imm(Reg::T1, reg(slot::I));
+    m.cmp(Reg::T0, Reg::T1);
+    m.branch(Cond::Eq, Target::Ext(ext::TRUE));
+    if let Some(frames) = env.frames {
+        m.mov_imm(Reg::T3, fixed(i64::from(u32::MAX)));
+        m.cmp(Reg::T0, Reg::T3);
+        m.branch(Cond::Ne, fill);
+        m.load(Width::U64, Reg::T3, Reg::Ctx, context(offset_of!(JitCtx, base)));
+        m.alu(Alu::Add, Reg::T3, Reg::T1);
+        m.alu_imm(Alu::Sub, Reg::T3, 1);
+        m.load(Width::U64, Reg::T4, Reg::Ctx, context(offset_of!(JitCtx, thread)));
+        m.store(Width::U64, Reg::T3, Reg::T4, fixed(i64::from(frames.top)));
+        m.jump(Target::Ext(ext::TRUE));
+    }
+    m.bind(fill);
+    m.cmp(Reg::T1, Reg::T0);
+    m.branch(Cond::AboveEq, Target::Ext(ext::TRUE));
+    m.mov(Reg::T3, Reg::T1);
+    m.shl_imm(Reg::T3, 4);
+    m.alu(Alu::Add, Reg::T3, Reg::T2);
+    m.store_imm(Width::U8, Reg::T3, fixed(0), NIL);
+    m.alu_imm(Alu::Add, Reg::T1, 1);
+    m.jump(fill);
 }

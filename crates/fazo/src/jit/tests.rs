@@ -397,19 +397,21 @@ for i = 1, 2 do print(pcall(function() local n = nil return n.field end)) end",
     b"local function f(...) local n = select('#', ...) return n, ... end print(f(1, nil, 3))\nlocal t = setmetatable({}, {__index = function(_, k) return k * 2 end}) print(t[21], t.x == nil or 'x')",
 ];
 
+/// Each group runs three times, so a forced Peak compile has the feedback of the first run.
 #[test]
 fn each_opcode_group_matches_the_interpreter_when_compiled() {
     for group in GROUPS {
-        let interpreted = run_source_with(options_for(INTERPRETER), group);
+        let group = [&b"for _ = 1, 3 do\n"[..], group, b"\nend"].concat();
+        let interpreted = run_source_with(options_for(INTERPRETER), &group);
         for mode in MODES {
-            let forced = run_source_with(options_for(mode), group);
+            let forced = run_source_with(options_for(mode), &group);
             assert_eq!(
                 String::from_utf8_lossy(&forced.0),
                 String::from_utf8_lossy(&interpreted.0),
                 "program {} in mode {mode:?}",
-                String::from_utf8_lossy(group)
+                String::from_utf8_lossy(&group)
             );
-            assert!(forced.1 || !mode[0].starts_with("force"), "the {mode:?} run compiles {}", String::from_utf8_lossy(group));
+            assert!(forced.1 || !mode[0].starts_with("force"), "the {mode:?} run compiles {}", String::from_utf8_lossy(&group));
         }
     }
 }

@@ -57,6 +57,7 @@ impl TableLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameLayout {
     pub(crate) stack_len: i32,
+    pub(crate) top: i32,
     pub(crate) frames_data: i32,
     pub(crate) frames_len: i32,
     pub(crate) frames_capacity: i32,
@@ -76,6 +77,7 @@ impl FrameLayout {
         let (upvalue_data, _) = upvalue_vec_layout()?;
         Some(Self {
             stack_len: i32::try_from(offset_of!(Thread, stack) + len).ok()?,
+            top: i32::try_from(offset_of!(Thread, top)).ok()?,
             frames_data: i32::try_from(offset_of!(Thread, frames) + data).ok()?,
             frames_len: i32::try_from(offset_of!(Thread, frames) + len).ok()?,
             frames_capacity: i32::try_from(offset_of!(Thread, frames) + capacity).ok()?,

@@ -17,6 +17,22 @@
         "failures": [
           "files.lua"
         ]
+      },
+      "baseline": {
+        "pass": 30,
+        "fail": 1,
+        "skip": 2,
+        "failures": [
+          "files.lua"
+        ]
+      },
+      "peak": {
+        "pass": 30,
+        "fail": 1,
+        "skip": 2,
+        "failures": [
+          "files.lua"
+        ]
       }
     },
     "cases": {
@@ -31,6 +47,18 @@
         "fail": 0,
         "skip": 0,
         "failures": []
+      },
+      "baseline": {
+        "pass": 152,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "peak": {
+        "pass": 152,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
       }
     },
     "syntax": {
@@ -41,6 +69,18 @@
         "failures": []
       },
       "interpreter": {
+        "pass": 43,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "baseline": {
+        "pass": 43,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "peak": {
         "pass": 43,
         "fail": 0,
         "skip": 0,
@@ -63,6 +103,22 @@
         "failures": [
           "standalone main.lua"
         ]
+      },
+      "baseline": {
+        "pass": 73,
+        "fail": 1,
+        "skip": 0,
+        "failures": [
+          "standalone main.lua"
+        ]
+      },
+      "peak": {
+        "pass": 73,
+        "fail": 1,
+        "skip": 0,
+        "failures": [
+          "standalone main.lua"
+        ]
       }
     },
     "generated": {
@@ -73,6 +129,18 @@
         "failures": []
       },
       "interpreter": {
+        "pass": 600,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "baseline": {
+        "pass": 600,
+        "fail": 0,
+        "skip": 0,
+        "failures": []
+      },
+      "peak": {
         "pass": 600,
         "fail": 0,
         "skip": 0,
@@ -89,157 +157,157 @@
   "perf": {
     "fib": {
       "puc": 161182880,
-      "fazo": 119494487,
-      "baseline": 132663331,
-      "peak": 239133674,
-      "interpreter": 153858006
+      "fazo": 120551569,
+      "baseline": 132745993,
+      "peak": 176837141,
+      "interpreter": 153857723
     },
     "integer loop": {
       "puc": 480031101,
-      "fazo": 191628346,
-      "baseline": 191625481,
-      "peak": 219967794,
-      "interpreter": 408028897
+      "fazo": 191710552,
+      "baseline": 191706023,
+      "peak": 221305969,
+      "interpreter": 408028638
     },
     "float loop": {
       "puc": 470060466,
-      "fazo": 177473527,
-      "baseline": 177469439,
-      "peak": 222222388,
-      "interpreter": 402052615
+      "fazo": 177553735,
+      "baseline": 177549604,
+      "peak": 223569433,
+      "interpreter": 402053082
     },
     "table array": {
       "puc": 187926306,
-      "fazo": 111539106,
-      "baseline": 111505458,
-      "peak": 106270684,
-      "interpreter": 167701094
+      "fazo": 111617666,
+      "baseline": 111623178,
+      "peak": 107620910,
+      "interpreter": 167700959
     },
     "table hash": {
       "puc": 150726025,
-      "fazo": 102591765,
-      "baseline": 102594034,
-      "peak": 139154070,
-      "interpreter": 137782815
+      "fazo": 102659044,
+      "baseline": 102687494,
+      "peak": 140860322,
+      "interpreter": 137782267
     },
     "closures": {
       "puc": 189542451,
-      "fazo": 170873542,
-      "baseline": 170869503,
-      "peak": 293587772,
-      "interpreter": 174855625
+      "fazo": 169664702,
+      "baseline": 169664338,
+      "peak": 215907996,
+      "interpreter": 174855710
     },
     "method calls through __index": {
       "puc": 510224213,
-      "fazo": 399260288,
-      "baseline": 399241469,
-      "peak": 794244154,
-      "interpreter": 492407078
+      "fazo": 399303287,
+      "baseline": 399346321,
+      "peak": 761335490,
+      "interpreter": 492407282
     },
     "absent metamethods": {
       "puc": 476179139,
-      "fazo": 379550308,
-      "baseline": 379545557,
-      "peak": 501424014,
-      "interpreter": 365775895
+      "fazo": 379458668,
+      "baseline": 379455749,
+      "peak": 380182862,
+      "interpreter": 365776260
     },
     "coroutine switching": {
       "puc": 498568374,
-      "fazo": 427098803,
-      "baseline": 427098643,
-      "peak": 647902254,
-      "interpreter": 416065241
+      "fazo": 427099416,
+      "baseline": 427099254,
+      "peak": 590752201,
+      "interpreter": 416065520
     },
     "strings": {
       "puc": 71362238,
-      "fazo": 66906529,
-      "baseline": 66907787,
-      "peak": 77056606,
-      "interpreter": 62843832
+      "fazo": 67184954,
+      "baseline": 67184363,
+      "peak": 77466944,
+      "interpreter": 62839713
     },
     "binary-trees": {
       "puc": 452087637,
-      "fazo": 448862093,
-      "baseline": 438707707,
-      "peak": 519915495,
-      "interpreter": 380988674
+      "fazo": 395664770,
+      "baseline": 383173926,
+      "peak": 492805330,
+      "interpreter": 380989820
     },
     "n-body": {
       "puc": 470903890,
-      "fazo": 238418750,
-      "baseline": 238460275,
-      "peak": 950810006,
-      "interpreter": 385579472
+      "fazo": 234896671,
+      "baseline": 234884807,
+      "peak": 465829413,
+      "interpreter": 385580164
     },
     "spectral-norm": {
       "puc": 263371091,
-      "fazo": 168075790,
-      "baseline": 150088800,
-      "peak": 270618340,
-      "interpreter": 230005001
+      "fazo": 166568946,
+      "baseline": 147952261,
+      "peak": 192137517,
+      "interpreter": 230005058
     },
     "fannkuch": {
       "puc": 310512921,
-      "fazo": 251202379,
-      "baseline": 251194471,
-      "peak": 270382025,
-      "interpreter": 287318605
+      "fazo": 251281112,
+      "baseline": 251274061,
+      "peak": 270169761,
+      "interpreter": 287318720
     },
     "class dispatch": {
       "puc": 301377471,
-      "fazo": 177534738,
-      "baseline": 177536111,
-      "peak": 479852672,
-      "interpreter": 247572751
+      "fazo": 176876607,
+      "baseline": 176873235,
+      "peak": 493311853,
+      "interpreter": 247571822
     },
     "deltablue": {
       "puc": 513410560,
-      "fazo": 465687309,
-      "baseline": 465503121,
-      "peak": 1273440031,
-      "interpreter": 464280462
+      "fazo": 402088634,
+      "baseline": 401864874,
+      "peak": 1299367372,
+      "interpreter": 464309108
     },
     "havlak": {
       "puc": 169081516,
-      "fazo": 179548085,
-      "baseline": 179597745,
-      "peak": 633123482,
-      "interpreter": 167764996
+      "fazo": 164041816,
+      "baseline": 164041763,
+      "peak": 675382235,
+      "interpreter": 167782942
     },
     "garbage collector (generational)": {
       "puc": 1792963000,
-      "fazo": 1243129120,
-      "baseline": 1242003614,
-      "peak": 1692351913,
-      "interpreter": 1466974962
+      "fazo": 1241880944,
+      "baseline": 1240828068,
+      "peak": 1633040977,
+      "interpreter": 1466971258
     },
     "stats": {
       "puc": 517068523,
-      "fazo": 314539820,
-      "baseline": 314518875,
-      "peak": 780748689,
-      "interpreter": 439644629
+      "fazo": 303829725,
+      "baseline": 303804695,
+      "peak": 776380252,
+      "interpreter": 439643802
     },
     "dialogue (interpreted)": {
       "puc": 467260908,
-      "fazo": 330325161,
-      "baseline": 330153284,
-      "peak": 541632058,
-      "interpreter": 399621748
+      "fazo": 329284585,
+      "baseline": 329135031,
+      "peak": 531961185,
+      "interpreter": 399623161
     },
     "dialogue (compiled with load)": {
       "puc": 1752306868,
-      "fazo": 1625377945,
-      "baseline": 1624725304,
-      "peak": 41667739090,
-      "interpreter": 1633622339
+      "fazo": 1626821879,
+      "baseline": 1626195276,
+      "peak": 16921679541,
+      "interpreter": 1633888927
     },
     "frame": {
       "puc": 2038314512,
-      "fazo": 926772574,
-      "baseline": 936625728,
-      "peak": 3149335116,
-      "interpreter": 1608332716
+      "fazo": 925522857,
+      "baseline": 933895632,
+      "peak": 3154781631,
+      "interpreter": 1608332324
     }
   },
   "operations": {

@@ -73,9 +73,26 @@ pub(crate) struct Exec {
     upvalue_count: usize,
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     budget: Pointer<std::cell::Cell<i64>>,
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    entry: Pointer<std::cell::Cell<usize>>,
+}
+
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) mod exec_layout {
+    use super::{CodeRef, Exec};
+    use crate::object::Closure;
+    use std::mem::offset_of;
+
+    pub(crate) const CLOSURE_CODE: usize = offset_of!(Closure, code) + offset_of!(CodeRef, 0);
+    pub(crate) const PROTO: usize = offset_of!(Exec, proto);
+    pub(crate) const NUM_PARAMS: usize = offset_of!(Exec, num_params);
+    pub(crate) const MAX_STACK: usize = offset_of!(Exec, max_stack);
+    pub(crate) const CONSTANTS: usize = offset_of!(Exec, constants);
+    pub(crate) const ENTRY: usize = offset_of!(Exec, entry);
 }
 
 #[derive(Debug)]
+#[repr(transparent)]
 struct Pointer<T>(*const T);
 
 impl<T> Clone for Pointer<T> {
@@ -99,6 +116,7 @@ unsafe impl<T> Sync for Pointer<T> {}
 
 /// Null until filled.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(transparent)]
 pub(crate) struct CodeRef(Pointer<Exec>);
 
 /// Null until filled.
@@ -221,6 +239,7 @@ impl Proto {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             exec.budget = Pointer(std::ptr::from_ref(self.jit.budget()));
+            exec.entry = Pointer(std::ptr::from_ref(self.jit.entry()));
         }
     }
 }

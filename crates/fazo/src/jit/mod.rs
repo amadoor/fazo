@@ -154,7 +154,7 @@ pub struct JitPolicy {
 }
 
 impl JitPolicy {
-    /// Tiers up on first use and keeps compiled code; `-X force=` selects it.
+    /// Tiers up on first use (Peak once the prototype's first calls have recorded feedback) and keeps compiled code; `-X force=` selects it.
     pub const fn forced() -> Self {
         Self {
             baseline: TierPolicy::immediate(),

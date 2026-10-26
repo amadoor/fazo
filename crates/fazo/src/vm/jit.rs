@@ -218,6 +218,12 @@ impl Vm {
             return self.jit_resume_compiled(proto, pc);
         }
         if let Some(tier) = forced {
+            if tier == Tier::Peak && !function.jit.primed {
+                function.jit.primed = true;
+                function.jit.budget().set(FORCED_PEAK_WAIT);
+                self.jit_watch_loop(proto, pc);
+                return None;
+            }
             return self.jit_compile_entry(proto, tier);
         }
         if function.jit.prepared {
@@ -233,7 +239,7 @@ impl Vm {
                 return None;
             }
         }
-        if function.jit.observed_from.is_none() && policy.observe_budget > 0 && crate::jit::calls_out(function) {
+        if function.jit.observed_from.is_none() && policy.observe_budget > 0 && switches > 0 && crate::jit::calls_out(function) {
             function.jit.observed_from = Some(switches);
             function.jit.budget().set(i64::from(policy.observe_budget));
             self.jit_watch_loop(proto, pc);
@@ -309,7 +315,8 @@ impl Vm {
     fn jit_reveal(&mut self, proto: Ref<Proto>) {
         let function = self.heap.protos.live_mut(proto);
         function.jit.hidden = false;
-        function.jit.entry().set(function.jit.code().map_or(0, |code| code as usize));
+        let entry = function.jit.code().filter(|_| !function.is_vararg).map_or(0, |code| code as usize);
+        function.jit.entry().set(entry);
     }
 
     fn jit_code_budget(&mut self) -> Arc<crate::jit::CodeBudget> {
@@ -665,6 +672,7 @@ impl Vm {
             self.jit.call_depth = depth.max(JIT_CALL_DEPTH.saturating_sub(levels));
         }
         let mut error = None;
+        let direct_results = self.jit_entry_results();
         let mut ctx = JitCtx {
             requests: Arc::as_ptr(&self.requests),
             registers,
@@ -677,8 +685,8 @@ impl Vm {
             closure,
             base,
             proto,
-            direct_results: NOT_DIRECT,
-            ret_offset: 0,
+            direct_results,
+            ret_offset: -(std::mem::size_of::<Value>() as i64),
             thread: self.jit_thread_object(),
             thread_ref: self.current_thread,
             call_depth: &raw mut self.jit.call_depth,
@@ -688,11 +696,26 @@ impl Vm {
         let code = crate::jit::enter(entry.code, &mut ctx, pc);
         self.jit.entries -= 1;
         self.jit.call_depth = depth;
-        debug_assert!(matches!(code, EXIT_RELOAD | EXIT_HOOK | EXIT_ERROR));
-        if code == EXIT_ERROR {
-            return Err(error.take().expect("compiled code exits with an error only after recording it"));
+        debug_assert!(matches!(code, EXIT_RELOAD | EXIT_HOOK | EXIT_ERROR | EXIT_RETURNED));
+        match code {
+            EXIT_ERROR => Err(error.take().expect("compiled code exits with an error only after recording it")),
+            EXIT_RETURNED => {
+                self.thread_mut().frames.pop();
+                Ok(true)
+            }
+            _ => Ok(true),
         }
-        Ok(true)
+    }
+
+    fn jit_entry_results(&self) -> i32 {
+        let thread = self.thread();
+        let [.., crate::object::Frame::Lua(caller), crate::object::Frame::Lua(frame)] = thread.frames.as_slice() else {
+            return NOT_DIRECT;
+        };
+        if !frame.nested() || !caller.is_idle() || frame.counted() || frame.hidden_params() != 0 || thread.hook.is_some() {
+            return NOT_DIRECT;
+        }
+        frame.nresults()
     }
 
     #[inline(never)]
@@ -1094,12 +1117,17 @@ impl Vm {
         if !self.call_settled(thread, frames) || !self.jit_stack_room(ctx, JIT_CALL_STACK) {
             return Control::Reload;
         }
-        let Some(&crate::object::LuaFrame { closure, base, .. }) = self.top_lua_frame() else {
+        let Some(frame) = self.top_lua_frame() else {
             return Control::Reload;
         };
+        let (closure, base, nested) = (frame.closure, frame.base, frame.nested());
         let proto = self.heap.closures.live(closure).proto;
         if let Some(outcome) = self.jit_enter_tail(ctx, closure, base, proto) {
             return outcome;
+        }
+        // A nested frame's caller belongs to the run that entered this code, so that run interprets the callee.
+        if nested {
+            return Control::Reload;
         }
         self.jit.call_depth += 1;
         let ran = self.jit_enter_callee(closure, base, proto);
@@ -1122,14 +1150,16 @@ impl Vm {
         let Instruction::TailCall { a, b, .. } = self.heap.protos.live(ctx.proto).code[pc] else {
             return None;
         };
-        let open_above = self.thread().open_upvalues.last().is_some_and(|&upvalue| self.open_index(upvalue) >= ctx.base);
         let frame = self.top_lua_frame()?;
         let (ret, counted) = (frame.ret(), frame.counted());
-        if b == 0 || open_above || counted || self.thread().hook.is_some() {
+        if counted || self.thread().hook.is_some() {
             return None;
         }
         let function_slot = ctx.base + usize::from(a);
-        let argument_count = usize::from(b) - 1;
+        let argument_count = if b != 0 { usize::from(b) - 1 } else { self.thread().top.checked_sub(function_slot + 1)? };
+        if self.thread().open_upvalues.last().is_some_and(|&upvalue| self.open_index(upvalue) >= ctx.base) {
+            self.close_upvalues(ctx.base);
+        }
 
         match self.stack_get(function_slot) {
             Value::Closure(closure) => self.jit_tail_closure(ctx, ret, function_slot, closure, argument_count),
@@ -1167,12 +1197,16 @@ impl Vm {
     fn jit_tail_builtin(&mut self, ctx: &mut JitCtx, ret: usize, function_slot: usize, native: Ref<crate::object::Native>, argument_count: usize) -> Option<Control> {
         let builtin = self.builtin_of(native)?;
         let wanted = ctx.direct_results;
-        if wanted < 0 || !self.call_builtin(builtin, function_slot, argument_count, wanted) {
+        if wanted == NOT_DIRECT || !self.call_builtin(builtin, function_slot, argument_count, wanted) {
             return None;
         }
 
-        let count = wanted as usize;
-        self.thread_mut().stack.copy_within(function_slot..function_slot + count, ret);
+        let thread = self.thread_mut();
+        let count = if wanted < 0 { thread.top - function_slot } else { wanted as usize };
+        thread.stack.copy_within(function_slot..function_slot + count, ret);
+        if wanted < 0 {
+            thread.top = ret + count;
+        }
         self.jit_refresh(ctx);
         Some(Control::Returned)
     }
@@ -1485,6 +1519,10 @@ const ARITH_OPS: [crate::instruction::ArithOp; 12] = [
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CODE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// A forced Peak compile waits for call feedback, so it builds the code normal tiering would.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const FORCED_PEAK_WAIT: i64 = crate::jit::ENTRY_CHARGE as i64 * super::ic::FEEDBACK_CALLS as i64;
 
 /// Declines after which Baseline code whose feedback held still stops charging the tier-up budget, so hot loops cost no more than the jump.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -20,7 +20,7 @@ use crate::{
     },
     proto::Proto,
     value::Value,
-    vm::ic::ABSENT,
+    vm::ic::{ABSENT, InlineCache},
 };
 
 pub(crate) struct BaselineFacts<'a> {
@@ -799,22 +799,34 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Follows `Lowering::lower_call` in compile.rs.
     fn call(&mut self, pc: usize, a: u8, b: u8, c: u8) {
         let args = [i64::from(a), i64::from(b), i64::from(c)];
         let targets = self.call_targets(pc, a, b);
-        if targets.is_empty() || b == 0 || c == 0 || !self.library.has_frames() {
+        let megamorphic = self.facts.inline_caches && matches!(self.proto.exec.feedback.get(pc), Some(InlineCache::Megamorphic));
+        if b == 0 || !self.library.has_frames() || u32::from(a) + u32::from(b) > u32::from(MAX_REGISTER) || (targets.is_empty() && !megamorphic) {
             return self.fast(pc, FAST_CALL, args, Some(pc + 1));
         }
         let slow = self.cold_fast(pc, FAST_CALL, args, Some(pc + 1));
+        let generic = megamorphic.then(|| self.mark());
         let arguments = i64::from(b) - 1;
-        let count = targets.len();
-        for (index, target) in targets.into_iter().enumerate() {
-            let fresh = (index + 1 < count).then(|| self.mark());
-            let next = fresh.map_or(slow, Label::Mark);
+        let first = i64::from(a) + 1;
+        let enter = |constants: i64, proto: i64| {
+            values(&[
+                (slot::A, offset(a)),
+                (slot::B, first),
+                (slot::C, i64::from(c) - 1),
+                (slot::K, constants),
+                (slot::Y, proto),
+                (slot::V, first * VALUE),
+                (slot::I, pc as i64 + 1),
+                (slot::PC, pc as i64),
+            ])
+        };
+        for (index, target) in targets.iter().enumerate() {
+            let fresh = (index + 1 < targets.len()).then(|| self.mark());
+            let next = fresh.or(generic).map_or(slow, Label::Mark);
             let register_count = arguments + i64::from(target.max_stack);
             let span = register_count.max(crate::vm::REGISTER_SPAN as i64);
-            let first = i64::from(a) + 1;
             let check = values(&[
                 (slot::A, offset(a)),
                 (slot::Y, target.proto as i64),
@@ -826,21 +838,19 @@ impl<'a> Emitter<'a> {
             for parameter in arguments..i64::from(target.num_params) {
                 self.put(false, Key::LoadNil, &values(&[(slot::A, (first + parameter) * VALUE)]), &self.labels(pc));
             }
-            let enter = values(&[
-                (slot::A, offset(a)),
-                (slot::B, first),
-                (slot::C, i64::from(c) - 1),
-                (slot::K, target.constants as i64),
-                (slot::Y, target.proto as i64),
-                (slot::V, first * VALUE),
-                (slot::I, pc as i64 + 1),
-                (slot::PC, pc as i64),
-            ]);
-            self.put(false, Key::CallEnter { upvalues: target.has_upvalues }, &enter, &self.with(pc, &[(ext::SLOW, slow)]));
+            let values = enter(target.constants as i64, target.proto as i64);
+            self.put(false, Key::CallEnter { upvalues: target.has_upvalues }, &values, &self.with(pc, &[(ext::SLOW, slow)]));
             if let Some(mark) = fresh {
                 self.bind_here(mark);
             }
         }
+        let Some(generic) = generic else {
+            return;
+        };
+        self.bind_here(generic);
+        let check = values(&[(slot::A, offset(a)), (slot::B, first), (slot::W, first + arguments), (slot::U, arguments), (slot::V, first * VALUE)]);
+        self.put(false, Key::CallAnyCheck, &check, &self.with(pc, &[(ext::SLOW, slow)]));
+        self.put(false, Key::CallAnyEnter, &enter(0, 0), &self.with(pc, &[(ext::SLOW, slow)]));
     }
 
     /// The helper answers this instruction's pc to continue into the inline return.
@@ -859,14 +869,24 @@ impl<'a> Emitter<'a> {
         }
         let slow = self.cold_fast(pc, FAST_RETURN, [i64::from(first), i64::from(count), 0], None);
         let done = self.mark();
-        let labels = self.with(pc, &[(ext::SLOW, slow), (ext::TRUE, Label::Mark(done))]);
-        self.put(false, Key::ReturnCheck, &values(&[(slot::I, i64::from(count))]), &labels);
-        for index in 0..count {
-            let vals = values(&[(slot::A, offset(first) + i64::from(index) * VALUE), (slot::B, i64::from(index) * VALUE)]);
-            self.put(false, Key::ReturnCopy, &vals, &labels);
-        }
+        let wide = self.mark();
+        let labels = self.with(pc, &[(ext::SLOW, slow), (ext::TRUE, Label::Mark(done)), (ext::TARGET, Label::Mark(wide))]);
+        let counted = values(&[(slot::I, i64::from(count))]);
+        self.put(false, Key::ReturnCheck, &counted, &labels);
+        self.return_copies(false, first, count, &labels);
         self.bind_here(done);
         self.put(false, Key::ReturnDone, &values(&[]), &labels);
+        self.bind_cold(wide);
+        self.put(true, Key::ReturnWide, &values(&[]), &labels);
+        self.return_copies(true, first, count, &labels);
+        self.put(true, Key::ReturnFill, &counted, &labels);
+    }
+
+    fn return_copies(&mut self, cold: bool, first: u8, count: u32, labels: &Labels) {
+        for index in 0..count {
+            let vals = values(&[(slot::A, offset(first) + i64::from(index) * VALUE), (slot::B, i64::from(index) * VALUE)]);
+            self.put(cold, Key::ReturnCopy, &vals, labels);
+        }
     }
 }
 

@@ -39,6 +39,8 @@ mod native_tests;
 
 use ic::{FEEDBACK_CALLS, InlineCache};
 pub(crate) use window::{CodeRef, Exec, Raw, UpvaluesRef};
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use window::exec_layout;
 
 pub(crate) use naming::Operand;
 

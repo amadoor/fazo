@@ -3,6 +3,7 @@ name = "fazo_cli"
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
+publish = false
 description = "The fazo standalone interpreter, a drop-in for the lua executable"
 repository = "https://github.com/amadoor/fazo"
 readme = "../../README.md"
