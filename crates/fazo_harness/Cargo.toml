@@ -16,6 +16,10 @@ name = "perf"
 path = "src/bin/perf.rs"
 
 [[bin]]
+name = "quick"
+path = "src/bin/quick.rs"
+
+[[bin]]
 name = "bytecode"
 path = "src/bin/bytecode.rs"
 

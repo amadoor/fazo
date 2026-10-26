@@ -119,6 +119,24 @@ operations. A workload with no such version reports why it has no LuaJIT number.
 fazo's ratio to PUC Lua and to LuaJIT, then lists the workloads where fazo is slower than LuaJIT; only
 the PUC ratio and the operation budgets fail the run.
 
+## Quick check
+
+`cargo xtask quick [seeds]` is the check to run after every compiler change; it takes a few minutes and
+needs neither Valgrind nor the reference cache. It runs:
+
+- `cargo test -p fazo --lib`;
+- every workload in `perf/` under `-X force=peak`, under `-X force=peak stress-exit=3 stress-ic`, and
+  under default tiering, each compared with its output under `-X tier=interpreter`;
+- every per-operation script in `perf/ops/` under `-X force=peak`, compared with the interpreter;
+- a deopt and recompile report from the JIT's own counters (`-X jitstats`), which counts as a failure any
+  deopt site that fired 8 times or more, any prototype compiled by Peak 6 times or more, and any prototype
+  recompiled 8 times or more;
+- `seeds` generated programs per generator profile (Full, Metatables and Core; default 100) under
+  `-X force=peak`, compared with the interpreter;
+- the official `math`, `calls`, `nextvar`, `coroutine` and `sort` tests under `-X force=peak`.
+
+It builds fazo with the `profiling` profile and prints each step's time and every failure.
+
 ## Command-line cases
 
 `src/cli.rs` holds the cases for the `fazo` executable (`crates/fazo_cli`). Each case runs the official

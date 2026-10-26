@@ -3,17 +3,18 @@
 
 use super::{
     flow::{self, Flow, RegSet},
-    ir::{BinOp, BlockId, Cc, Closure, Const, Counted, Edge, FrameState, Func, Helper, HelperKind, InlineFrame, Loop, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
+    ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Counted, Edge, FrameState, Func, Helper, HelperKind, InlineFrame, Loop, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
     passes::inline::{self, Candidate},
 };
 use crate::{
     arena::Ref,
     instruction::Instruction,
     jit::sites,
+    object::Native,
     proto::Proto,
     value::Value as LuaValue,
     vm::{
-        Event,
+        Builtin, Event,
         ic::{ABSENT, Entry, InlineCache, MethodEntry},
     },
 };
@@ -25,8 +26,10 @@ pub(crate) struct Facts<'a> {
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
     pub(crate) policy: inline::Policy,
     pub(crate) osr_at: Option<u32>,
-    /// Per pc of the compiled prototype: where the running closure's environment table held the global's key.
-    pub(crate) nodes: &'a [Option<NodeHint>],
+    pub(crate) node_hint: &'a dyn Fn(&Proto, usize, bool) -> Option<NodeHint>,
+    pub(crate) builtin_of: &'a dyn Fn(Ref<Native>) -> Option<Builtin>,
+    /// An accumulator that changed kind inside the loop is entered as a number, so the guard checks only that.
+    pub(crate) running_floats: &'a [bool],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,7 +91,28 @@ pub(crate) fn build<'a>(proto: &'a Proto, facts: &Facts<'a>) -> Func {
     builder.regs = vec![Reg::Mem; usize::from(proto.max_stack).max(1)];
     builder.jump_to(&mut frame, 0);
     builder.run(&mut frame);
+    if facts.osr_at.is_some_and(|at| at != 0) && proto.line_defined == 0 {
+        osr_only(&mut builder.func);
+    }
     builder.func
+}
+
+/// Follows V8's OSR (src/compiler/osr.cc): a main chunk runs once, so only loop entries can run its code.
+fn osr_only(func: &mut Func) {
+    func.entry = None;
+    let mut reachable = vec![false; func.blocks.len()];
+    for block in func.reverse_postorder() {
+        reachable[block.0 as usize] = true;
+    }
+    for (index, block) in func.blocks.iter_mut().enumerate() {
+        if reachable[index] {
+            continue;
+        }
+        block.params.clear();
+        block.insts.clear();
+        block.term = Term::Return { pc: 0, first: 0, count: 0, close: false };
+    }
+    func.loops.retain(|entry| reachable[entry.header.0 as usize]);
 }
 
 struct Builder<'a, 'f> {
@@ -213,7 +237,16 @@ impl<'a> Builder<'a, '_> {
             frames: frame.chain.clone(),
             slots,
             site: frame.site.unwrap_or(pc as u32),
+            lazy: false,
+            objects: Vec::new(),
         };
+        self.func.add_state(state)
+    }
+
+    fn lazy_state_at(&mut self, frame: &Frame<'_>, pc: usize) -> StateId {
+        let eager = self.state_at(frame, pc);
+        let mut state = self.func.state(eager).clone();
+        state.lazy = true;
         self.func.add_state(state)
     }
 
@@ -453,9 +486,12 @@ impl<'a> Builder<'a, '_> {
                 Some(Reg::Val(value, _)) => self.entry_type(frame, *value),
                 _ => Type::ANY,
             }).collect();
-            let ty = kinds.iter().fold(Type::NONE, |ty, kind| ty.union(*kind));
+            let entered = kinds.iter().fold(Type::NONE, |ty, kind| ty.union(*kind));
+            let float_now = self.facts.running_floats.get(slot as usize).copied().unwrap_or(false);
+            let number = Type::INT.union(Type::FLOAT);
+            let ty = if entered == Type::INT && float_now { number } else { entered };
             let loaded = self.emit(Op::LoadReg { slot }, Type::ANY, Rep::Boxed);
-            let value = if speculate && !kinds.is_empty() && (ty == Type::INT || ty == Type::FLOAT) {
+            let value = if speculate && !kinds.is_empty() && (ty == Type::INT || ty == Type::FLOAT || ty == number) {
                 self.emit(Op::GuardType { value: loaded, ty, state }, ty, Rep::Boxed)
             } else {
                 loaded
@@ -697,7 +733,7 @@ impl<'a> Builder<'a, '_> {
             Instruction::Call { a, b, c } => return self.call(frame, pc, a, b, c),
             Instruction::TailCall { a, b, k, .. } => {
                 if frame.site.is_some() {
-                    return self.deopt(frame, pc);
+                    return self.inlined_tail_call(frame, pc, (a, b, k));
                 }
                 self.flush();
                 self.end(Term::TailCall { pc: pc as u32, a, b, k });
@@ -930,10 +966,10 @@ impl<'a> Builder<'a, '_> {
     }
 
     fn node_hint(&self, frame: &Frame<'_>, pc: usize, constant: u8) -> Option<(NodeHint, u64)> {
-        if !self.facts.inline_caches || !frame.chain.is_empty() {
+        if !self.facts.inline_caches {
             return None;
         }
-        let hint = (*self.facts.nodes.get(pc)?)?;
+        let hint = (self.facts.node_hint)(frame.proto, pc, frame.chain.is_empty())?;
         let key = frame.proto.constants.get(usize::from(constant)).copied()?;
         let LuaValue::String(string) = key else {
             return None;
@@ -1112,11 +1148,20 @@ impl<'a> Builder<'a, '_> {
         let adds = self.facts.inline_caches && !sites::add_entries(frame.proto, pc).is_empty();
         let stored = self.stored(frame, value);
         let state = self.state_at(frame, pc);
-        match entries.as_slice() {
-            [entry] if !adds => {
+        let additions = sites::add_entries(frame.proto, pc);
+        let monomorphic = matches!(frame.proto.exec.feedback.get(pc), Some(InlineCache::Monomorphic(_)));
+        match (entries.as_slice(), additions.as_slice()) {
+            ([entry], _) if !adds => {
                 let table = self.table_of(object, state);
                 self.effect(Op::GuardShape { table, shape: entry.shape.packed(), state });
                 self.effect(Op::StoreSlot { table, slot: entry.slot, value: stored, state });
+            }
+            (_, [entry]) if monomorphic => {
+                let table = self.table_of(object, state);
+                let key = self.constant_value(frame, u32::from(b));
+                self.func.shapes.push(entry.next);
+                let op = Op::AddSlot { table, key, shape: entry.shape.packed(), next: entry.next.packed(), slot: entry.slot, value: stored, state };
+                self.effect(op);
             }
             _ => {
                 let table = self.table_of(object, state);
@@ -1137,7 +1182,58 @@ impl<'a> Builder<'a, '_> {
         if array > i32::MAX as u64 {
             return self.fallback(frame, pc);
         }
+        if array == 0 && self.speculates(frame, pc) {
+            let state = self.state_at(frame, pc);
+            let top = Self::slot(frame, a);
+            let (shape, sources, next) = self.constructor_fields(frame, pc + 2, a, hash_capacity(b));
+            let fields: Box<[Val]> = sources.into_iter().map(|source| self.present_field(frame, source, state)).collect();
+            if let Some(shape) = shape {
+                self.func.shapes.push(shape);
+            }
+            let op = Op::NewTable { hash_log: b, top, shape: shape.map(|shape| shape.packed()), fields, state, after: state };
+            let table = self.emit(op, Type::TABLE, Rep::Payload);
+            self.write(frame, a, table);
+            let after = self.lazy_state_at(frame, next);
+            if let Op::NewTable { after: slot, .. } = &mut self.func.inst_mut(table).op {
+                *slot = after;
+            }
+            return next;
+        }
         self.helper(frame, pc, HelperKind::Fast(sites::FAST_NEW_TABLE), [u32::from(a), array as u32, u32::from(b)])
+    }
+
+    /// A nil field adds no key, so the fused table's shape holds only when every value is present.
+    fn present_field(&mut self, frame: &mut Frame<'a>, source: (u8, bool), state: StateId) -> Val {
+        let value = self.stored(frame, source);
+        let ty = self.func.ty(value);
+        if ty.intersect(Type::NIL).is_none() {
+            return value;
+        }
+        self.emit(Op::GuardNotNil { value, state }, ty.without(Type::NIL), Rep::Boxed)
+    }
+
+    /// Follows V8's `CreateShallowObjectLiteral`: constructor SETFIELDs right after NEWTABLE fold into the allocation.
+    fn constructor_fields(&self, frame: &Frame<'_>, start: usize, a: u8, capacity: usize) -> (Option<crate::arena::Ref<crate::shape::Shape>>, Vec<(u8, bool)>, usize) {
+        let mut shape = crate::shape::ROOT;
+        let mut sources = Vec::new();
+        let mut pc = start;
+        while self.facts.inline_caches && sources.len() < capacity && pc < frame.proto.code.len() && !frame.flow.leaders[pc] {
+            let Instruction::SetField { a: target, c, k, .. } = frame.proto.code[pc] else {
+                break;
+            };
+            let [entry] = sites::add_entries(frame.proto, pc)[..] else {
+                break;
+            };
+            let monomorphic = matches!(frame.proto.exec.feedback.get(pc), Some(InlineCache::Monomorphic(_)));
+            if target != a || (!k && c >= a) || !monomorphic || entry.shape != shape || entry.slot as usize != sources.len() {
+                break;
+            }
+            shape = entry.next;
+            sources.push((c, k));
+            pc += 1;
+        }
+        let shape = (!sources.is_empty()).then_some(shape);
+        (shape, sources, pc)
     }
 
     fn call(&mut self, frame: &mut Frame<'a>, pc: usize, a: u8, b: u8, c: u8) -> usize {
@@ -1145,6 +1241,11 @@ impl<'a> Builder<'a, '_> {
             && let Some(candidate) = self.inline_candidate(frame, pc, (a, b, c))
         {
             return self.inline_call(frame, pc, (a, b, c), candidate);
+        }
+        if self.speculates(frame, pc)
+            && let Some(function) = self.builtin_candidate(frame.proto, pc, (b, c))
+        {
+            return self.builtin_call(frame, pc, (a, b, c), function);
         }
         if frame.site.is_some() {
             return self.deopt(frame, pc);
@@ -1156,19 +1257,127 @@ impl<'a> Builder<'a, '_> {
     }
 
     fn inline_candidate(&self, frame: &Frame<'_>, pc: usize, (a, b, c): (u8, u8, u8)) -> Option<Candidate<'a>> {
-        if !self.facts.inline_caches || b == 0 || c == 0 || frame.chain.len() >= self.facts.policy.depth {
+        if b == 0 || c == 0 || frame.chain.len() >= self.facts.policy.depth {
             return None;
         }
-        let Some(InlineCache::Callee(callee)) = frame.proto.exec.feedback.get(pc) else {
+        self.lua_candidate(frame.proto, pc, Self::slot(frame, a) + 1, frame.chain.len() + 1)
+    }
+
+    fn lua_candidate(&self, proto: &Proto, pc: usize, base: u32, depth: usize) -> Option<Candidate<'a>> {
+        if !self.facts.inline_caches || depth > self.facts.policy.depth + TAIL_CALL_LINKS {
+            return None;
+        }
+        let Some(InlineCache::Callee(callee)) = proto.exec.feedback.get(pc) else {
             return None;
         };
-        let proto = callee.proto?;
-        let function = (self.facts.proto_of)(proto)?;
-        let top = Self::slot(frame, a) as usize + 1 + usize::from(function.max_stack);
-        if top > crate::vm::REGISTER_SPAN {
+        let reference = callee.proto?;
+        let function = (self.facts.proto_of)(reference)?;
+        if base as usize + usize::from(function.max_stack) > crate::vm::REGISTER_SPAN {
             return None;
         }
-        inline::candidate(function, proto, &self.facts.policy)
+        let candidate = inline::candidate(function, reference, &self.facts.policy)?;
+        self.calls_inline(function, base, depth).then_some(candidate)
+    }
+
+    /// An inlined frame has no helper to call out through, so its calls must inline too.
+    fn calls_inline(&self, proto: &Proto, base: u32, depth: usize) -> bool {
+        proto.code.iter().enumerate().all(|(pc, &instruction)| match instruction {
+            Instruction::Call { a, b, c } => {
+                self.builtin_candidate(proto, pc, (b, c)).is_some()
+                    || (depth < self.facts.policy.depth && self.lua_candidate(proto, pc, base + u32::from(a) + 1, depth + 1).is_some())
+            }
+            Instruction::TailCall { b, .. } => self.builtin_candidate(proto, pc, (b, 1)).is_some() || self.lua_candidate(proto, pc, base, depth + 1).is_some(),
+            _ => true,
+        })
+    }
+
+    /// Follows `luaD_pretailcall` (ldo.c), which reuses the caller's frame.
+    fn inlined_tail_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, k): (u8, u8, bool)) -> usize {
+        if k || b == 0 || !self.speculates(frame, pc) {
+            return self.deopt(frame, pc);
+        }
+        if let Some(function) = self.builtin_candidate(frame.proto, pc, (b, 1)) {
+            self.builtin_call(frame, pc, (a, b, 2), function);
+            return self.ret(frame, pc, a, 1, false);
+        }
+        let Some(candidate) = self.lua_candidate(frame.proto, pc, frame.base, frame.chain.len() + 1) else {
+            return self.deopt(frame, pc);
+        };
+        let state = self.state_at(frame, pc);
+        let function = self.read(frame, a);
+        let closure = self.emit(Op::GuardType { value: function, ty: Type::CLOSURE, state }, Type::CLOSURE, Rep::Boxed);
+        let proto = self.emit(Op::LoadProto { closure }, Type::NONE, Rep::Word);
+        self.effect(Op::GuardEq { value: proto, expected: candidate.reference.packed(), state });
+        let arguments: Vec<Val> = (1..b).map(|offset| self.read(frame, a + offset)).collect();
+        let base = frame.base;
+        self.ensure_slot(base - 1);
+        self.regs[(base - 1) as usize] = Reg::Val(closure, true);
+        let nil = self.constant(Const::Nil);
+        let width = u32::from(candidate.proto.max_stack).max(arguments.len() as u32);
+        for offset in 0..width {
+            let slot = base + offset;
+            self.ensure_slot(slot);
+            self.regs[slot as usize] = match arguments.get(offset as usize) {
+                Some(&value) => Reg::Val(value, true),
+                None if offset < u32::from(candidate.proto.num_params) => Reg::Val(nil, true),
+                None => Reg::Mem,
+            };
+        }
+        let mut chain = frame.chain.clone();
+        let Some(last) = chain.last_mut() else {
+            return self.deopt(frame, pc);
+        };
+        *last = InlineFrame { base, caller_pc: last.caller_pc, wanted: last.wanted, proto: candidate.reference.packed(), tail: true };
+        let mut callee = self.frame(candidate.proto, base, chain, frame.site, frame.caller);
+        self.jump_to(&mut callee, 0);
+        self.run(&mut callee);
+        frame.returns.append(&mut callee.returns);
+        self.current = None;
+        pc + 1
+    }
+
+    /// Follows V8 Maglev's `TryReduceBuiltin` (src/maglev/maglev-graph-builder.cc).
+    fn builtin_candidate(&self, proto: &Proto, pc: usize, (b, c): (u8, u8)) -> Option<(BuiltinFn, u64)> {
+        if !self.facts.inline_caches || b == 0 || c == 0 {
+            return None;
+        }
+        let Some(InlineCache::Callee(callee)) = proto.exec.feedback.get(pc) else {
+            return None;
+        };
+        let LuaValue::Native(native) = callee.value else {
+            return None;
+        };
+        let (function, arguments) = match (self.facts.builtin_of)(native)? {
+            Builtin::Type => (BuiltinFn::Type, 1),
+            Builtin::RawEqual => (BuiltinFn::RawEqual, 2),
+            Builtin::RawGet => (BuiltinFn::RawGet, 2),
+            Builtin::GetMetatable => (BuiltinFn::GetMetatable, 1),
+            Builtin::SetMetatable => (BuiltinFn::SetMetatable, 2),
+            _ => return None,
+        };
+        (u32::from(b) - 1 == arguments).then_some((function, native.packed()))
+    }
+
+    /// A builtin that refuses its arguments deoptimizes to the generic call's frame state.
+    fn builtin_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8), (function, native): (BuiltinFn, u64)) -> usize {
+        let state = self.state_at(frame, pc);
+        let callee = self.read(frame, a);
+        let callee = self.emit(Op::GuardType { value: callee, ty: Type::of_tag(7), state }, Type::of_tag(7), Rep::Payload);
+        self.effect(Op::GuardEq { value: callee, expected: native, state });
+        let args: Box<[Val]> = (1..b).map(|offset| self.read(frame, a + offset)).collect();
+        let ty = match function {
+            BuiltinFn::Type => Type::of_tag(4),
+            BuiltinFn::RawEqual => Type::BOOL,
+            BuiltinFn::SetMetatable => Type::TABLE,
+            BuiltinFn::RawGet | BuiltinFn::GetMetatable => Type::ANY,
+        };
+        let result = self.emit(Op::Builtin { function, args, state }, ty, Rep::Boxed);
+        self.write(frame, a, result);
+        let nil = self.constant(Const::Nil);
+        for offset in 1..c.saturating_sub(1) {
+            self.write(frame, a + offset, nil);
+        }
+        pc + 1
     }
 
     /// Follows Maglev's `BuildInlineFunction`.
@@ -1188,7 +1397,7 @@ impl<'a> Builder<'a, '_> {
         self.write(frame, a, closure);
         let wanted = i32::from(c) - 1;
         let mut chain = frame.chain.clone();
-        chain.push(InlineFrame { base, caller_pc: pc as u32 + 1, wanted, proto: candidate.reference.packed() });
+        chain.push(InlineFrame { base, caller_pc: pc as u32 + 1, wanted, proto: candidate.reference.packed(), tail: false });
         let site = frame.site.unwrap_or(pc as u32);
         let mut callee = self.frame(candidate.proto, base, chain, Some(site), Some((Self::slot(frame, a), wanted)));
         for slot in base + u32::from(candidate.proto.num_params).max(arguments)..base + u32::from(candidate.proto.max_stack) {
@@ -1348,6 +1557,14 @@ impl<'a> Builder<'a, '_> {
         pc + 1
     }
 }
+
+/// Follows `luaH_resize`'s hash part sizing (ltable.c).
+fn hash_capacity(log_plus_one: u8) -> usize {
+    if log_plus_one == 0 { 0 } else { 1usize.checked_shl(u32::from(log_plus_one) - 1).unwrap_or(0) }
+}
+
+/// A tail call replaces its frame but still costs a level of the candidate search.
+const TAIL_CALL_LINKS: usize = 2;
 
 fn event_bit(event: Event) -> u8 {
     event.absence_bit().unwrap_or(0)

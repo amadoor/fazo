@@ -47,6 +47,10 @@ impl Vm {
     pub(crate) fn jit_tier_of(&self, _proto: Ref<Proto>) -> crate::Tier {
         crate::Tier::Interpreter
     }
+
+    pub fn jit_stats_report(&self) -> String {
+        String::new()
+    }
 }
 
 impl Vm {
@@ -393,9 +397,18 @@ impl Vm {
                 continue;
             }
             for entry in crate::jit::sites::add_entries(function, pc) {
-                if !function.jit.shapes.contains(&entry.next) && !added.contains(&entry.next) {
-                    added.push(entry.next);
-                }
+                added.push(entry.next);
+            }
+        }
+        self.jit_keep_shapes(proto, added);
+    }
+
+    fn jit_keep_shapes(&mut self, proto: Ref<Proto>, shapes: Vec<crate::arena::Ref<crate::shape::Shape>>) {
+        let function = self.heap.protos.live(proto);
+        let mut added = Vec::new();
+        for shape in shapes {
+            if !function.jit.shapes.contains(&shape) && !added.contains(&shape) {
+                added.push(shape);
             }
         }
         for shape in added {
@@ -461,7 +474,7 @@ impl Vm {
         let layout = *self.jit.layout.get_or_insert_with(crate::jit::TableLayout::probe);
         let frames = *self.jit.frames.get_or_insert_with(crate::jit::FrameLayout::probe);
         let calls = self.jit_call_targets(proto);
-        let estimate = crate::jit::tiering::of_proto(self.heap.protos.live(proto), &calls);
+        let estimate = self.jit_estimate(proto, &calls);
         let executed = self.heap.protos.live(proto).jit.peak_executed;
         let judged = self.options.jit_policy.peak.estimate_payoff && self.jit_forced().is_none();
         if judged && !estimate.pays_after(executed) {
@@ -473,11 +486,21 @@ impl Vm {
         let avoid = self.heap.protos.live(proto).jit.avoid.clone();
         let observed = self.heap.protos.live(proto).jit.observed.clone();
         let nodes = self.jit_node_hints(proto);
+        let running_floats = if at.is_some() { self.jit_running_floats(proto) } else { Vec::new() };
+        let environment = self.jit_environment(proto);
         let dump = self.options.jit_trace;
         let facts_stress = self.options.jit_stress;
         let heap = &self.heap;
         let interned = |constant: Value| matches!(constant, Value::String(string) if heap.key_view().is_interned(string));
         let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
+        let builtin_of = |native: Ref<crate::object::Native>| heap.natives.try_get(native).and_then(|native| native.builtin);
+        let type_names = self.type_name_refs();
+        let node_hint = |function: &Proto, pc: usize, root: bool| {
+            if root {
+                return nodes.get(pc).copied().flatten();
+            }
+            inlined_node_hint(heap, environment?, function, pc)
+        };
         let facts = crate::jit::CompileFacts {
             layout,
             frames,
@@ -491,7 +514,11 @@ impl Vm {
             proto_of: &proto_of,
             stress_exits: facts_stress.exit_every != 0,
             osr_at: at.map(|pc| pc as u32),
-            nodes: &nodes,
+            node_hint: &node_hint,
+            builtin_of: &builtin_of,
+            type_names,
+            sink_allocations: self.options.memory_limit.is_none(),
+            running_floats: &running_floats,
         };
         let compiled = self.jit.compiler.as_deref_mut().map(|compiler| crate::jit::compile(compiler, budget, heap.protos.live(proto), &facts, dump));
         let (unit, text) = match compiled {
@@ -530,7 +557,10 @@ impl Vm {
             function.exec.feedback = vec![super::InlineCache::Uninitialized; function.code.len()];
         }
         function.jit.tier_budget().set(0);
+        function.jit.peak_compiles += 1;
+        let shapes = unit.shapes.clone();
         function.jit.unit = Some(Box::new(unit));
+        self.jit_keep_shapes(proto, shapes);
         self.jit_reveal(proto);
         self.jit_trace(proto, "peak");
         true
@@ -542,6 +572,9 @@ impl Vm {
     /// speculation, as V8 discards optimized code on an eager deopt.
     pub(crate) fn jit_deopt(&mut self, ctx: &mut JitCtx, point: &crate::jit::ssa::DeoptPoint) -> i64 {
         self.jit_push_inlined_frames(ctx, point);
+        if point.lazy {
+            return -EXIT_RELOAD;
+        }
         let proto = ctx.proto;
         let forced = self.jit_forced().is_some();
         let policy = self.options.jit_policy;
@@ -555,6 +588,10 @@ impl Vm {
         let repeated = function.jit.avoid.contains(&point.site);
         let learned = kinds.is_some_and(|kinds| learn_kinds(&mut function.jit.observed, point.site, kinds));
         function.jit.deopts += 1;
+        match function.jit.deopt_sites.iter_mut().find(|(site, _)| *site == point.site) {
+            Some((_, count)) => *count += 1,
+            None => function.jit.deopt_sites.push((point.site, 1)),
+        }
         if !repeated && !learned {
             function.jit.avoid.push(point.site);
         }
@@ -597,6 +634,9 @@ impl Vm {
             };
             let pc = point.frames.get(index + 1).map_or(point.pc, |next| next.caller_pc);
             let mut lua = crate::object::LuaFrame::called(closure, base, frame.wanted, 0);
+            if frame.tail {
+                lua.set_status(lua.status() | crate::object::status::TAIL);
+            }
             lua.set_pc(pc as usize);
             self.thread_mut().frames.push(crate::object::Frame::Lua(lua));
         }
@@ -651,11 +691,19 @@ impl Vm {
         -EXIT_RELOAD
     }
 
+    fn jit_estimate(&self, proto: Ref<Proto>, calls: &[Vec<crate::jit::CallTarget>]) -> crate::jit::tiering::Estimate {
+        let heap = &self.heap;
+        let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
+        let builtin_of = |native: Ref<crate::object::Native>| heap.natives.try_get(native).and_then(|native| native.builtin);
+        let lookup = crate::jit::tiering::Lookup { proto_of: &proto_of, builtin_of: &builtin_of };
+        crate::jit::tiering::of_proto(heap.protos.live(proto), calls, &lookup)
+    }
+
     /// The Baseline work after which a Peak compile breaks even by the bytecode estimate; with no predicted savings, as if each bytecode saved one instruction.
     fn jit_peak_budget(&self, proto: Ref<Proto>) -> i64 {
         let divisor = i64::from(self.options.jit_stress.threshold_divisor.max(1));
         let calls = self.jit_call_targets(proto);
-        let estimate = crate::jit::tiering::of_proto(self.heap.protos.live(proto), &calls);
+        let estimate = self.jit_estimate(proto, &calls);
         estimate.break_even().unwrap_or(estimate.cost) / divisor
     }
 
@@ -693,6 +741,30 @@ impl Vm {
         }
         self.save_pc(pc);
         -EXIT_RELOAD
+    }
+
+    pub fn jit_stats_report(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for (_, function) in self.heap.protos.iter() {
+            let jit = &function.jit;
+            if jit.peak_compiles == 0 && jit.deopts == 0 && jit.recompiles == 0 && jit.declines == 0 {
+                continue;
+            }
+            let sites: Vec<String> = jit.deopt_sites.iter().map(|(site, count)| format!("{site}:{count}")).collect();
+            lines.push(format!(
+                "jitstats {}:{} peak={} deopts={} recompiles={} declines={} sites={}
+",
+                String::from_utf8_lossy(trace_source(&function.chunkname)).chars().take(60).collect::<String>(),
+                function.line_defined,
+                jit.peak_compiles,
+                jit.deopts,
+                jit.recompiles,
+                jit.declines,
+                sites.join(",")
+            ));
+        }
+        lines.sort();
+        lines.concat()
     }
 
     pub(crate) fn jit_trace(&mut self, proto: Ref<Proto>, event: &str) {
@@ -735,6 +807,35 @@ impl Vm {
         }
         let function = self.heap.protos.live(proto);
         function.code.iter().map(|&instruction| self.jit_node_hint(closure, function, instruction)).collect()
+    }
+
+    /// Float-holding registers that OSR speculates on.
+    fn jit_running_floats(&self, proto: Ref<Proto>) -> Vec<bool> {
+        let Some(super::Frame::Lua(frame)) = self.thread().frames.last() else {
+            return Vec::new();
+        };
+        if self.heap.closures.live(frame.closure).proto != proto {
+            return Vec::new();
+        }
+        let width = usize::from(self.heap.protos.live(proto).max_stack);
+        (0..width).map(|register| matches!(self.stack_get(frame.base + register), Value::Float(_))).collect()
+    }
+
+    /// The running closure's `_ENV`; an inlined prototype usually shares it, and its guard checks the node either way.
+    fn jit_environment(&self, proto: Ref<Proto>) -> Option<Ref<crate::table::Table>> {
+        let Some(super::Frame::Lua(frame)) = self.thread().frames.last() else {
+            return None;
+        };
+        let closure = self.heap.closures.live(frame.closure);
+        let function = self.heap.protos.live(proto);
+        if closure.proto != proto {
+            return None;
+        }
+        let index = function.upvalues.iter().position(|upvalue| upvalue.name.is_some_and(|name| self.heap.bytes(name) == b"_ENV"))?;
+        match self.upvalue_value(closure.upvalues.get(index)?.reference) {
+            Value::Table(table) => Some(table),
+            _ => None,
+        }
     }
 
     fn jit_node_hint(&self, closure: &crate::object::Closure, function: &Proto, instruction: Instruction) -> Option<crate::jit::NodeHint> {
@@ -1674,6 +1775,10 @@ impl Vm {
     }
 
     /// The constants belong to the same prototype, so they do not change.
+    pub(crate) fn jit_refresh_context(&mut self, ctx: &mut JitCtx) {
+        self.jit_refresh(ctx);
+    }
+
     fn jit_refresh(&mut self, ctx: &mut JitCtx) {
         ctx.registers = self.thread_mut().stack.as_mut_ptr().wrapping_add(ctx.base);
         ctx.tables = self.heap.tables.objects_ptr();
@@ -1761,6 +1866,25 @@ const JIT_INTERPRETER_STACK: usize = 64 * 1024;
 fn stack_address() -> usize {
     let marker = 0u8;
     std::hint::black_box(&marker) as *const u8 as usize
+}
+
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn inlined_node_hint(heap: &crate::heap::Heap, environment: Ref<crate::table::Table>, function: &Proto, pc: usize) -> Option<crate::jit::NodeHint> {
+    let (upvalue, constant) = match *function.code.get(pc)? {
+        Instruction::GetTabUp { b, c, .. } => (b, c),
+        Instruction::SetTabUp { a, b, .. } => (a, b),
+        _ => return None,
+    };
+    let name = function.upvalues.get(usize::from(upvalue))?.name?;
+    if heap.bytes(name) != b"_ENV" {
+        return None;
+    }
+    let Some(&Value::String(key)) = function.constants.get(usize::from(constant)) else {
+        return None;
+    };
+    let hash = heap.string_keys.get(key.index())?.hash.get();
+    let (node, nodes) = heap.tables.try_get(environment)?.short_str_node(key, hash)?;
+    Some(crate::jit::NodeHint { node, nodes })
 }
 
 /// Drops the `@` or `=` that marks the chunk's kind.

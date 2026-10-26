@@ -402,6 +402,12 @@ impl Table {
         self.slots.push(Value::Nil);
     }
 
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn enter_shape_with(&mut self, shape: Ref<Shape>, values: &[Value]) {
+        self.shape = shape;
+        self.slots.extend_from_slice(values);
+    }
+
     pub(crate) fn may_create_dynamic_transition(&self) -> bool {
         self.dynamic_transitions < MAX_DYNAMIC_TRANSITIONS
     }

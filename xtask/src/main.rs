@@ -2,13 +2,14 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <check|scoreboard [args...]|perf|bytecode>";
+const USAGE: &str = "usage: cargo xtask <check|quick [seeds]|scoreboard [args...]|perf|bytecode>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let result = match args.first().map(String::as_str) {
         Some("check") => check(),
+        Some("quick") => quick(&args[1..]),
         Some("scoreboard") => harness("scoreboard", &args[1..]),
         Some("perf") => harness("perf", &args[1..]),
         Some("bytecode") => harness("bytecode", &args[1..]),
@@ -34,6 +35,21 @@ fn check() -> Result<(), String> {
 
     cargo_with(&["test", "--workspace", "--no-fail-fast"], &[("FAZO_CLI", cli.as_os_str())])?;
     cargo(&["test", "-p", "fazo", "--features", "libm", "--no-fail-fast"])
+}
+
+fn quick(extra: &[String]) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    cargo(&["test", "-p", "fazo", "--lib", "--quiet"])?;
+    let tests = started.elapsed();
+    cargo(&["build", "--profile", "profiling", "-p", "fazo_cli"])?;
+    let cli = target_dir()?.join("profiling").join(format!("fazo{}", std::env::consts::EXE_SUFFIX));
+    let mut args = vec!["run", "--quiet", "--profile", "profiling", "-p", "fazo_harness", "--bin", "quick", "--"];
+    let cli_text = cli.to_string_lossy().into_owned();
+    args.push(&cli_text);
+    args.extend(extra.iter().map(String::as_str));
+    let outcome = cargo(&args);
+    eprintln!("xtask quick: unit tests {:.0}s, total {:.0}s", tests.as_secs_f64(), started.elapsed().as_secs_f64());
+    outcome
 }
 
 fn target_dir() -> Result<PathBuf, String> {

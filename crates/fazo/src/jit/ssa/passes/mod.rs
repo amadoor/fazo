@@ -1,6 +1,8 @@
 pub(crate) mod bounds;
 pub(crate) mod dce;
+pub(crate) mod escape;
 pub(crate) mod fold;
+pub(crate) mod forward;
 pub(crate) mod hoist;
 pub(crate) mod inline;
 pub(crate) mod repr;
@@ -13,11 +15,13 @@ use super::ir::{BlockId, Func, Op, Rep, Type, Val};
 
 type Pass = (&'static str, fn(&mut Func));
 
-const PASSES: [Pass; 9] = [
+const PASSES: [Pass; 11] = [
     ("types", types::run),
+    ("forward", forward::run),
     ("fold", fold::run),
     ("types", types::run),
     ("fold", fold::run),
+    ("escape", escape::run),
     ("repr", repr::run),
     ("hoist", hoist::run),
     ("bounds", bounds::run),

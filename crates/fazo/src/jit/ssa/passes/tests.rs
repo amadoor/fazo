@@ -1,12 +1,12 @@
 use super::super::{
     build, check,
-    ir::{BinOp, BlockId, Cc, Const, Counted, Edge, FrameState, Func, Loop, NumOp, Op, Rep, StateId, Term, Type, UnOp, Val},
+    ir::{BinOp, BlockId, BuiltinFn, Cc, Const, Counted, Edge, FrameState, Func, Loop, NumOp, Op, Rep, StateId, Term, Type, UnOp, Val},
 };
-use super::{bounds, dce, fold, hoist, inline, repr, types};
+use super::{bounds, dce, escape, fold, forward, hoist, inline, repr, types};
 use crate::{arena::Ref, proto::Proto};
 
 fn state(func: &mut Func, pc: u32) -> StateId {
-    func.add_state(FrameState { pc, frames: Vec::new(), slots: Vec::new(), site: pc })
+    func.add_state(FrameState { pc, frames: Vec::new(), slots: Vec::new(), site: pc, lazy: false, objects: Vec::new() })
 }
 
 fn constant(func: &mut Func, block: BlockId, constant: Const) -> Val {
@@ -99,6 +99,8 @@ fn built(source: &str) -> Func {
     let heap = &vm.heap;
     let interned = |_: crate::Value| false;
     let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
+    let node_hint = |_: &Proto, _: usize, _: bool| None;
+    let builtin_of = |_: Ref<crate::object::Native>| None;
     let facts = build::Facts {
         inline_caches: true,
         avoid: &[],
@@ -106,7 +108,9 @@ fn built(source: &str) -> Func {
         proto_of: &proto_of,
         policy: inline::Policy::default(),
         osr_at: None,
-        nodes: &[],
+        node_hint: &node_hint,
+        builtin_of: &builtin_of,
+        running_floats: &[],
     };
     build::build(heap.protos.live(reference), &facts)
 }
@@ -235,7 +239,7 @@ fn folding_removes_trivial_parameters_and_folds_branches() {
     returns(&mut func, join, param);
     fold::run(&mut func);
     assert!(func.block(join).params.is_empty(), "a parameter given one value everywhere is that value");
-    assert!(matches!(func.block(entry).term, Term::Jump(_)), "a constant condition picks its branch");
+    assert!(!matches!(func.block(entry).term, Term::Branch { .. }), "a constant condition picks its branch");
     check::check(&func, false).expect("the graph stays valid");
 }
 
@@ -333,16 +337,16 @@ fn dead_code_elimination_removes_unused_values_and_self_feeding_parameters() {
 }
 
 #[test]
-fn the_inline_policy_takes_small_leaves_only() {
+fn the_inline_policy_takes_small_functions_without_loops() {
     let mut vm = crate::Vm::new(crate::Options::default());
     let chunk = vm
-        .load(b"=test", b"local function leaf(o) return o.x + 1 end local function caller(f) return f(1) end".as_slice())
+        .load(b"=test", b"local function leaf(o) return o.x + 1 end local function looped(f) for i = 1, 2 do f(i) end end".as_slice())
         .expect("the chunk loads");
     let leaf = child_proto(&vm, chunk, 0);
-    let caller = child_proto(&vm, chunk, 1);
+    let looped = child_proto(&vm, chunk, 1);
     let policy = inline::Policy::default();
-    assert!(inline::candidate(vm.heap.protos.live(leaf), leaf, &policy).is_some(), "a small function without calls inlines");
-    assert!(inline::candidate(vm.heap.protos.live(caller), caller, &policy).is_none(), "a function that calls does not");
+    assert!(inline::candidate(vm.heap.protos.live(leaf), leaf, &policy).is_some(), "a small function inlines");
+    assert!(inline::candidate(vm.heap.protos.live(looped), looped, &policy).is_none(), "a function with a loop does not");
 }
 
 #[test]
@@ -360,4 +364,125 @@ fn the_checker_reports_a_use_its_definition_does_not_dominate() {
     func.block_mut(right).term = Term::Jump(Edge::to(join));
     returns(&mut func, join, only_left);
     assert!(check::check(&func, false).is_err());
+}
+
+fn fresh_table(func: &mut Func, block: BlockId, fields: &[Val], s: StateId) -> Val {
+    let op = Op::NewTable { hash_log: 2, top: 4, shape: Some(9), fields: fields.into(), state: s, after: s };
+    func.append(block, op, Type::TABLE, Rep::Payload)
+}
+
+fn stored(func: &Func, block: BlockId, slot: u32) -> Option<Val> {
+    func.block(block).insts.iter().find_map(|&value| match func.op(value) {
+        Op::StoreReg { slot: at, value } if *at == slot => Some(*value),
+        _ => None,
+    })
+}
+
+#[test]
+fn load_forwarding_reads_constructed_and_stored_fields_and_drops_known_shape_guards() {
+    let (mut func, block) = straight_line();
+    let s = state(&mut func, 1);
+    let x = constant(&mut func, block, Const::Int(3));
+    let fresh = fresh_table(&mut func, block, &[x], s);
+    let known = func.append(block, Op::GuardShape { table: fresh, shape: 9, state: s }, Type::NONE, Rep::None);
+    let constructed = func.append(block, Op::LoadSlot { table: fresh, slot: 0 }, Type::ANY, Rep::Boxed);
+    let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let other = func.append(block, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
+    func.append(block, Op::StoreSlot { table: other, slot: 1, value: x, state: s }, Type::NONE, Rep::None);
+    let reloaded = func.append(block, Op::LoadSlot { table: other, slot: 1 }, Type::ANY, Rep::Boxed);
+    let untouched = func.append(block, Op::LoadSlot { table: fresh, slot: 0 }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 1, value: constructed }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreReg { slot: 2, value: reloaded }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreReg { slot: 3, value: untouched }, Type::NONE, Rep::None);
+    func.block_mut(block).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
+    forward::run(&mut func);
+    assert!(!func.block(block).insts.contains(&known), "the fresh table's shape is known");
+    assert_eq!(stored(&func, block, 1), Some(x), "a constructed field is read from the constructor");
+    assert_eq!(stored(&func, block, 2), Some(x), "a stored field is read from the store");
+    assert_eq!(stored(&func, block, 3), Some(x), "a store to another table leaves the fresh table's fields");
+}
+
+#[test]
+fn load_forwarding_forgets_fields_across_calls() {
+    let (mut func, block) = straight_line();
+    let s = state(&mut func, 1);
+    let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let table = func.append(block, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
+    let first = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::CallLua { pc: 1, a: 2, b: 1, c: 1 }, Type::NONE, Rep::None);
+    let second = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 1, value: first }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreReg { slot: 2, value: second }, Type::NONE, Rep::None);
+    func.block_mut(block).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
+    forward::run(&mut func);
+    assert_eq!(stored(&func, block, 2), Some(second), "a call may store to the table");
+}
+
+#[test]
+fn escape_analysis_sinks_a_table_only_frame_states_see() {
+    let mut fixture = counted_loop();
+    let func = &mut fixture.func;
+    func.sink_allocations = true;
+    let body = func.state(StateId(1)).clone();
+    let x = func.append(fixture.header, Op::Unary(UnOp::Box, fixture.index), Type::INT, Rep::Boxed);
+    let fresh = fresh_table(func, fixture.header, &[x], StateId(0));
+    let meta = func.append(fixture.header, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let set = func.append(fixture.header, Op::Builtin { function: BuiltinFn::SetMetatable, args: Box::new([fresh, meta]), state: StateId(0) }, Type::TABLE, Rep::Boxed);
+    let seen = func.add_state(FrameState { slots: vec![(6, set)], ..body });
+    let guard = func.append(fixture.header, Op::GuardType { value: fixture.index, ty: Type::INT, state: seen }, Type::INT, Rep::Int);
+    escape::run(func);
+    let header = &func.block(fixture.header).insts;
+    assert!(!header.contains(&fresh) && !header.contains(&set), "the allocation and setmetatable are gone");
+    assert!(header.iter().any(|&value| matches!(func.op(value), Op::GuardAbsent { .. })), "the metatable is checked for __gc");
+    let object = func.state(seen).object(fresh).expect("the state describes the table");
+    assert_eq!(object.fields, vec![x]);
+    assert!(object.meta.is_some(), "past setmetatable the table has its metatable");
+    assert_eq!(func.state(seen).slots, vec![(6, fresh)]);
+    assert!(header.contains(&guard));
+    check::check(func, false).expect("the sunk graph stays valid");
+}
+
+#[test]
+fn escape_analysis_keeps_a_table_stored_to_a_register() {
+    let mut fixture = counted_loop();
+    let func = &mut fixture.func;
+    func.sink_allocations = true;
+    let x = func.append(fixture.header, Op::Unary(UnOp::Box, fixture.index), Type::INT, Rep::Boxed);
+    let fresh = fresh_table(func, fixture.header, &[x], StateId(0));
+    func.append(fixture.header, Op::StoreReg { slot: 6, value: fresh }, Type::NONE, Rep::None);
+    escape::run(func);
+    assert!(func.block(fixture.header).insts.contains(&fresh), "a table the interpreter's registers hold is allocated");
+}
+
+#[test]
+fn escape_analysis_turns_a_carried_table_into_field_parameters() {
+    let mut fixture = counted_loop();
+    let func = &mut fixture.func;
+    func.sink_allocations = true;
+    let entry_state = StateId(0);
+    let latch = func.loops[0].blocks[1];
+    let entering = func.append(fixture.preheader, Op::LoadReg { slot: 2 }, Type::ANY, Rep::Boxed);
+    let Term::Jump(edge) = &mut func.block_mut(fixture.preheader).term else {
+        unreachable!("the preheader jumps to the header");
+    };
+    edge.args.push(entering);
+    let carried = func.add_param(fixture.header, Type::ANY, Rep::Boxed);
+    let table = func.append(fixture.header, Op::GuardType { value: carried, ty: Type::TABLE, state: entry_state }, Type::TABLE, Rep::Payload);
+    func.append(fixture.header, Op::GuardShape { table, shape: 9, state: entry_state }, Type::NONE, Rep::None);
+    let field = func.append(fixture.header, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
+    func.append(fixture.header, Op::StoreReg { slot: 7, value: field }, Type::NONE, Rep::None);
+    let x = func.append(latch, Op::Unary(UnOp::Box, fixture.index), Type::INT, Rep::Boxed);
+    let fresh = fresh_table(func, latch, &[x], entry_state);
+    let Term::Jump(edge) = &mut func.block_mut(latch).term else {
+        unreachable!("the latch jumps to the header");
+    };
+    edge.args.push(fresh);
+    escape::run(func);
+    assert!(!func.block(latch).insts.contains(&fresh), "the carried allocation is sunk");
+    assert!(!func.block(fixture.header).params.contains(&carried), "the table parameter is gone");
+    let stored_field = stored(func, fixture.header, 7).expect("the field is still stored");
+    assert!(func.block(fixture.header).params.contains(&stored_field), "the field load reads its parameter");
+    let preheader_shape = func.block(fixture.preheader).insts.iter().any(|&value| matches!(func.op(value), Op::GuardShape { shape: 9, .. }));
+    assert!(preheader_shape, "the entering table's shape is checked before the loop");
+    check::check(func, false).expect("the carried graph stays valid");
 }

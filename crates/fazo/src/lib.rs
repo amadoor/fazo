@@ -66,6 +66,7 @@ pub struct Options {
     pub jit_policy: JitPolicy,
     pub jit_stress: JitStress,
     pub jit_trace: bool,
+    pub jit_stats: bool,
     pub jit_library: bool,
 }
 
@@ -83,6 +84,7 @@ impl Default for Options {
             jit_policy: JitPolicy::default(),
             jit_stress: JitStress::default(),
             jit_trace: false,
+            jit_stats: false,
             jit_library: false,
         }
     }
@@ -124,6 +126,7 @@ impl Options {
             },
             (b"stress-ic", None) => self.jit_stress.inline_caches_off = true,
             (b"trace", None) => self.jit_trace = true,
+            (b"jitstats", None) => self.jit_stats = true,
             (b"jitlib", None) => self.jit_library = true,
             _ => return false,
         }

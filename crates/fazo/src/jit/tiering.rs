@@ -3,7 +3,14 @@
 //! for the work it will still do, so it compiles once that work times the savings per bytecode covers the compile cost.
 
 use super::CallTarget;
-use crate::{instruction::Instruction, proto::Proto, vm::ic::InlineCache};
+use crate::{
+    arena::Ref,
+    instruction::Instruction,
+    object::Native,
+    proto::Proto,
+    value::Value as LuaValue,
+    vm::{Builtin, ic::InlineCache},
+};
 
 /// Peak compile Ir outside Cranelift's per-instruction work (module, declarations, finalize, unwind registration), measured on
 /// a fib compile, and per bytecode: the least-squares fit of the rest over the perf workloads under `force=peak`.
@@ -33,6 +40,17 @@ const GENERIC_TABLE_COST: i64 = 20;
 const HELPER_CALL_COST: i64 = 650;
 /// A tail call leaves Peak code through its helper: the `tailcall` operation costs about 1000 more in Peak.
 const TAIL_CALL_COST: i64 = 1000;
+/// Inlining saves Baseline's call and return: `call0` costs 173.2 there.
+const INLINED_CALL_GAIN: i64 = 170;
+/// An inlined builtin saves Baseline's native call: `callnative` costs 301.2 there.
+const BUILTIN_GAIN: i64 = 250;
+/// Matches `passes::inline::Policy` so the estimate inlines what the builder will.
+const INLINE_DEPTH: usize = 3;
+
+pub(crate) struct Lookup<'a> {
+    pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
+    pub(crate) builtin_of: &'a dyn Fn(Ref<Native>) -> Option<Builtin>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Estimate {
@@ -58,20 +76,68 @@ impl Estimate {
 }
 
 /// Before the graph exists, so a decline costs one pass over the bytecode: compile cost from the prototype's length, savings from its bytecodes and their feedback.
-pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>]) -> Estimate {
+/// Inlined callees' bytecodes add to compile cost but not to executed work.
+pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>], lookup: &Lookup<'_>) -> Estimate {
     let depths = super::sites::loop_depths(proto);
     let mut gain: i64 = 0;
     let mut weight: i64 = 0;
+    let mut bytecodes = proto.code.len() as i64;
     for (pc, &instruction) in proto.code.iter().enumerate() {
         let scale = depth_weight(depths[pc]);
-        gain = gain.saturating_add(bytecode_gain(proto, calls, pc, instruction).saturating_mul(scale));
+        let (site_gain, inlined) = match call_inlines(proto, pc, instruction, lookup, 1) {
+            Some(inlined) => inlined,
+            None => (bytecode_gain(proto, calls, pc, instruction), 0),
+        };
+        gain = gain.saturating_add(site_gain.saturating_mul(scale));
         weight = weight.saturating_add(scale);
+        bytecodes = bytecodes.saturating_add(inlined);
     }
     Estimate {
-        cost: COMPILE_IR_PER_BYTECODE.saturating_mul(proto.code.len() as i64).saturating_add(COMPILE_IR_PER_UNIT),
+        cost: COMPILE_IR_PER_BYTECODE.saturating_mul(bytecodes).saturating_add(COMPILE_IR_PER_UNIT),
         gain,
         weight: weight.max(1),
     }
+}
+
+fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Lookup<'_>, depth: usize) -> Option<(i64, i64)> {
+    let (b, c) = match instruction {
+        Instruction::Call { b, c, .. } if depth == 1 || b != 0 => (b, c),
+        Instruction::TailCall { b, .. } if depth > 1 => (b, 1),
+        _ => return None,
+    };
+    if b == 0 || c == 0 || depth > INLINE_DEPTH {
+        return None;
+    }
+    let Some(InlineCache::Callee(callee)) = proto.exec.feedback.get(pc) else {
+        return None;
+    };
+    if let LuaValue::Native(native) = callee.value {
+        return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|_| (BUILTIN_GAIN, 0));
+    }
+    let function = (lookup.proto_of)(callee.proto?)?;
+    let policy = super::ssa::passes::inline::Policy::default();
+    let nested = matches!(instruction, Instruction::Call { .. }) && depth > 1;
+    if nested && depth > policy.depth {
+        return None;
+    }
+    super::ssa::passes::inline::candidate(function, callee.proto?, &policy)?;
+    let mut gain = INLINED_CALL_GAIN;
+    let mut bytecodes = function.code.len() as i64;
+    for (inner, &instruction) in function.code.iter().enumerate() {
+        let calls = matches!(instruction, Instruction::Call { .. } | Instruction::TailCall { .. });
+        let (site_gain, inlined) = match call_inlines(function, inner, instruction, lookup, depth + 1) {
+            Some(inlined) => inlined,
+            None if calls => return None,
+            None => (bytecode_gain(function, &[], inner, instruction), 0),
+        };
+        gain = gain.saturating_add(site_gain);
+        bytecodes = bytecodes.saturating_add(inlined);
+    }
+    Some((gain, bytecodes))
+}
+
+fn inlined_builtin(builtin: Builtin) -> bool {
+    matches!(builtin, Builtin::Type | Builtin::RawEqual | Builtin::RawGet | Builtin::GetMetatable | Builtin::SetMetatable)
 }
 
 fn depth_weight(depth: u32) -> i64 {

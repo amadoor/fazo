@@ -27,7 +27,11 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
     pub(crate) stress_exits: bool,
     pub(crate) osr_at: Option<u32>,
-    pub(crate) nodes: &'a [Option<build::NodeHint>],
+    pub(crate) node_hint: &'a dyn Fn(&Proto, usize, bool) -> Option<build::NodeHint>,
+    pub(crate) builtin_of: &'a dyn Fn(Ref<crate::object::Native>) -> Option<crate::vm::Builtin>,
+    pub(crate) type_names: [u64; 8],
+    pub(crate) sink_allocations: bool,
+    pub(crate) running_floats: &'a [bool],
 }
 
 /// The compiled unit, and the optimized graph's text when `dump` asks for it.
@@ -49,8 +53,11 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     let symbols = lower::symbols();
     let unit = JitUnit::compile(compiler, budget, &symbols, |module, function, context| lower::define(module, function, context, &func, &env))?;
     let mut entries: Vec<u32> = func.osr.iter().map(|&(pc, _)| pc).collect();
-    entries.push(0);
-    Ok((PeakUnit { unit, _points: points, entries }, text))
+    if func.entry.is_some() {
+        entries.push(0);
+    }
+    let shapes = func.shapes.clone();
+    Ok((PeakUnit { unit, _points: points, entries, shapes }, text))
 }
 
 pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitResult<ssa::ir::Func> {
@@ -61,12 +68,16 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitRe
         proto_of: facts.proto_of,
         policy: passes::inline::Policy::default(),
         osr_at: facts.osr_at,
-        nodes: facts.nodes,
+        node_hint: facts.node_hint,
+        builtin_of: facts.builtin_of,
+        running_floats: facts.running_floats,
     };
     let mut func = build::build(proto, &builder_facts);
     func.float_guess = facts.float_guess;
     func.avoid = facts.avoid.to_vec();
     func.observed = facts.observed.to_vec();
+    func.type_names = Some(facts.type_names);
+    func.sink_allocations = facts.sink_allocations;
     ssa::check::check(&func, false).map_err(|message| unsupported(&format!("built graph: {message}")))?;
     passes::optimize(&mut func, cfg!(debug_assertions)).map_err(|message| unsupported(&format!("optimized graph {message}")))?;
     ssa::check::check(&func, true).map_err(|message| unsupported(&format!("optimized graph: {message}")))?;

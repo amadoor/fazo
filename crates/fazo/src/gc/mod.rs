@@ -113,6 +113,8 @@ pub(crate) struct GcState {
     pub(crate) sweep_index: usize,
     pub(crate) live_native: Option<(Ref<crate::object::Thread>, usize, usize)>,
     pub(crate) safe_window: Option<(Ref<crate::object::Thread>, usize, usize)>,
+    /// Compiled code that allocates leaves when this changes, since a finalizer may change anything.
+    pub(crate) finalizers_called: u64,
 }
 
 impl Default for GcState {
@@ -144,6 +146,7 @@ impl Default for GcState {
             sweep_index: 0,
             live_native: None,
             safe_window: None,
+            finalizers_called: 0,
         }
     }
 }
@@ -618,6 +621,7 @@ impl Vm {
         }
         let saved_stop = self.heap.gc.stop;
         self.heap.gc.stop |= STOP_COLLECTOR;
+        self.heap.gc.finalizers_called = self.heap.gc.finalizers_called.wrapping_add(1);
         let outcome = self.call_protected_as(handler, &[value], None, true);
         self.heap.gc.stop = saved_stop;
         if let Err(error) = outcome {

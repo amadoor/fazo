@@ -172,6 +172,29 @@ impl Vm {
         }
     }
 
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn jit_builtin(&mut self, builtin: Builtin, one: Value, two: Value) -> Option<Value> {
+        match builtin {
+            Builtin::Type => Some(self.type_name_value(one)),
+            Builtin::RawEqual => Some(Value::Boolean(self.raw_equal(one, two))),
+            Builtin::RawGet => match one {
+                Value::Table(table) => Some(self.table_get(table, two)),
+                _ => None,
+            },
+            Builtin::GetMetatable => Some(self.visible_metatable(one)),
+            Builtin::SetMetatable => match self.set_metatable_fast(one, two)? {
+                Results::One(value) => Some(value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn type_name_refs(&self) -> [u64; 8] {
+        std::array::from_fn(|slot| self.heap.events[Event::ALL.len() + Field::ALL.len() + slot].packed())
+    }
+
     fn type_name_value(&self, value: Value) -> Value {
         Value::String(self.heap.events[Event::ALL.len() + Field::ALL.len() + type_slot(value)])
     }

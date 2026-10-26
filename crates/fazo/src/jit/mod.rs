@@ -300,6 +300,8 @@ pub(crate) struct ProtoJit {
     /// Sites whose speculation failed; a recompile runs them through the interpreter's helpers.
     pub(crate) avoid: Vec<u32>,
     pub(crate) deopts: u32,
+    pub(crate) deopt_sites: Vec<(u32, u32)>,
+    pub(crate) peak_compiles: u32,
     /// Bytecodes the Peak budgets handed out so far stand for, the work the payoff estimate weighs the compile against.
     pub(crate) peak_executed: i64,
     pub(crate) float_guess: bool,
@@ -349,8 +351,9 @@ impl ProtoJit {
     }
 
     #[cfg(test)]
+    /// A main chunk's OSR unit has no entry at its first instruction, so either tier's code is requested.
     pub(crate) fn is_compiled(&self) -> bool {
-        self.code().is_some()
+        self.tier() != Tier::Interpreter
     }
 }
 

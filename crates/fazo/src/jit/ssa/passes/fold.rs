@@ -6,14 +6,15 @@ use hashbrown::HashMap;
 use super::remove;
 use crate::{
     instruction::{ArithOp, UnaryOp},
-    jit::ssa::ir::{BinOp, BlockId, Cc, Closure, Const, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
+    jit::ssa::ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
     value::Value,
     vm::fast,
 };
 
 pub(crate) fn run(func: &mut Func) {
     for _ in 0..8 {
-        let mut changed = remove_trivial_params(func);
+        let mut changed = merge_blocks(func);
+        changed |= remove_trivial_params(func);
         changed |= fold_constants(func);
         changed |= fold_branches(func);
         changed |= cse(func);
@@ -21,6 +22,35 @@ pub(crate) fn run(func: &mut Func) {
             break;
         }
     }
+}
+
+/// Joins a block to its only predecessor so block-local memory CSE sees the whole straight line; loop headers and preheaders stay.
+pub(crate) fn merge_blocks(func: &mut Func) -> bool {
+    let order = func.reverse_postorder();
+    let incoming = incoming_edges(func, &order);
+    let pinned: Vec<BlockId> = func.loops.iter().flat_map(|entry| [entry.header, entry.preheader]).chain(func.entry).chain(func.osr.iter().map(|&(_, block)| block)).collect();
+    let mut map = func.identity_map();
+    let mut changed = false;
+    for &block in &order {
+        while let Term::Jump(edge) = func.block(block).term.clone() {
+            let next = edge.block;
+            if next == block || pinned.contains(&next) || incoming[next.0 as usize].len() != 1 || func.block(next).cold != func.block(block).cold {
+                break;
+            }
+            let taken = std::mem::replace(func.block_mut(next), super::super::ir::Block { params: Vec::new(), insts: Vec::new(), term: Term::Open, cold: false });
+            for (&param, &arg) in taken.params.iter().zip(&edge.args) {
+                map[param.0 as usize] = arg;
+            }
+            let data = func.block_mut(block);
+            data.insts.extend(taken.insts);
+            data.term = taken.term;
+            changed = true;
+        }
+    }
+    if changed {
+        func.rewrite_uses(&map);
+    }
+    changed
 }
 
 /// Braun et al., "Simple and Efficient Construction of Static Single Assignment Form", section 3.1.
@@ -170,8 +200,30 @@ pub(crate) fn fold(func: &Func, op: &Op) -> Option<Const> {
             _ => None,
         },
         Op::Pure(function, args) => fold_pure(func, *function, args),
+        Op::Builtin { function: BuiltinFn::Type, args, .. } => type_name(func, args[0]),
         _ => None,
     }
+}
+
+/// Follows `luaB_type`.
+fn type_name(func: &Func, value: Val) -> Option<Const> {
+    let names = func.type_names?;
+    let ty = func.ty(value);
+    if ty.is_none() {
+        return None;
+    }
+    let kinds: [Type; 8] = [
+        Type::NIL,
+        Type::BOOL,
+        Type::NUM,
+        Type::of_tag(4),
+        Type::TABLE,
+        Type::CLOSURE.union(Type::of_tag(7)),
+        Type::of_tag(8),
+        Type::of_tag(9).union(Type::of_tag(10)),
+    ];
+    let slot = kinds.iter().position(|&kind| ty.within(kind))?;
+    Some(Const::Gc { tag: 4, payload: names[slot] })
 }
 
 fn fold_pure(func: &Func, function: PureFn, args: &[Val]) -> Option<Const> {
@@ -308,6 +360,8 @@ fn key(op: &Op, rep: Rep, map: &[Val]) -> Option<(Key, bool)> {
         Op::GuardNode { node, nodes, key, .. } => (16, [u64::from(*node) << 32 | u64::from(*nodes), *key], true),
         Op::LoadUpval { closure, index } => (UPVALUE_KIND, [u64::from(*index), u64::from(matches!(closure, Closure::Root))], true),
         Op::LoadNode { node, .. } => (NODE_KIND, [u64::from(*node), 0], true),
+        Op::LoadProto { .. } => (19, [0, 0], false),
+        Op::Builtin { function, .. } if function.is_pure() => (20, [*function as u64, 0], false),
         _ => return None,
     };
     let mut words = [kind, rep_code(rep), extra[0], extra[1], u64::MAX, u64::MAX, u64::MAX];
@@ -360,7 +414,10 @@ fn rep_code(rep: Rep) -> u64 {
 
 /// Changes table shapes, metatables or absence bits, so table-memory guards before it say nothing after it.
 fn clobbers_tables(op: &Op) -> bool {
-    matches!(op, Op::NewIndex { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::StoreSlot { .. })
+    match op {
+        Op::Builtin { function, .. } => function.writes(),
+        _ => matches!(op, Op::NewIndex { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::StoreSlot { .. } | Op::AddSlot { .. } | Op::NewTable { .. }),
+    }
 }
 
 fn cse(func: &mut Func) -> bool {

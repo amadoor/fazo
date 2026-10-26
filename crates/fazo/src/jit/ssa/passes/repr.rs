@@ -21,7 +21,7 @@ fn assign(func: &mut Func) {
             let rep = match &inst.op {
                 Op::Param | Op::GuardType { .. } | Op::GuardNotNil { .. } | Op::Select { .. } => unboxed(inst.ty),
                 Op::Unary(UnOp::Unbox, _) => unboxed(inst.ty),
-                Op::Arith { .. } | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadArray { .. } | Op::Index { .. } | Op::LoadUpval { .. } => Rep::Boxed,
+                Op::Arith { .. } | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadArray { .. } | Op::Index { .. } | Op::LoadUpval { .. } | Op::Builtin { .. } => Rep::Boxed,
                 _ => inst.rep,
             };
             func.inst_mut(value).rep = rep;
@@ -58,12 +58,13 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
             Closure::Value(_) => vec![payload, boxed],
         },
         Op::LoadUpval { closure: Closure::Value(_), .. } | Op::LoadProto { .. } => vec![payload],
-        Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::GuardNode { .. } | Op::ShapeIs { .. } | Op::GuardShape { .. } | Op::GuardHasMeta { .. } | Op::GuardNoMeta { .. } => {
+        Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::GuardNode { .. } | Op::ShapeIs { .. } | Op::GuardShape { .. } | Op::GuardHasMeta { .. } | Op::GuardNoMeta { .. } | Op::GuardAbsent { .. } => {
             vec![payload]
         }
         Op::LoadArray { .. } => vec![payload, int],
         Op::GuardRange { .. } => vec![payload, int, int],
         Op::StoreSlot { .. } | Op::StoreNode { .. } => vec![payload, boxed],
+        Op::AddSlot { .. } => vec![payload, boxed, boxed],
         Op::NewIndex { .. } => vec![None, None, boxed],
         Op::GuardEq { value: operand, .. } => match func.rep(*operand) {
             Rep::Word | Rep::Payload => vec![None],
@@ -71,6 +72,8 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
         },
         Op::GuardFalse { .. } => vec![Some(Rep::Bool)],
         Op::Arith { .. } | Op::Compare { .. } => vec![boxed; 2],
+        Op::Builtin { args, .. } => vec![boxed; args.len()],
+        Op::NewTable { fields, .. } => vec![boxed; fields.len()],
         Op::Len { .. } => vec![boxed],
         _ => Vec::new(),
     }

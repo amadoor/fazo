@@ -129,7 +129,9 @@ impl Func {
             write!(text, " frame(base {} caller {} wanted {})", frame.base, frame.caller_pc, frame.wanted)?;
         }
         let slots: Vec<String> = data.slots.iter().map(|(slot, value)| format!("r{slot}=v{}", value.0)).collect();
-        writeln!(text, " [{}]", slots.join(" "))
+        let objects: Vec<String> = data.objects.iter().map(virtual_text).collect();
+        let lazy = if data.lazy { " lazy" } else { "" };
+        writeln!(text, " [{}]{lazy} {}", slots.join(" "), objects.join(" "))
     }
 }
 
@@ -146,6 +148,13 @@ fn closure_text(closure: Closure) -> String {
         Closure::Root => "root".to_owned(),
         Closure::Value(value) => format!("v{}", value.0),
     }
+}
+
+pub(crate) fn virtual_text(object: &super::ir::Virtual) -> String {
+    let fields: Vec<String> = object.fields.iter().map(|field| format!("v{}", field.0)).collect();
+    let meta = object.meta.map_or(String::new(), |meta| format!(" meta v{}", meta.0));
+    let original = object.original.map_or(String::new(), |(flag, original)| format!(" else v{} unless v{}", original.0, flag.0));
+    format!("v{} = {{{:x} [{}]{meta}{original}}}", object.value.0, object.shape, fields.join(", "))
 }
 
 pub(crate) fn describe(op: &Op) -> String {
@@ -182,6 +191,7 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::GuardRange { table, low, high, state } => format!("guard.range {} [{}..{}] s{}", v(table), v(low), v(high), state.0),
         Op::Index { object, key, state } => format!("index {} [{}] s{}", v(object), v(key), state.0),
         Op::NewIndex { object, key, value, state } => format!("newindex {} [{}] = {} s{}", v(object), v(key), v(value), state.0),
+        Op::AddSlot { table, key, shape, next, slot, value, state } => format!("add.slot {} [{}] {shape:x}->{next:x} #{slot} = {} s{}", v(table), v(key), v(value), state.0),
         Op::StoreSlot { table, slot, value, state } => format!("store.slot {} #{slot} = {} s{}", v(table), v(value), state.0),
         Op::GuardNode { table, node, nodes, key, state } => format!("guard.node {} #{node}/{nodes} {key:x} s{}", v(table), state.0),
         Op::LoadNode { table, node } => format!("load.node {} #{node}", v(table)),
@@ -193,6 +203,17 @@ pub(crate) fn describe(op: &Op) -> String {
             };
             format!("helper.{kind} @{} {:?}", helper.pc, helper.args)
         }
+        Op::Builtin { function, args, state } => {
+            let args: Vec<String> = args.iter().map(v).collect();
+            format!("builtin.{} {} s{}", format!("{function:?}").to_lowercase(), args.join(", "), state.0)
+        }
+        Op::NewTable { hash_log, top, shape, fields, state, after } => {
+            let fields: Vec<String> = fields.iter().map(v).collect();
+            let shape = shape.map_or(String::new(), |shape| format!(" shape {shape:x} [{}]", fields.join(", ")));
+            format!("new.table h{hash_log} top r{top}{shape} s{} after s{}", state.0, after.0)
+        }
+        Op::Materialize { object } => format!("materialize {}", virtual_text(object)),
+        Op::GuardAbsent { table, bit, state } => format!("guard.absent {} bit{bit} s{}", v(table), state.0),
         Op::CallLua { pc, a, b, c } => format!("call @{pc} r{a} b{b} c{c}"),
         Op::Safepoint { pc, state } => format!("safepoint @{pc} s{}", state.0),
     }

@@ -73,9 +73,13 @@ impl Context<'_> {
         let Some(data) = self.func.states.get(state.0 as usize) else {
             return Err(format!("v{} names missing state s{}", user.0, state.0));
         };
-        for &(_, value) in &data.slots {
-            self.dominated(value, block, at, user)?;
-        }
+        let mut failure = Ok(());
+        data.for_each_operand(|value| {
+            if failure.is_ok() {
+                failure = self.dominated(value, block, at, user);
+            }
+        });
+        failure?;
         Ok(())
     }
 
@@ -114,8 +118,8 @@ impl Context<'_> {
                 Some(rep) => expect(*operand, rep),
                 None => Ok(()),
             },
-            Op::StoreReg { value: stored, .. } | Op::StoreSlot { value: stored, .. } | Op::StoreNode { value: stored, .. } | Op::NewIndex { value: stored, .. } => expect(*stored, Rep::Boxed),
-            Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::GuardNode { table, .. } | Op::ShapeIs { table, .. } | Op::GuardShape { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => {
+            Op::StoreReg { value: stored, .. } | Op::StoreSlot { value: stored, .. } | Op::AddSlot { value: stored, .. } | Op::StoreNode { value: stored, .. } | Op::NewIndex { value: stored, .. } => expect(*stored, Rep::Boxed),
+            Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::GuardNode { table, .. } | Op::ShapeIs { table, .. } | Op::GuardShape { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } | Op::GuardAbsent { table, .. } => {
                 expect(*table, Rep::Payload)
             }
             Op::GuardFalse { cond, .. } => expect(*cond, Rep::Bool),

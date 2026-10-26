@@ -12,7 +12,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use super::{
     DeoptPoint,
-    ir::{BinOp, BlockId, Cc, Closure, Const, Func, HelperKind, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
+    ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Func, HelperKind, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
     runtime,
 };
 use crate::jit::{
@@ -62,6 +62,8 @@ struct Imports {
     pure_int: FuncRef,
     loop_count: FuncRef,
     mixed: FuncRef,
+    new_table: FuncRef,
+    materialize: FuncRef,
     entry_signature: SigRef,
 }
 
@@ -103,6 +105,8 @@ pub(crate) fn define(module: &mut JITModule, func: &mut Function, context: &mut 
     let pure_int = make(module, &[types::I32, types::I64, types::I64], types::I64);
     let loop_count = make(module, &[types::I64, types::I64, types::I64], types::I64);
     let mixed = make(module, &[types::I32, types::I64, types::F64], types::I64);
+    let new_table = make(module, &[pointer, types::I32, types::I32, types::I32], types::I64);
+    let materialize = make(module, &[pointer, types::I64, types::I32, pointer, types::I32], types::I64);
     let imports = Imports {
         step,
         fast,
@@ -114,6 +118,8 @@ pub(crate) fn define(module: &mut JITModule, func: &mut Function, context: &mut 
         pure_int: declare(module, func, runtime::PURE_INT, &pure_int)?,
         loop_count: declare(module, func, runtime::LOOP_COUNT, &loop_count)?,
         mixed: declare(module, func, runtime::MIXED, &mixed)?,
+        new_table: declare(module, func, runtime::NEW_TABLE, &new_table)?,
+        materialize: declare(module, func, runtime::MATERIALIZE, &materialize)?,
         entry_signature: func.import_signature(signature),
     };
     let builder = FunctionBuilder::new(func, context);
@@ -395,16 +401,54 @@ impl<'a, 'f> Lowering<'a, 'f> {
         }
     }
 
+    /// Sunk tables are built last, after every other register is in place.
     fn store_state(&mut self, state: StateId) {
-        let slots = self.ir.state(state).slots.clone();
-        if slots.is_empty() {
+        let data = self.ir.state(state).clone();
+        if data.slots.is_empty() {
             return;
         }
         let registers = self.registers();
-        for (slot, value) in slots {
+        for &(slot, value) in &data.slots {
+            if data.object(value).is_some() {
+                continue;
+            }
             let pair = self.pair(value);
             self.store_pair(self.value_flags, pair, registers, slot_offset(slot));
         }
+        for &(slot, value) in &data.slots {
+            let Some(object) = data.object(value) else {
+                continue;
+            };
+            let table = self.materialize(object);
+            let tag = self.iconst(types::I64, TABLE_TAG);
+            let registers = self.registers();
+            self.store_pair(self.value_flags, (tag, table), registers, slot_offset(slot));
+        }
+    }
+
+    fn materialize(&mut self, object: &super::ir::Virtual) -> Value {
+        let meta = match object.meta {
+            Some(meta) => self.pair(meta),
+            None => (self.iconst(types::I64, NIL_TAG), self.iconst(types::I64, 0)),
+        };
+        let fields: Vec<(Value, Value)> = object.fields.iter().map(|&field| self.pair(field)).collect();
+        let count = fields.len() + 1;
+        let buffer = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, count as u32 * VALUE_SIZE as u32, 4));
+        let address = self.builder.ins().stack_addr(self.pointer, buffer, 0);
+        for (index, pair) in std::iter::once(meta).chain(fields).enumerate() {
+            self.store_pair(MemFlagsData::new().with_notrap(), pair, address, index as i32 * VALUE_SIZE);
+        }
+        let shape = self.iconst(types::I64, object.shape as i64);
+        let hash_log = self.iconst(types::I32, i64::from(object.hash_log));
+        let count = self.iconst(types::I32, count as i64);
+        let call = self.builder.ins().call(self.imports.materialize, &[self.ctx, shape, hash_log, address, count]);
+        let built = self.builder.inst_results(call)[0];
+        let Some((flag, original)) = object.original else {
+            return built;
+        };
+        let flag = self.one(flag);
+        let original = self.one(original);
+        self.builder.ins().select(flag, built, original)
     }
 
     fn deoptimize(&mut self, state: StateId) {
@@ -454,6 +498,53 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let extra = self.iconst(types::I32, i64::from(extra as i32));
         let call = self.builder.ins().call(self.imports.value, &[self.ctx, kind, address, extra]);
         self.builder.inst_results(call)[0]
+    }
+
+    /// `rawget` of a non-table and a refused `setmetatable` answer zero and resume the call in the interpreter.
+    fn builtin(&mut self, function: BuiltinFn, args: &[Val], state: StateId) -> Word {
+        let pairs: Vec<(Value, Value)> = args.iter().map(|&arg| self.pair(arg)).collect();
+        let ok = self.call_value(runtime::KIND_BUILTIN, &pairs, runtime::builtin_code(function));
+        if matches!(function, BuiltinFn::RawGet | BuiltinFn::SetMetatable) {
+            self.guard(ok, state);
+        }
+        let (tag, payload) = self.scratch_load(0);
+        Word::Two(tag, payload)
+    }
+
+    /// Every register the frame state holds is written back first, so the collector step sees it.
+    fn new_table(&mut self, value: Val, (hash_log, top): (u8, u32), (shape, fields): (Option<u64>, &[Val]), (state, after): (StateId, StateId)) -> Word {
+        self.store_state(state);
+        let pc = self.iconst(types::I32, i64::from(self.ir.state(state).frames.first().map_or(self.ir.state(state).pc, |frame| frame.caller_pc)));
+        let hash_log = self.iconst(types::I32, i64::from(hash_log));
+        let top = self.iconst(types::I32, i64::from(top));
+        let call = self.builder.ins().call(self.imports.new_table, &[self.ctx, pc, hash_log, top]);
+        let answer = self.builder.inst_results(call)[0];
+        let allocated = self.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, answer, 0);
+        self.guard(allocated, state);
+        let table = self.builder.ins().band_imm_s(answer, !runtime::RAN_CODE);
+        self.set(value, Word::One(table));
+        if let Some(shape) = shape {
+            self.fill_fresh_table(value, shape, fields);
+        }
+        let ran = self.builder.ins().band_imm_s(answer, runtime::RAN_CODE);
+        let quiet = self.builder.ins().icmp_imm_s(IntCC::Equal, ran, 0);
+        self.guard(quiet, after);
+        Word::One(table)
+    }
+
+    /// The fresh table is white and its slots were reserved for the hash part, so the stores need no barrier or growth.
+    fn fill_fresh_table(&mut self, table: Val, shape: u64, fields: &[Val]) {
+        let layout = self.env.layout;
+        let pairs: Vec<(Value, Value)> = fields.iter().map(|&field| self.pair(field)).collect();
+        let address = self.table_address(self.one(table));
+        let slots = self.builder.ins().load(self.pointer, self.heap_flags, address, layout.slots);
+        for (index, pair) in pairs.into_iter().enumerate() {
+            self.store_pair(self.heap_flags, pair, slots, index as i32 * VALUE_SIZE);
+        }
+        let length = self.iconst(types::I64, fields.len() as i64);
+        self.builder.ins().store(self.heap_flags, length, address, layout.slots_len);
+        let shape = self.iconst(types::I64, shape as i64);
+        self.builder.ins().store(self.heap_flags, shape, address, layout.shape);
     }
 
     fn table_pair(&mut self, table: Val) -> (Value, Value) {
@@ -563,6 +654,10 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 self.new_index(object, key, stored, state);
                 Word::None
             }
+            Op::AddSlot { table, key, shape, next, slot, value: stored, state } => {
+                self.add_slot(table, key, (shape, next, slot), stored, state);
+                Word::None
+            }
             Op::StoreSlot { table, slot, value: stored, state } => {
                 let address = self.slot_address(table, slot);
                 let tag = self.builder.ins().uload8(types::I64, self.heap_flags, address, 0);
@@ -598,6 +693,17 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 Word::None
             }
             Op::Helper(helper) => Word::One(self.helper(helper.pc, helper.kind, helper.args)),
+            Op::Builtin { function, args, state } => self.builtin(function, &args, state),
+            Op::NewTable { hash_log, top, shape, fields, state, after } => self.new_table(value, (hash_log, top), (shape, &fields), (state, after)),
+            Op::Materialize { object } => Word::One(self.materialize(&object)),
+            Op::GuardAbsent { table, bit, state } => {
+                let layout = self.env.layout;
+                let address = self.table_address(self.one(table));
+                let absent = self.builder.ins().uload8(types::I64, self.heap_flags, address, layout.absent);
+                let flagged = self.builder.ins().band_imm_s(absent, i64::from(bit));
+                self.guard(flagged, state);
+                Word::None
+            }
             Op::CallLua { pc, a, b, c } => Word::One(self.call_lua(pc as usize, (a, b, c))),
             Op::Safepoint { pc, state } => {
                 self.safepoint(pc, state);
@@ -1144,6 +1250,59 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.new_index_helper(object, key, value, state);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
+    }
+
+    /// Follows `Vm::transition_store_hit`; anything else takes the helper's generic store.
+    fn add_slot(&mut self, table: Val, key: Val, (shape, next, slot): (u64, u64, u32), stored: Val, state: StateId) {
+        let layout = self.env.layout;
+        let value = self.pair(stored);
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+        let address = self.table_address(self.one(table));
+        let same = self.shape_is(table, shape);
+        self.continue_if(same, slow);
+        let metatable = self.builder.ins().uload32(self.heap_flags, address, layout.metatable_tag);
+        let has_meta = self.builder.ins().icmp_imm_s(IntCC::NotEqual, metatable, i64::from(layout.metatable_none));
+        self.continue_unless_flag(has_meta, slow);
+        let length = self.builder.ins().load(types::I64, self.heap_flags, address, layout.slots_len);
+        let capacity = self.builder.ins().load(types::I64, self.heap_flags, address, layout.slots_capacity);
+        let full = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, length, capacity);
+        self.continue_unless_flag(full, slow);
+        let payload = self.one(table);
+        let index = self.builder.ins().band_imm_s(payload, 0xffff_ffff);
+        let marks = self.ctx_load(self.pointer, offset_of!(JitCtx, table_marks));
+        let mark_address = self.builder.ins().iadd(marks, index);
+        let mark = self.builder.ins().uload8(types::I64, self.heap_flags, mark_address, 0);
+        let black = self.builder.ins().band_imm_s(mark, i64::from(crate::gc::BLACK));
+        self.continue_unless_flag(black, slow);
+        if !self.ir.ty(stored).intersect(Type::NIL).is_none() {
+            let tag = self.tag_of(value.0);
+            let nil = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, NIL_TAG);
+            self.continue_unless_flag(nil, slow);
+        }
+        let slots = self.builder.ins().load(self.pointer, self.heap_flags, address, layout.slots);
+        self.store_pair(self.heap_flags, value, slots, slot as i32 * VALUE_SIZE);
+        let grown = self.builder.ins().iadd_imm_s(length, 1);
+        self.builder.ins().store(self.heap_flags, grown, address, layout.slots_len);
+        let next = self.iconst(types::I64, next as i64);
+        self.builder.ins().store(self.heap_flags, next, address, layout.shape);
+        let cleared = self.iconst(types::I8, 0);
+        self.builder.ins().store(self.heap_flags, cleared, address, layout.absent);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(slow);
+        let table_pair = self.table_pair(table);
+        let key = self.pair(key);
+        let ok = self.call_value(runtime::KIND_NEW_INDEX, &[table_pair, key, value], 0);
+        self.guard(ok, state);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+    }
+
+    fn continue_unless_flag(&mut self, flag: Value, otherwise: Block) {
+        let next = self.builder.create_block();
+        self.builder.ins().brif(flag, otherwise, &[], next, &[]);
+        self.builder.switch_to_block(next);
     }
 
     fn new_index_helper(&mut self, object: Val, key: Val, value: (Value, Value), state: StateId) {

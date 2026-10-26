@@ -499,6 +499,8 @@ fn compiled_ir_size(statements: usize) -> usize {
     let heap = &vm.heap;
     let interned = |_: crate::Value| false;
     let proto_of = |reference: crate::arena::Ref<crate::proto::Proto>| heap.protos.try_get(reference);
+    let builtin_of = |_: crate::arena::Ref<crate::object::Native>| None;
+    let node_hint = |_: &crate::proto::Proto, _: usize, _: bool| None;
     let facts = crate::jit::CompileFacts {
         layout: crate::jit::TableLayout::probe(),
         frames: crate::jit::FrameLayout::probe(),
@@ -512,7 +514,11 @@ fn compiled_ir_size(statements: usize) -> usize {
         proto_of: &proto_of,
         stress_exits: false,
         osr_at: None,
-        nodes: &[],
+        node_hint: &node_hint,
+        builtin_of: &builtin_of,
+        type_names: [0; 8],
+        sink_allocations: true,
+        running_floats: &[],
     };
     let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
     unit.unit.ir_insts()

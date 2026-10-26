@@ -40,6 +40,9 @@ fn execute(argv: &[Vec<u8>], progname: String, flags: Flags, script: usize) -> b
     let mut session = Session::new(progname, !flags.ignore_env, &flags.extensions);
     let outcome = run_session(&mut session, argv, &flags, script);
     report_opcode_counts(&mut session, &flags);
+    if session.vm().options().jit_stats {
+        session::write_stderr(session.vm().jit_stats_report().as_bytes());
+    }
     let ok = match outcome {
         Ok(()) => true,
         Err(message) => {

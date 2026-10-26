@@ -1,6 +1,6 @@
 //! Value operations answer zero when a metamethod, coercion or error is needed, so the frame deoptimizes.
 
-use super::{DeoptPoint, ir::NumOp};
+use super::{DeoptPoint, ir::{BuiltinFn, NumOp}};
 use crate::{
     instruction::{ArithOp, UnaryOp},
     jit::JitCtx,
@@ -17,6 +17,9 @@ pub(crate) const PURE_FLOAT: &str = "fazo_ssa_pure_float";
 pub(crate) const PURE_INT: &str = "fazo_ssa_pure_int";
 pub(crate) const LOOP_COUNT: &str = "fazo_ssa_loop_count";
 pub(crate) const MIXED: &str = "fazo_ssa_mixed";
+pub(crate) const NEW_TABLE: &str = "fazo_ssa_new_table";
+pub(crate) const MATERIALIZE: &str = "fazo_ssa_materialize";
+pub(crate) const RAN_CODE: i64 = 1 << 62;
 
 pub(crate) const KIND_ARITH: u32 = 0;
 pub(crate) const KIND_COMPARE: u32 = 1;
@@ -25,6 +28,7 @@ pub(crate) const KIND_NEW_INDEX: u32 = 3;
 pub(crate) const KIND_LEN: u32 = 4;
 pub(crate) const KIND_SET_UPVALUE: u32 = 5;
 pub(crate) const KIND_BARRIER: u32 = 6;
+pub(crate) const KIND_BUILTIN: u32 = 7;
 
 pub(crate) const PURE_MOD: i32 = 0;
 pub(crate) const PURE_POW: i32 = 1;
@@ -65,8 +69,10 @@ type PureFloatFn = extern "C" fn(i32, f64, f64) -> f64;
 type PureIntFn = extern "C" fn(i32, i64, i64) -> i64;
 type LoopCountFn = extern "C" fn(i64, i64, i64) -> i64;
 type MixedFn = extern "C" fn(i32, i64, f64) -> i64;
+type NewTableFn = extern "C" fn(*mut JitCtx, u32, u32, u32) -> i64;
+type MaterializeFn = extern "C" fn(*mut JitCtx, u64, u32, *const Value, u32) -> i64;
 
-pub(crate) fn symbols() -> [(&'static str, *const u8); 8] {
+pub(crate) fn symbols() -> [(&'static str, *const u8); 10] {
     [
         (DEOPT, deopt as DeoptFn as *const u8),
         (SAFE_POINT, safe_point as SafePointFn as *const u8),
@@ -76,7 +82,31 @@ pub(crate) fn symbols() -> [(&'static str, *const u8); 8] {
         (PURE_INT, pure_int as PureIntFn as *const u8),
         (LOOP_COUNT, loop_count as LoopCountFn as *const u8),
         (MIXED, mixed as MixedFn as *const u8),
+        (NEW_TABLE, new_table as NewTableFn as *const u8),
+        (MATERIALIZE, materialize as MaterializeFn as *const u8),
     ]
+}
+
+extern "C" fn materialize(ctx: *mut JitCtx, shape: u64, hash_log: u32, values: *const Value, count: u32) -> i64 {
+    // SAFETY: compiled code passes a stack buffer it filled with `count` values.
+    let values = unsafe { std::slice::from_raw_parts(values, count as usize) };
+    let shape = crate::arena::Ref::new(shape as u32, (shape >> 32) as u32);
+    with_vm(ctx, |ctx, vm| {
+        let table = vm.jit_materialize(shape, hash_log as u8, values[0], &values[1..]);
+        vm.jit_refresh_context(ctx);
+        table.packed() as i64
+    })
+}
+
+extern "C" fn new_table(ctx: *mut JitCtx, pc: u32, hash_log: u32, top: u32) -> i64 {
+    with_vm(ctx, |ctx, vm| {
+        let Some((table, ran)) = vm.jit_alloc_table(ctx.base, (pc as usize, top as usize), hash_log as u8) else {
+            return -1;
+        };
+        vm.jit_refresh_context(ctx);
+        let packed = table.packed() as i64;
+        if ran { packed | RAN_CODE } else { packed }
+    })
 }
 
 fn with_vm<T>(ctx: *mut JitCtx, body: impl FnOnce(&mut JitCtx, &mut crate::Vm) -> T) -> T {
@@ -130,6 +160,10 @@ extern "C" fn value(ctx: *mut JitCtx, kind: u32, operands: *mut Value, extra: u3
             }
             1
         }
+        KIND_BUILTIN => match builtin_of(extra) {
+            Some(builtin) => store(operands, vm.jit_builtin(builtin, operands[0], operands[1])),
+            None => 0,
+        },
         KIND_BARRIER => {
             if let Value::Table(table) = operands[0] {
                 vm.jit_table_barrier(table, operands[1]);
@@ -138,6 +172,22 @@ extern "C" fn value(ctx: *mut JitCtx, kind: u32, operands: *mut Value, extra: u3
             1
         }
         _ => 0,
+    })
+}
+
+const BUILTINS: [BuiltinFn; 5] = [BuiltinFn::Type, BuiltinFn::RawEqual, BuiltinFn::RawGet, BuiltinFn::GetMetatable, BuiltinFn::SetMetatable];
+
+pub(crate) fn builtin_code(function: BuiltinFn) -> u32 {
+    BUILTINS.iter().position(|&known| known == function).unwrap_or(0) as u32
+}
+
+fn builtin_of(code: u32) -> Option<crate::vm::Builtin> {
+    Some(match BUILTINS.get(code as usize)? {
+        BuiltinFn::Type => crate::vm::Builtin::Type,
+        BuiltinFn::RawEqual => crate::vm::Builtin::RawEqual,
+        BuiltinFn::RawGet => crate::vm::Builtin::RawGet,
+        BuiltinFn::GetMetatable => crate::vm::Builtin::GetMetatable,
+        BuiltinFn::SetMetatable => crate::vm::Builtin::SetMetatable,
     })
 }
 

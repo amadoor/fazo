@@ -188,6 +188,33 @@ impl Vm {
         self.check_memory()
     }
 
+    /// Follows `OP_NEWTABLE` (lvm.c); `None` leaves the instruction to the interpreter, which owns the memory limit's checks.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn jit_alloc_table(&mut self, base: usize, (pc, top): (usize, usize), hash_log: u8) -> Option<(Ref<crate::table::Table>, bool)> {
+        let finalized = self.heap.gc.finalizers_called;
+        if self.heap.gc.debt <= 0 {
+            if self.options.memory_limit.is_some() {
+                return None;
+            }
+            self.save_pc(pc);
+            self.gc_safe_point_at(base, base + top);
+        }
+        let table = self.new_table_sized(0, hash_log, false).ok()?;
+        Some((table, finalized != self.heap.gc.finalizers_called))
+    }
+
+    /// Skips the collector step and finalizer registration: the placed values are unreachable, and `__gc` was checked at `setmetatable`.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn jit_materialize(&mut self, shape: Ref<crate::shape::Shape>, hash_log: u8, meta: Value, fields: &[Value]) -> Ref<crate::table::Table> {
+        let hash = super::hash_size(hash_log).max(fields.len());
+        let table = self.heap.alloc(crate::table::Table::with_spare(0, 0, hash).unwrap_or_default());
+        self.heap.tables.live_mut(table).enter_shape_with(shape, fields);
+        if let Value::Table(meta) = meta {
+            self.heap.set_table_metatable(table, Some(meta));
+        }
+        table
+    }
+
     fn extra_argument_at(&mut self, proto: Ref<Proto>, pc: usize) -> Result<u32, LuaError> {
         match self.heap.protos.live(proto).code.get(pc) {
             Some(&Instruction::ExtraArg { ax }) => Ok(ax),

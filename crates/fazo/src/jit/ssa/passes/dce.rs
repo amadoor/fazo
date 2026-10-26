@@ -32,7 +32,7 @@ fn mark(func: &Func) -> Vec<bool> {
         match &data.term {
             Term::Branch { cond, .. } => work.push(*cond),
             Term::Switch { code, .. } => work.push(*code),
-            Term::Deopt { state } => work.extend(func.state(*state).slots.iter().map(|&(_, value)| value)),
+            Term::Deopt { state } => func.state(*state).for_each_operand(|value| work.push(value)),
             _ => {}
         }
     }
@@ -47,7 +47,7 @@ fn mark(func: &Func) -> Vec<bool> {
         let op = func.op(value);
         work.extend(op.operands());
         if let Some(state) = op.state() {
-            work.extend(func.state(state).slots.iter().map(|&(_, slot_value)| slot_value));
+            func.state(state).for_each_operand(|slot_value| work.push(slot_value));
         }
         let Some(block) = defined[value.0 as usize] else {
             continue;

@@ -175,6 +175,26 @@ pub(crate) enum PureFn {
     EqFI,
 }
 
+/// Builtins compiled code calls directly: none allocates, runs Lua code or raises.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum BuiltinFn {
+    Type,
+    RawEqual,
+    RawGet,
+    GetMetatable,
+    SetMetatable,
+}
+
+impl BuiltinFn {
+    pub(crate) fn is_pure(self) -> bool {
+        matches!(self, BuiltinFn::Type | BuiltinFn::RawEqual)
+    }
+
+    pub(crate) fn writes(self) -> bool {
+        self == BuiltinFn::SetMetatable
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum NumOp {
     Add,
@@ -243,11 +263,17 @@ pub(crate) enum Op {
     Index { object: Val, key: Val, state: StateId },
     NewIndex { object: Val, key: Val, value: Val, state: StateId },
     StoreSlot { table: Val, slot: u32, value: Val, state: StateId },
+    AddSlot { table: Val, key: Val, shape: u64, next: u64, slot: u32, value: Val, state: StateId },
     /// Follows LuaJIT's `HREFK`: the hash node at `node` of a table with `nodes` nodes holds the interned string `key`.
     GuardNode { table: Val, node: u32, nodes: u32, key: u64, state: StateId },
     LoadNode { table: Val, node: u32 },
     StoreNode { table: Val, node: u32, value: Val, state: StateId },
     Helper(Helper),
+    Builtin { function: BuiltinFn, args: Box<[Val]>, state: StateId },
+    /// The collector step scans only the registers below absolute slot `top`.
+    NewTable { hash_log: u8, top: u32, shape: Option<u64>, fields: Box<[Val]>, state: StateId, after: StateId },
+    Materialize { object: Box<Virtual> },
+    GuardAbsent { table: Val, bit: u8, state: StateId },
     CallLua { pc: u32, a: u8, b: u8, c: u8 },
     Safepoint { pc: u32, state: StateId },
 }
@@ -262,6 +288,8 @@ impl Op {
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
         match self {
             Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Safepoint { .. } => {}
+            Op::NewTable { fields, .. } => fields.iter().for_each(|&field| f(field)),
+            Op::Materialize { object } => object.for_each_operand(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) | Op::Len { value, .. } => f(*value),
             Op::LoadUpval { closure, .. } => each_closure(*closure, &mut f),
             Op::StoreUpval { closure, value, .. } => {
@@ -272,7 +300,7 @@ impl Op {
                 f(*left);
                 f(*right);
             }
-            Op::Pure(_, args) => args.iter().for_each(|&arg| f(arg)),
+            Op::Pure(_, args) | Op::Builtin { args, .. } => args.iter().for_each(|&arg| f(arg)),
             Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::ShapeIs { table, .. } => f(*table),
             Op::Select { cond, yes, no } => {
                 f(*cond);
@@ -285,7 +313,7 @@ impl Op {
                 f(*index);
             }
             Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => f(*value),
-            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => f(*table),
+            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } | Op::GuardAbsent { table, .. } => f(*table),
             Op::GuardFalse { cond, .. } => f(*cond),
             Op::GuardRange { table, low, high, .. } => {
                 f(*table);
@@ -305,12 +333,19 @@ impl Op {
                 f(*table);
                 f(*value);
             }
+            Op::AddSlot { table, key, value, .. } => {
+                f(*table);
+                f(*key);
+                f(*value);
+            }
         }
     }
 
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Val) -> Val) {
         match self {
             Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Safepoint { .. } => {}
+            Op::NewTable { fields, .. } => fields.iter_mut().for_each(|field| *field = f(*field)),
+            Op::Materialize { object } => object.map_operands(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) => *value = f(*value),
             Op::LoadUpval { closure, .. } => map_closure(closure, &mut f),
             Op::StoreUpval { closure, value, .. } => {
@@ -321,7 +356,7 @@ impl Op {
                 *left = f(*left);
                 *right = f(*right);
             }
-            Op::Pure(_, args) => args.iter_mut().for_each(|arg| *arg = f(*arg)),
+            Op::Pure(_, args) | Op::Builtin { args, .. } => args.iter_mut().for_each(|arg| *arg = f(*arg)),
             Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::ShapeIs { table, .. } => *table = f(*table),
             Op::Arith { left, right, .. } | Op::Compare { left, right, .. } => {
                 *left = f(*left);
@@ -339,7 +374,7 @@ impl Op {
                 *index = f(*index);
             }
             Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => *value = f(*value),
-            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => *table = f(*table),
+            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } | Op::GuardAbsent { table, .. } => *table = f(*table),
             Op::GuardFalse { cond, .. } => *cond = f(*cond),
             Op::GuardRange { table, low, high, .. } => {
                 *table = f(*table);
@@ -359,6 +394,11 @@ impl Op {
                 *table = f(*table);
                 *value = f(*value);
             }
+            Op::AddSlot { table, key, value, .. } => {
+                *table = f(*table);
+                *key = f(*key);
+                *value = f(*value);
+            }
         }
     }
 
@@ -375,12 +415,16 @@ impl Op {
             | Op::Index { state, .. }
             | Op::NewIndex { state, .. }
             | Op::StoreSlot { state, .. }
+            | Op::AddSlot { state, .. }
             | Op::GuardNode { state, .. }
             | Op::StoreNode { state, .. }
             | Op::Safepoint { state, .. }
             | Op::Arith { state, .. }
             | Op::Compare { state, .. }
             | Op::Len { state, .. }
+            | Op::Builtin { state, .. }
+            | Op::NewTable { state, .. }
+            | Op::GuardAbsent { state, .. }
             | Op::LoadArray { state, .. } => Some(*state),
             _ => None,
         }
@@ -399,25 +443,33 @@ impl Op {
             | Op::Index { state, .. }
             | Op::NewIndex { state, .. }
             | Op::StoreSlot { state, .. }
+            | Op::AddSlot { state, .. }
             | Op::GuardNode { state, .. }
             | Op::StoreNode { state, .. }
             | Op::Safepoint { state, .. }
             | Op::Arith { state, .. }
             | Op::Compare { state, .. }
             | Op::Len { state, .. }
+            | Op::Builtin { state, .. }
+            | Op::NewTable { state, .. }
+            | Op::GuardAbsent { state, .. }
             | Op::LoadArray { state, .. } => *state = new,
             _ => {}
         }
     }
 
     pub(crate) fn is_pure(&self) -> bool {
-        matches!(self, Op::Const(_) | Op::Unary(..) | Op::Binary(..) | Op::Pure(..) | Op::EqConst(..) | Op::Select { .. })
+        match self {
+            Op::Builtin { function, .. } => function.is_pure(),
+            _ => matches!(self, Op::Const(_) | Op::Unary(..) | Op::Binary(..) | Op::Pure(..) | Op::EqConst(..) | Op::Select { .. }),
+        }
     }
 
-
-
     pub(crate) fn is_removable(&self) -> bool {
-        self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. })
+        match self {
+            Op::Builtin { function, .. } => !function.writes(),
+            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. }),
+        }
     }
 }
 
@@ -507,6 +559,43 @@ pub(crate) struct InlineFrame {
     pub(crate) caller_pc: u32,
     pub(crate) wanted: i32,
     pub(crate) proto: u64,
+    /// Reached by a tail call, which the interpreter marks on the frame it reuses.
+    pub(crate) tail: bool,
+}
+
+/// A table the code does not allocate, following V8's captured objects and LuaJIT's `snap_unsink` (lj_snap.c).
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct Virtual {
+    pub(crate) value: Val,
+    pub(crate) hash_log: u8,
+    pub(crate) shape: u64,
+    pub(crate) fields: Vec<Val>,
+    pub(crate) meta: Option<Val>,
+    pub(crate) original: Option<(Val, Val)>,
+}
+
+impl Virtual {
+    pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(Val)) {
+        self.fields.iter().for_each(|&field| f(field));
+        if let Some(meta) = self.meta {
+            f(meta);
+        }
+        if let Some((flag, original)) = self.original {
+            f(flag);
+            f(original);
+        }
+    }
+
+    pub(crate) fn map_operands(&mut self, f: &mut impl FnMut(Val) -> Val) {
+        self.fields.iter_mut().for_each(|field| *field = f(*field));
+        if let Some(meta) = &mut self.meta {
+            *meta = f(*meta);
+        }
+        if let Some((flag, original)) = &mut self.original {
+            *flag = f(*flag);
+            *original = f(*original);
+        }
+    }
 }
 
 /// Follows V8 Maglev's eager deopt frame (`GetDeoptFrameForEagerDeopt`, src/maglev/maglev-graph-builder.cc).
@@ -516,6 +605,24 @@ pub(crate) struct FrameState {
     pub(crate) frames: Vec<InlineFrame>,
     pub(crate) slots: Vec<(u32, Val)>,
     pub(crate) site: u32,
+    /// Follows V8's lazy deoptimization: the instruction ran code the frame cannot account for, and no speculation failed.
+    pub(crate) lazy: bool,
+    pub(crate) objects: Vec<Virtual>,
+}
+
+impl FrameState {
+    pub(crate) fn object(&self, value: Val) -> Option<&Virtual> {
+        self.objects.iter().find(|object| object.value == value)
+    }
+
+    pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
+        for &(_, value) in &self.slots {
+            match self.object(value) {
+                Some(object) => object.for_each_operand(&mut f),
+                None => f(value),
+            }
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -560,6 +667,11 @@ pub(crate) struct Func {
     pub(crate) float_guess: bool,
     pub(crate) avoid: Vec<u32>,
     pub(crate) observed: Vec<(u32, u8)>,
+    pub(crate) type_names: Option<[u64; 8]>,
+    /// Shapes the code moves tables into; the prototype keeps them alive.
+    pub(crate) shapes: Vec<crate::arena::Ref<crate::shape::Shape>>,
+    /// Allocations may be removed: no memory limit makes an allocation able to fail.
+    pub(crate) sink_allocations: bool,
 }
 
 pub(crate) const KIND_INT: u8 = 1;
@@ -697,7 +809,10 @@ impl Func {
             inst.op.map_operands(resolve);
         }
         for state in &mut self.states {
-            state.slots.iter_mut().for_each(|(_, value)| *value = resolve(*value));
+            let placeholders: Vec<Val> = state.objects.iter().map(|object| object.value).collect();
+            state.slots.iter_mut().filter(|(_, value)| !placeholders.contains(value)).for_each(|(_, value)| *value = resolve(*value));
+            let mut map = resolve;
+            state.objects.iter_mut().for_each(|object| object.map_operands(&mut map));
         }
     }
 

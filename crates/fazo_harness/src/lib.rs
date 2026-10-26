@@ -8,6 +8,7 @@ pub mod minimize;
 pub mod number;
 pub mod official;
 pub mod perf;
+pub mod quick;
 pub mod reference;
 pub mod report;
 

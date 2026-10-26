@@ -8,6 +8,9 @@ struct Clobbers {
     calls: bool,
     shapes: bool,
     upvalues: bool,
+    stores: bool,
+    /// A collector step may clear entries of weak tables, so loads do not move across an allocation.
+    allocates: bool,
     slots: Vec<u32>,
     nodes: Vec<u32>,
 }
@@ -100,12 +103,14 @@ fn movable(func: &Func, value: Val, invariant: &[bool], clobbers: &Clobbers, eve
     match op {
         Op::GuardType { .. } | Op::GuardNotNil { .. } | Op::GuardEq { .. } | Op::GuardFalse { .. } => true,
         Op::GuardShape { .. } | Op::GuardNode { .. } | Op::ShapeIs { .. } => !clobbers.calls && !clobbers.shapes,
-        Op::LoadNode { node, .. } => !clobbers.calls && !clobbers.shapes && !clobbers.nodes.contains(node),
+        Op::LoadNode { node, .. } => !clobbers.calls && !clobbers.shapes && !clobbers.allocates && !clobbers.nodes.contains(node),
         Op::GuardHasMeta { .. } | Op::GuardNoMeta { .. } => !clobbers.calls && !clobbers.shapes,
-        Op::LoadSlot { slot, .. } => !clobbers.calls && !clobbers.shapes && !clobbers.slots.contains(slot),
+        Op::GuardAbsent { .. } => !clobbers.calls && !clobbers.shapes && !clobbers.stores,
+        Op::LoadSlot { slot, .. } => !clobbers.calls && !clobbers.shapes && !clobbers.allocates && !clobbers.slots.contains(slot),
         Op::LoadProto { .. } => true,
         Op::LoadUpval { .. } => !clobbers.calls && !clobbers.upvalues,
         Op::GuardRange { .. } => !clobbers.calls && !clobbers.shapes,
+        Op::Builtin { function, .. } => !function.writes() && !clobbers.calls && !clobbers.shapes && !clobbers.stores && !clobbers.allocates,
         _ => false,
     }
 }
@@ -116,9 +121,27 @@ fn clobbers(func: &Func, entry: &Loop) -> Clobbers {
         for &value in &func.block(block).insts {
             match func.op(value) {
                 Op::Helper(_) | Op::CallLua { .. } => found.calls = true,
-                Op::NewIndex { .. } => found.shapes = true,
-                Op::StoreSlot { slot, .. } => found.slots.push(*slot),
-                Op::StoreNode { node, .. } => found.nodes.push(*node),
+                Op::NewTable { .. } | Op::Materialize { .. } => found.allocates = true,
+                Op::NewIndex { .. } => {
+                    found.shapes = true;
+                    found.stores = true;
+                }
+                Op::Builtin { function, .. } if function.writes() => {
+                    found.shapes = true;
+                    found.stores = true;
+                }
+                Op::AddSlot { .. } => {
+                    found.shapes = true;
+                    found.stores = true;
+                }
+                Op::StoreSlot { slot, .. } => {
+                    found.slots.push(*slot);
+                    found.stores = true;
+                }
+                Op::StoreNode { node, .. } => {
+                    found.nodes.push(*node);
+                    found.stores = true;
+                }
                 Op::StoreUpval { .. } | Op::StoreReg { .. } => found.upvalues = true,
                 _ => {}
             }
