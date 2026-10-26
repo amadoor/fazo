@@ -114,8 +114,8 @@ impl Context<'_> {
                 Some(rep) => expect(*operand, rep),
                 None => Ok(()),
             },
-            Op::StoreReg { value: stored, .. } | Op::StoreSlot { value: stored, .. } | Op::NewIndex { value: stored, .. } => expect(*stored, Rep::Boxed),
-            Op::LoadSlot { table, .. } | Op::ShapeIs { table, .. } | Op::GuardShape { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => {
+            Op::StoreReg { value: stored, .. } | Op::StoreSlot { value: stored, .. } | Op::StoreNode { value: stored, .. } | Op::NewIndex { value: stored, .. } => expect(*stored, Rep::Boxed),
+            Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::GuardNode { table, .. } | Op::ShapeIs { table, .. } | Op::GuardShape { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => {
                 expect(*table, Rep::Payload)
             }
             Op::GuardFalse { cond, .. } => expect(*cond, Rep::Bool),

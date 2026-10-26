@@ -122,10 +122,6 @@ impl Options {
                 Some(budget) => self.jit_policy.baseline.budget_per_instruction = budget,
                 None => return false,
             },
-            (b"peak-budget", Some(_)) => match number() {
-                Some(budget) => self.jit_policy.peak.budget_per_instruction = budget,
-                None => return false,
-            },
             (b"stress-ic", None) => self.jit_stress.inline_caches_off = true,
             (b"trace", None) => self.jit_trace = true,
             (b"jitlib", None) => self.jit_library = true,

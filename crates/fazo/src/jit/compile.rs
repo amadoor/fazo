@@ -26,7 +26,8 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) interned: &'a dyn Fn(LuaValue) -> bool,
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
     pub(crate) stress_exits: bool,
-    pub(crate) require_payoff: bool,
+    pub(crate) osr_at: Option<u32>,
+    pub(crate) nodes: &'a [Option<build::NodeHint>],
 }
 
 /// The compiled unit, and the optimized graph's text when `dump` asks for it.
@@ -35,9 +36,6 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         return Err(unsupported("the table and frame layouts are unknown"));
     };
     let func = optimized(proto, facts)?;
-    if facts.require_payoff && payoff(&func) <= 0 {
-        return Err(unsupported("the optimized graph specializes no more than Baseline does"));
-    }
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
     let env = lower::Env {
@@ -55,26 +53,6 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     Ok((PeakUnit { unit, _points: points, entries }, text))
 }
 
-/// Ops weighted by loop depth: unboxed and array-part ops count for Peak, generic table ops and helpers against it.
-fn payoff(func: &ssa::ir::Func) -> i64 {
-    use ssa::ir::{Op, UnOp};
-    let mut total: i64 = 0;
-    for block in func.reverse_postorder() {
-        let depth = func.loops.iter().filter(|entry| entry.blocks.contains(&block)).count().min(3) as u32;
-        let weight = 8i64.pow(depth);
-        for &value in &func.block(block).insts {
-            let gain = match func.op(value) {
-                Op::Unary(UnOp::Box | UnOp::Unbox, _) => 0,
-                Op::Binary(..) | Op::Unary(..) | Op::Pure(..) | Op::LoadArray { .. } | Op::LoadSlot { .. } | Op::StoreSlot { .. } => 1,
-                Op::Index { .. } | Op::NewIndex { .. } | Op::Helper(_) | Op::Arith { .. } | Op::Compare { .. } => -1,
-                _ => 0,
-            };
-            total = total.saturating_add(gain * weight);
-        }
-    }
-    total
-}
-
 pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitResult<ssa::ir::Func> {
     let builder_facts = build::Facts {
         inline_caches: facts.inline_caches,
@@ -82,6 +60,8 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>) -> JitRe
         interned: facts.interned,
         proto_of: facts.proto_of,
         policy: passes::inline::Policy::default(),
+        osr_at: facts.osr_at,
+        nodes: facts.nodes,
     };
     let mut func = build::build(proto, &builder_facts);
     func.float_guess = facts.float_guess;

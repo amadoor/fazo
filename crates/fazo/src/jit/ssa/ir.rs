@@ -243,6 +243,10 @@ pub(crate) enum Op {
     Index { object: Val, key: Val, state: StateId },
     NewIndex { object: Val, key: Val, value: Val, state: StateId },
     StoreSlot { table: Val, slot: u32, value: Val, state: StateId },
+    /// Follows LuaJIT's `HREFK`: the hash node at `node` of a table with `nodes` nodes holds the interned string `key`.
+    GuardNode { table: Val, node: u32, nodes: u32, key: u64, state: StateId },
+    LoadNode { table: Val, node: u32 },
+    StoreNode { table: Val, node: u32, value: Val, state: StateId },
     Helper(Helper),
     CallLua { pc: u32, a: u8, b: u8, c: u8 },
     Safepoint { pc: u32, state: StateId },
@@ -256,11 +260,52 @@ impl Op {
     }
 
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
-        let mut copy = self.clone();
-        copy.map_operands(|value| {
-            f(value);
-            value
-        });
+        match self {
+            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Safepoint { .. } => {}
+            Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) | Op::Len { value, .. } => f(*value),
+            Op::LoadUpval { closure, .. } => each_closure(*closure, &mut f),
+            Op::StoreUpval { closure, value, .. } => {
+                each_closure(*closure, &mut f);
+                f(*value);
+            }
+            Op::Binary(_, left, right) | Op::Arith { left, right, .. } | Op::Compare { left, right, .. } => {
+                f(*left);
+                f(*right);
+            }
+            Op::Pure(_, args) => args.iter().for_each(|&arg| f(arg)),
+            Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::ShapeIs { table, .. } => f(*table),
+            Op::Select { cond, yes, no } => {
+                f(*cond);
+                f(*yes);
+                f(*no);
+            }
+            Op::LoadProto { closure } => f(*closure),
+            Op::LoadArray { table, index, .. } => {
+                f(*table);
+                f(*index);
+            }
+            Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => f(*value),
+            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => f(*table),
+            Op::GuardFalse { cond, .. } => f(*cond),
+            Op::GuardRange { table, low, high, .. } => {
+                f(*table);
+                f(*low);
+                f(*high);
+            }
+            Op::Index { object, key, .. } => {
+                f(*object);
+                f(*key);
+            }
+            Op::NewIndex { object, key, value, .. } => {
+                f(*object);
+                f(*key);
+                f(*value);
+            }
+            Op::StoreSlot { table, value, .. } | Op::StoreNode { table, value, .. } => {
+                f(*table);
+                f(*value);
+            }
+        }
     }
 
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Val) -> Val) {
@@ -277,7 +322,7 @@ impl Op {
                 *right = f(*right);
             }
             Op::Pure(_, args) => args.iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::LoadSlot { table, .. } | Op::ShapeIs { table, .. } => *table = f(*table),
+            Op::LoadSlot { table, .. } | Op::LoadNode { table, .. } | Op::ShapeIs { table, .. } => *table = f(*table),
             Op::Arith { left, right, .. } | Op::Compare { left, right, .. } => {
                 *left = f(*left);
                 *right = f(*right);
@@ -294,7 +339,7 @@ impl Op {
                 *index = f(*index);
             }
             Op::GuardType { value, .. } | Op::GuardEq { value, .. } | Op::GuardNotNil { value, .. } => *value = f(*value),
-            Op::GuardShape { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => *table = f(*table),
+            Op::GuardShape { table, .. } | Op::GuardNode { table, .. } | Op::GuardHasMeta { table, .. } | Op::GuardNoMeta { table, .. } => *table = f(*table),
             Op::GuardFalse { cond, .. } => *cond = f(*cond),
             Op::GuardRange { table, low, high, .. } => {
                 *table = f(*table);
@@ -310,7 +355,7 @@ impl Op {
                 *key = f(*key);
                 *value = f(*value);
             }
-            Op::StoreSlot { table, value, .. } => {
+            Op::StoreSlot { table, value, .. } | Op::StoreNode { table, value, .. } => {
                 *table = f(*table);
                 *value = f(*value);
             }
@@ -330,6 +375,8 @@ impl Op {
             | Op::Index { state, .. }
             | Op::NewIndex { state, .. }
             | Op::StoreSlot { state, .. }
+            | Op::GuardNode { state, .. }
+            | Op::StoreNode { state, .. }
             | Op::Safepoint { state, .. }
             | Op::Arith { state, .. }
             | Op::Compare { state, .. }
@@ -352,6 +399,8 @@ impl Op {
             | Op::Index { state, .. }
             | Op::NewIndex { state, .. }
             | Op::StoreSlot { state, .. }
+            | Op::GuardNode { state, .. }
+            | Op::StoreNode { state, .. }
             | Op::Safepoint { state, .. }
             | Op::Arith { state, .. }
             | Op::Compare { state, .. }
@@ -368,7 +417,13 @@ impl Op {
 
 
     pub(crate) fn is_removable(&self) -> bool {
-        self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. })
+        self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. })
+    }
+}
+
+fn each_closure(closure: Closure, f: &mut impl FnMut(Val)) {
+    if let Closure::Value(value) = closure {
+        f(value);
     }
 }
 

@@ -20,6 +20,8 @@ pub struct Scoreboard {
     pub perf: IndexMap<String, Workload>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub operations: IndexMap<String, Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost: Option<CompileCost>,
 }
 
 impl Default for Scoreboard {
@@ -30,6 +32,7 @@ impl Default for Scoreboard {
             bytecode: None,
             perf: IndexMap::new(),
             operations: IndexMap::new(),
+            compile_cost: None,
         }
     }
 }
@@ -156,6 +159,16 @@ pub struct Operation {
     #[serde(default)]
     pub luajit: f64,
     pub budget: f64,
+}
+
+/// Peak compile Ir per bytecode for one function of `statements` global updates run 200 times, and LuaJIT's on the same code.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CompileCost {
+    pub statements: u32,
+    pub peak_per_bytecode: f64,
+    pub luajit_per_bytecode: f64,
+    pub peak_per_statement: f64,
+    pub luajit_per_statement: f64,
 }
 
 pub fn path() -> PathBuf {

@@ -15,6 +15,8 @@ pub(crate) mod compile;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) mod sites;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) mod tiering;
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[expect(unsafe_code, reason = "Peak code reaches the VM and its deoptimization points through raw pointers")]
 pub(crate) mod ssa;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -61,6 +63,8 @@ pub(crate) use memory::CodeBudget;
 pub(crate) use unit::{Compiler, JitUnit};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use compile::{CompileFacts, compile};
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use ssa::build::NodeHint;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use sites::{CallTarget, calls_out, payoff};
 
@@ -114,7 +118,8 @@ impl Tier {
 
 /// When a prototype moves up one tier. A zero budget tiers up on first use.
 /// With `estimate_payoff` set, a prototype whose budget runs out compiles only if its estimated
-/// payoff over the tier below is positive.
+/// payoff over the tier below is positive. Peak's budget comes from the compile-cost estimate
+/// instead, and its `budget_base` is the wait before recompiling after a deoptimization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TierPolicy {
     pub budget_base: u32,
@@ -202,7 +207,7 @@ impl Default for JitPolicy {
             },
             peak: TierPolicy {
                 budget_base: 200_000,
-                budget_per_instruction: 80_000,
+                budget_per_instruction: 0,
                 estimate_payoff: true,
                 inline_gain: 0,
                 call_gain: 35,
@@ -295,6 +300,8 @@ pub(crate) struct ProtoJit {
     /// Sites whose speculation failed; a recompile runs them through the interpreter's helpers.
     pub(crate) avoid: Vec<u32>,
     pub(crate) deopts: u32,
+    /// Bytecodes the Peak budgets handed out so far stand for, the work the payoff estimate weighs the compile against.
+    pub(crate) peak_executed: i64,
     pub(crate) float_guess: bool,
     /// Number kinds a numeric site's registers held when its guess failed, as `ssa::ir::KIND_*` bits.
     pub(crate) observed: Vec<(u32, u8)>,

@@ -92,7 +92,7 @@ extern "C" fn deopt(ctx: *mut JitCtx, point: i64) -> i64 {
     // SAFETY: `point` is the address of one of the deoptimization points the unit owns, and the unit stays mapped,
     // with its points, while any frame runs its code.
     let point = unsafe { &*(point as usize as *const DeoptPoint) };
-    with_vm(ctx, |ctx, vm| vm.jit_deopt(ctx, point))
+    with_vm(ctx, |ctx, vm| vm.jit_deopt(ctx, point)).wrapping_neg()
 }
 
 extern "C" fn safe_point(ctx: *mut JitCtx, target: u32) -> i64 {

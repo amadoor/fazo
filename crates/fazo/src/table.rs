@@ -174,6 +174,26 @@ impl Table {
         }
     }
 
+    /// The node and node count for an interned string key with a value, which compiled code then reads in place.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn short_str_node(&self, string: Ref<LuaString>, hash: u64) -> Option<(u32, u32)> {
+        if self.shaped || self.nodes.is_empty() {
+            return None;
+        }
+        let nodes = u32::try_from(self.nodes.len()).ok()?;
+        let mut index = hash as usize & (self.nodes.len() - 1);
+        loop {
+            let node = &self.nodes[index];
+            if matches!(node.key, Value::String(stored) if stored == string) {
+                return (!node.value.is_nil()).then_some((index as u32, nodes));
+            }
+            match node.next {
+                0 => return None,
+                next => index = next as usize - 1,
+            }
+        }
+    }
+
     /// Follows PUC's `luaV_fastseti`; a store that may add the key or resize goes through `set_within`.
     #[inline]
     pub(crate) fn replace_int(&mut self, index: i64, value: &Value) -> bool {

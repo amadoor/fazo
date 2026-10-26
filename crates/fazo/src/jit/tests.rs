@@ -511,7 +511,8 @@ fn compiled_ir_size(statements: usize) -> usize {
         interned: &interned,
         proto_of: &proto_of,
         stress_exits: false,
-        require_payoff: false,
+        osr_at: None,
+        nodes: &[],
     };
     let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
     unit.unit.ir_insts()

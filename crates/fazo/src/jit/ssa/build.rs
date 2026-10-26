@@ -24,6 +24,15 @@ pub(crate) struct Facts<'a> {
     pub(crate) interned: &'a dyn Fn(LuaValue) -> bool,
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
     pub(crate) policy: inline::Policy,
+    pub(crate) osr_at: Option<u32>,
+    /// Per pc of the compiled prototype: where the running closure's environment table held the global's key.
+    pub(crate) nodes: &'a [Option<NodeHint>],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct NodeHint {
+    pub(crate) node: u32,
+    pub(crate) nodes: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -295,7 +304,7 @@ impl<'a> Builder<'a, '_> {
                 index += 1;
             }
         }
-        let osr = frame.flow.headers[pc] && frame.chain.is_empty();
+        let osr = frame.flow.headers[pc] && frame.chain.is_empty() && (incoming.is_empty() || self.enters_loop(frame, pc));
         if incoming.is_empty() && !osr {
             return;
         }
@@ -367,8 +376,9 @@ impl<'a> Builder<'a, '_> {
     }
 
     /// Only root-frame headers get an on-stack-replacement entry, since the interpreter enters only root frames.
+    /// A header no forward edge reaches, such as a generic `for` loop's body, which only its back edge enters, keeps its entry.
     fn start_loop(&mut self, frame: &mut Frame<'a>, pc: usize, mut incoming: Vec<Incoming>) {
-        if frame.chain.is_empty() {
+        if frame.chain.is_empty() && (incoming.is_empty() || self.enters_loop(frame, pc)) {
             let osr = self.osr_entry(frame, pc, &incoming);
             incoming.push(osr);
         }
@@ -407,6 +417,15 @@ impl<'a> Builder<'a, '_> {
         });
         frame.loops[pc] = Some(LoopBuild { header, params, index: self.func.loops.len() - 1 });
         self.current = Some(header);
+    }
+
+    /// Maglev builds one on-stack-replacement entry, at the loop being run (`entrypoint_` from `osr_offset`, src/maglev/maglev-graph-builder.cc); this keeps entries for the loops around the tier-up point, so an exit inside any of them can come back, or for every loop when the point is unknown.
+    fn enters_loop(&self, frame: &Frame<'_>, header: usize) -> bool {
+        let Some(at) = self.facts.osr_at else {
+            return true;
+        };
+        let at = at as usize;
+        header <= at && frame.flow.successors.iter().skip(at).any(|targets| targets.contains(&header))
     }
 
     fn for_base_slot(&self, frame: &Frame<'_>, header: usize) -> Option<u32> {
@@ -562,6 +581,9 @@ impl<'a> Builder<'a, '_> {
             Instruction::GetTabUp { a, b, c } => {
                 let closure = self.frame_closure(frame);
                 let object = self.emit(Op::LoadUpval { closure, index: b }, Type::ANY, Rep::Boxed);
+                if let Some(node) = self.node_hint(frame, pc, c) {
+                    return self.get_node(frame, pc, a, object, node);
+                }
                 return self.get_field(frame, pc, a, object, c);
             }
             Instruction::GetField { a, b, c } => {
@@ -582,6 +604,11 @@ impl<'a> Builder<'a, '_> {
             Instruction::SetTabUp { a, b, c, k } => {
                 let closure = self.frame_closure(frame);
                 let object = self.emit(Op::LoadUpval { closure, index: a }, Type::ANY, Rep::Boxed);
+                if let Some(node) = self.node_hint(frame, pc, b)
+                    && let Some(next) = self.set_node(frame, pc, object, node, (c, k))
+                {
+                    return next;
+                }
                 let key = self.constant_value(frame, u32::from(b));
                 return self.new_index(frame, pc, object, key, (c, k));
             }
@@ -900,6 +927,47 @@ impl<'a> Builder<'a, '_> {
             return value;
         }
         self.emit(Op::GuardType { value, ty: Type::TABLE, state }, Type::TABLE, Rep::Boxed)
+    }
+
+    fn node_hint(&self, frame: &Frame<'_>, pc: usize, constant: u8) -> Option<(NodeHint, u64)> {
+        if !self.facts.inline_caches || !frame.chain.is_empty() {
+            return None;
+        }
+        let hint = (*self.facts.nodes.get(pc)?)?;
+        let key = frame.proto.constants.get(usize::from(constant)).copied()?;
+        let LuaValue::String(string) = key else {
+            return None;
+        };
+        (self.facts.interned)(key).then_some((hint, string.packed()))
+    }
+
+    fn get_node(&mut self, frame: &mut Frame<'a>, pc: usize, a: u8, object: Val, (hint, key): (NodeHint, u64)) -> usize {
+        if !self.speculates(frame, pc) {
+            return self.fallback(frame, pc);
+        }
+        let state = self.state_at(frame, pc);
+        let table = self.table_of(object, state);
+        self.effect(Op::GuardNode { table, node: hint.node, nodes: hint.nodes, key, state });
+        let value = self.emit(Op::LoadNode { table, node: hint.node }, Type::ANY, Rep::Boxed);
+        let value = self.emit(Op::GuardNotNil { value, state }, Type::ANY.without(Type::NIL), Rep::Boxed);
+        self.write(frame, a, value);
+        pc + 1
+    }
+
+    /// Storing nil removes the key, which the generic path does.
+    fn set_node(&mut self, frame: &mut Frame<'a>, pc: usize, object: Val, (hint, key): (NodeHint, u64), value: (u8, bool)) -> Option<usize> {
+        if !self.speculates(frame, pc) {
+            return None;
+        }
+        let stored = self.stored(frame, value);
+        if !self.func.ty(stored).intersect(Type::NIL).is_none() {
+            return None;
+        }
+        let state = self.state_at(frame, pc);
+        let table = self.table_of(object, state);
+        self.effect(Op::GuardNode { table, node: hint.node, nodes: hint.nodes, key, state });
+        self.effect(Op::StoreNode { table, node: hint.node, value: stored, state });
+        Some(pc + 1)
     }
 
     fn get_field(&mut self, frame: &mut Frame<'a>, pc: usize, a: u8, object: Val, c: u8) -> usize {

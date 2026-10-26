@@ -1,12 +1,12 @@
 //! Folds with `vm::fast` so results match the interpreter. Follows LuaJIT's `lj_opt_fold.c` (lj_opt_cse, line 2611).
 //! Table-memory guards merge only within one block, since stores between blocks can change what they read.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use super::remove;
 use crate::{
     instruction::{ArithOp, UnaryOp},
-    jit::ssa::ir::{BinOp, BlockId, Cc, Const, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
+    jit::ssa::ir::{BinOp, BlockId, Cc, Closure, Const, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
     value::Value,
     vm::fast,
 };
@@ -227,9 +227,10 @@ fn fold_constants(func: &mut Func) -> bool {
     let mut map = func.identity_map();
     let mut dead = vec![false; func.insts.len()];
     for block in func.reverse_postorder() {
-        for value in func.block(block).insts.clone() {
-            let op = func.op(value).clone();
-            if let Some(redundant) = redundant_guard(func, &op) {
+        for index in 0..func.block(block).insts.len() {
+            let value = func.block(block).insts[index];
+            let op = func.op(value);
+            if let Some(redundant) = redundant_guard(func, op) {
                 if let Some(input) = redundant {
                     map[value.0 as usize] = input;
                 }
@@ -240,7 +241,7 @@ fn fold_constants(func: &mut Func) -> bool {
             if matches!(op, Op::Const(_)) || !op.is_pure() {
                 continue;
             }
-            let Some(folded) = fold(func, &op) else {
+            let Some(folded) = fold(func, op) else {
                 continue;
             };
             let rep = if func.rep(value) == Rep::Boxed { Rep::Boxed } else { rep_of(folded) };
@@ -282,33 +283,42 @@ fn fold_branches(func: &mut Func) -> bool {
     changed
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct Key(Vec<u64>);
+const KEY_OPERANDS: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key([u64; 4 + KEY_OPERANDS]);
 
 /// Frame states are left out, since the earlier op's frame serves the later one too.
-fn key(op: &Op, rep: Rep) -> Option<(Key, bool)> {
-    let operands: Vec<u64> = op.operands().into_iter().map(|value| u64::from(value.0)).collect();
-    let (kind, extra, memory): (u64, Vec<u64>, bool) = match op {
-        Op::Const(constant) => (1, vec![u64::from(constant.tag()), constant.payload()], false),
-        Op::Unary(unary, _) => (2, vec![*unary as u64], false),
-        Op::Binary(binary, ..) => (3, vec![binary_code(*binary)], false),
-        Op::Pure(function, _) => (4, vec![*function as u64], false),
-        Op::EqConst(_, constant) => (5, vec![u64::from(constant.tag()), constant.payload()], false),
-        Op::Select { .. } => (6, Vec::new(), false),
-        Op::GuardType { ty, .. } => (7, vec![u64::from(type_bits(*ty))], false),
-        Op::GuardNotNil { .. } => (8, Vec::new(), false),
-        Op::GuardEq { expected, .. } => (9, vec![*expected], false),
-        Op::GuardFalse { .. } => (11, Vec::new(), false),
-        Op::GuardShape { shape, .. } => (12, vec![*shape], true),
-        Op::GuardHasMeta { .. } => (13, Vec::new(), true),
-        Op::GuardNoMeta { bit, .. } => (14, vec![u64::from(*bit)], true),
-        Op::ShapeIs { shape, .. } => (15, vec![*shape], true),
+fn key(op: &Op, rep: Rep, map: &[Val]) -> Option<(Key, bool)> {
+    let (kind, extra, memory): (u64, [u64; 2], bool) = match op {
+        Op::Const(constant) => (1, [u64::from(constant.tag()), constant.payload()], false),
+        Op::Unary(unary, _) => (2, [*unary as u64, 0], false),
+        Op::Binary(binary, ..) => (3, [binary_code(*binary), 0], false),
+        Op::Pure(function, _) => (4, [*function as u64, 0], false),
+        Op::EqConst(_, constant) => (5, [u64::from(constant.tag()), constant.payload()], false),
+        Op::Select { .. } => (6, [0, 0], false),
+        Op::GuardType { ty, .. } => (7, [u64::from(type_bits(*ty)), 0], false),
+        Op::GuardNotNil { .. } => (8, [0, 0], false),
+        Op::GuardEq { expected, .. } => (9, [*expected, 0], false),
+        Op::GuardFalse { .. } => (11, [0, 0], false),
+        Op::GuardShape { shape, .. } => (12, [*shape, 0], true),
+        Op::GuardHasMeta { .. } => (13, [0, 0], true),
+        Op::GuardNoMeta { bit, .. } => (14, [u64::from(*bit), 0], true),
+        Op::ShapeIs { shape, .. } => (15, [*shape, 0], true),
+        Op::GuardNode { node, nodes, key, .. } => (16, [u64::from(*node) << 32 | u64::from(*nodes), *key], true),
+        Op::LoadUpval { closure, index } => (UPVALUE_KIND, [u64::from(*index), u64::from(matches!(closure, Closure::Root))], true),
+        Op::LoadNode { node, .. } => (NODE_KIND, [u64::from(*node), 0], true),
         _ => return None,
     };
-    let mut words = vec![kind, rep_code(rep)];
-    words.extend(extra);
-    words.extend(operands);
-    Some((Key(words), memory))
+    let mut words = [kind, rep_code(rep), extra[0], extra[1], u64::MAX, u64::MAX, u64::MAX];
+    let mut count = 0;
+    op.for_each_operand(|operand| {
+        if let Some(word) = words.get_mut(4 + count) {
+            *word = u64::from(super::super::ir::resolve(map, operand).0);
+        }
+        count += 1;
+    });
+    (count <= KEY_OPERANDS).then_some((Key(words), memory))
 }
 
 fn type_bits(ty: Type) -> u16 {
@@ -389,16 +399,36 @@ fn cse(func: &mut Func) -> bool {
     changed
 }
 
+const UPVALUE_KIND: u64 = 17;
+const NODE_KIND: u64 = 18;
+
+/// Follows LuaJIT's `fwd_ahload` (lj_opt_mem.c): a load of the node just stored reads the stored value. A store to the same node of another table may alias every load of that node.
+fn forward_store(local: &mut HashMap<Key, Val>, map: &[Val], (table, node, stored): (Val, u32, Val)) {
+    local.retain(|key, _| key.0[0] != NODE_KIND || key.0[2] != u64::from(node));
+    let table = u64::from(super::super::ir::resolve(map, table).0);
+    let key = Key([NODE_KIND, rep_code(Rep::Boxed), u64::from(node), 0, table, u64::MAX, u64::MAX]);
+    local.insert(key, super::super::ir::resolve(map, stored));
+}
+
+/// A store to a captured register writes through its open upvalue.
+fn clobbers_upvalues(op: &Op) -> bool {
+    matches!(op, Op::StoreUpval { .. } | Op::StoreReg { .. })
+}
+
 fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key, Val>, &mut Vec<Val>, &mut Vec<bool>), changed: &mut bool) -> Vec<Key> {
     let mut added = Vec::new();
     let mut local: HashMap<Key, Val> = HashMap::new();
     for &value in &func.block(block).insts {
-        let mut op = func.op(value).clone();
-        op.map_operands(|operand| super::super::ir::resolve(map, operand));
-        if clobbers_tables(&op) {
+        let op = func.op(value);
+        if clobbers_tables(op) {
             local.clear();
+        } else if clobbers_upvalues(op) {
+            local.retain(|key, _| key.0[0] != UPVALUE_KIND);
         }
-        let Some((key, memory)) = key(&op, func.rep(value)) else {
+        if let Op::StoreNode { table, node, value: stored, .. } = op {
+            forward_store(&mut local, map, (*table, *node, *stored));
+        }
+        let Some((key, memory)) = key(op, func.rep(value), map) else {
             continue;
         };
         let known = if memory { local.get(&key) } else { table.get(&key) };
@@ -411,7 +441,7 @@ fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key,
         if memory {
             local.insert(key, value);
         } else {
-            table.insert(key.clone(), value);
+            table.insert(key, value);
             added.push(key);
         }
     }

@@ -183,6 +183,9 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::Index { object, key, state } => format!("index {} [{}] s{}", v(object), v(key), state.0),
         Op::NewIndex { object, key, value, state } => format!("newindex {} [{}] = {} s{}", v(object), v(key), v(value), state.0),
         Op::StoreSlot { table, slot, value, state } => format!("store.slot {} #{slot} = {} s{}", v(table), v(value), state.0),
+        Op::GuardNode { table, node, nodes, key, state } => format!("guard.node {} #{node}/{nodes} {key:x} s{}", v(table), state.0),
+        Op::LoadNode { table, node } => format!("load.node {} #{node}", v(table)),
+        Op::StoreNode { table, node, value, state } => format!("store.node {} #{node} = {} s{}", v(table), v(value), state.0),
         Op::Helper(helper) => {
             let kind = match helper.kind {
                 HelperKind::Step => "step".to_owned(),

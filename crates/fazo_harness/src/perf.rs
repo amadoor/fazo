@@ -23,6 +23,13 @@ const LUAJIT_REPOSITORY: &str = "https://github.com/LuaJIT/LuaJIT.git";
 const LUAJIT_DIR_VARIABLE: &str = "FAZO_LUAJIT_DIR";
 const LUAJIT_JIT_OFF: &[&str] = &["-joff"];
 const LUAJIT_SUFFIX: &str = ".luajit.lua";
+const COMPILE_STATEMENTS: u32 = 500;
+const COMPILE_CALLS: u32 = 200;
+/// `aaa = aaa + 1` is GETTABUP, ADDI, MMBINI and SETTABUP in Lua 5.5, and GGET, ADDVN and GSET in LuaJIT (`luajit -bl`).
+const FAZO_BYTECODES_PER_STATEMENT: f64 = 4.0;
+const LUAJIT_BYTECODES_PER_STATEMENT: f64 = 3.0;
+/// Callgrind counts only inside Peak's compile entry point, under either symbol spelling.
+const PEAK_COMPILE_SYMBOLS: [&str; 2] = ["*4fazo3jit7compile7compile", "fazo::jit::compile::compile"];
 const NO_GENERATIONAL_COLLECTOR: &str =
     "LuaJIT 2.1 has no generational collector: collectgarbage(\"generational\") is an invalid option";
 
@@ -148,8 +155,13 @@ pub fn run() -> Result<(), String> {
 
     let measurements = measure_workloads(&interpreters, &out_dir, &scripts)?;
     let operations = measure_operations(&interpreters, &out_dir, &operations_dir, &budgets)?;
-    let path = report::update(|board| record(board, &measurements, &operations))?;
+    let compile_cost = measure_compile_cost(&interpreters, &out_dir)?;
+    let path = report::update(|board| {
+        record(board, &measurements, &operations);
+        board.compile_cost = Some(compile_cost);
+    })?;
     print!("{}", summary(&measurements, &operations));
+    println!("{}", compile_cost_line(&compile_cost));
     println!("report: {}", path.display());
     print!("{}", compare_with_luajit(&measurements));
 
@@ -480,6 +492,53 @@ fn per_operation(instructions: f64, empty: f64) -> f64 {
     (instructions - empty) / OPERATIONS_PER_RUN
 }
 
+/// The difference between a chunk with the statements and one without leaves the hot function's own cost. fazo's is the Ir
+/// spent inside Peak compiles under `-X force=peak`; LuaJIT's, as the brief that set the target measured it, is its run with
+/// the JIT on less its run with `-joff`, which also credits LuaJIT the speedup of the 200 calls.
+fn measure_compile_cost(interpreters: &Interpreters, out_dir: &Path) -> Result<report::CompileCost, String> {
+    let full = write_compile_chunk(out_dir, COMPILE_STATEMENTS)?;
+    let empty = write_compile_chunk(out_dir, 0)?;
+    let peak = |script: &Path, label: &str| measure_inside(&interpreters.fazo, PEAK_ONLY, out_dir, label, script);
+    let peak_ir = peak(&full, "compile-peak")? - peak(&empty, "compile-peak-empty")?;
+    let luajit = |script: &Path, label: &str| -> Result<f64, String> {
+        let on = measure(&interpreters.luajit, &[], out_dir, label, script, &[])?;
+        let off = measure(&interpreters.luajit, LUAJIT_JIT_OFF, out_dir, &format!("{label}-off"), script, &[])?;
+        Ok(on - off)
+    };
+    let luajit_ir = luajit(&full, "compile-luajit")? - luajit(&empty, "compile-luajit-empty")?;
+    let statements = f64::from(COMPILE_STATEMENTS);
+    Ok(report::CompileCost {
+        statements: COMPILE_STATEMENTS,
+        peak_per_bytecode: tenths(peak_ir / (statements * FAZO_BYTECODES_PER_STATEMENT)),
+        luajit_per_bytecode: tenths(luajit_ir / (statements * LUAJIT_BYTECODES_PER_STATEMENT)),
+        peak_per_statement: tenths(peak_ir / statements),
+        luajit_per_statement: tenths(luajit_ir / statements),
+    })
+}
+
+fn write_compile_chunk(out_dir: &Path, statements: u32) -> Result<std::path::PathBuf, String> {
+    let mut source = String::from("aaa = 0\nlocal function f()\n");
+    for _ in 0..statements {
+        source.push_str("aaa = aaa + 1\n");
+    }
+    let _ = write!(source, "end\nfor i = 1, {COMPILE_CALLS} do f() end\nprint(aaa)\n");
+    let path = out_dir.join(format!("compile-{statements}.lua"));
+    fs::write(&path, source).map_err(|error| format!("writing {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn compile_cost_line(cost: &report::CompileCost) -> String {
+    format!(
+        "compile cost ({} statements): Peak {:.0} Ir per bytecode ({:.0} per statement), LuaJIT {:.0} ({:.0}), Peak/LuaJIT {:.2} per bytecode",
+        cost.statements,
+        cost.peak_per_bytecode,
+        cost.peak_per_statement,
+        cost.luajit_per_bytecode,
+        cost.luajit_per_statement,
+        cost.peak_per_bytecode / cost.luajit_per_bytecode,
+    )
+}
+
 fn build_interpreters(source: &Path) -> Result<Interpreters, String> {
     build_puc(source)?;
     build_fazo()?;
@@ -604,6 +663,25 @@ fn measure(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, scr
         .get("Ir")
         .copied()
         .ok_or_else(|| format!("cachegrind output for {label} has no Ir total"))
+}
+
+fn measure_inside(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, script: &Path) -> Result<f64, String> {
+    let out = out_dir.join(format!("{label}.callgrind"));
+    let mut args = vec!["--tool=callgrind".to_owned(), format!("--callgrind-out-file={}", guest_path(&out))];
+    args.extend(PEAK_COMPILE_SYMBOLS.iter().map(|symbol| format!("--toggle-collect={symbol}")));
+    args.push(interpreter.to_owned());
+    args.extend(arguments_for(options, script, &[]));
+    let output = host_command("valgrind", &args)
+        .output()
+        .map_err(|error| format!("starting valgrind: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
+    }
+    let text = fs::read_to_string(&out).map_err(|error| format!("reading {}: {error}", out.display()))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("totals: ").or_else(|| line.strip_prefix("summary: ")))
+        .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
+        .ok_or_else(|| format!("callgrind output for {label} has no total"))
 }
 
 fn read_totals(path: &Path) -> Result<BTreeMap<String, f64>, String> {

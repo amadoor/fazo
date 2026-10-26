@@ -105,6 +105,8 @@ fn built(source: &str) -> Func {
         interned: &interned,
         proto_of: &proto_of,
         policy: inline::Policy::default(),
+        osr_at: None,
+        nodes: &[],
     };
     build::build(heap.protos.live(reference), &facts)
 }

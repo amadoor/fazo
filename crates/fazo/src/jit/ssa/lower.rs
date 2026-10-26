@@ -26,6 +26,9 @@ const BOOL_TAG: i64 = 1;
 const INT_TAG: i64 = 2;
 const FLOAT_TAG: i64 = 3;
 const STRING_TAG: i64 = 4;
+const NODE_SIZE: i64 = crate::table::offsets::NODE_SIZE as i64;
+const NODE_KEY: i64 = crate::table::offsets::NODE_KEY as i64;
+const NODE_VALUE: i64 = crate::table::offsets::NODE_VALUE as i64;
 const TABLE_TAG: i64 = 5;
 const CLOSURE_TAG: i64 = 6;
 const LIGHT_USERDATA_TAG: i64 = 10;
@@ -136,6 +139,7 @@ struct Lowering<'a, 'f> {
     values: Vec<Word>,
     scratch: StackSlot,
     callee: Option<StackSlot>,
+    stubs: Vec<Option<Block>>,
     context_flags: MemFlagsData,
     value_flags: MemFlagsData,
     heap_flags: MemFlagsData,
@@ -186,6 +190,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
             values: vec![Word::None; ir.insts.len()],
             scratch,
             callee: None,
+            stubs: vec![None; ir.states.len()],
             context_flags,
             value_flags,
             heap_flags,
@@ -241,6 +246,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
             }
             self.lower_term(&data.term.clone());
         }
+        self.fill_stubs();
         self.builder.seal_all_blocks();
     }
 
@@ -362,13 +368,31 @@ impl<'a, 'f> Lowering<'a, 'f> {
     }
 
     fn guard(&mut self, cond: Value, state: StateId) {
-        let stub = self.builder.create_block();
-        self.builder.set_cold_block(stub);
+        let stub = self.stub(state);
         let next = self.builder.create_block();
         self.builder.ins().brif(cond, next, &[], stub, &[]);
-        self.builder.switch_to_block(stub);
-        self.deoptimize(state);
         self.builder.switch_to_block(next);
+    }
+
+    /// Guards that resume at the same frame state share one exit.
+    fn stub(&mut self, state: StateId) -> Block {
+        if let Some(stub) = self.stubs[state.0 as usize] {
+            return stub;
+        }
+        let stub = self.builder.create_block();
+        self.builder.set_cold_block(stub);
+        self.stubs[state.0 as usize] = Some(stub);
+        stub
+    }
+
+    fn fill_stubs(&mut self) {
+        for index in 0..self.stubs.len() {
+            let Some(stub) = self.stubs[index] else {
+                continue;
+            };
+            self.builder.switch_to_block(stub);
+            self.deoptimize(StateId(index as u32));
+        }
     }
 
     fn store_state(&mut self, state: StateId) {
@@ -388,8 +412,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let point = std::ptr::from_ref(&self.env.points[state.0 as usize]) as i64;
         let point = self.iconst(types::I64, point);
         let call = self.builder.ins().call(self.imports.deopt, &[self.ctx, point]);
-        let result = self.builder.inst_results(call)[0];
-        let code = self.builder.ins().ineg(result);
+        let code = self.builder.inst_results(call)[0];
         self.builder.ins().return_(&[code]);
     }
 
@@ -413,22 +436,20 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.ins().stack_addr(self.pointer, self.scratch, 0)
     }
 
-    fn scratch_store(&mut self, index: i32, pair: (Value, Value)) {
-        self.builder.ins().stack_store(self.pointer, pair.0, self.scratch, index * VALUE_SIZE);
-        self.builder.ins().stack_store(self.pointer, pair.1, self.scratch, index * VALUE_SIZE + PAYLOAD);
+    fn scratch_store(&mut self, address: Value, index: i32, pair: (Value, Value)) {
+        self.store_pair(MemFlagsData::new().with_notrap(), pair, address, index * VALUE_SIZE);
     }
 
     fn scratch_load(&mut self, index: i32) -> (Value, Value) {
-        let tag = self.builder.ins().stack_load(self.pointer, types::I64, self.scratch, index * VALUE_SIZE);
-        let payload = self.builder.ins().stack_load(self.pointer, types::I64, self.scratch, index * VALUE_SIZE + PAYLOAD);
-        (tag, payload)
+        let address = self.scratch_address();
+        self.load_pair(MemFlagsData::new().with_notrap(), address, index * VALUE_SIZE)
     }
 
     fn call_value(&mut self, kind: u32, operands: &[(Value, Value)], extra: u32) -> Value {
-        for (index, &pair) in operands.iter().enumerate() {
-            self.scratch_store(index as i32, pair);
-        }
         let address = self.scratch_address();
+        for (index, &pair) in operands.iter().enumerate() {
+            self.scratch_store(address, index as i32, pair);
+        }
         let kind = self.iconst(types::I32, i64::from(kind));
         let extra = self.iconst(types::I32, i64::from(extra as i32));
         let call = self.builder.ins().call(self.imports.value, &[self.ctx, kind, address, extra]);
@@ -549,7 +570,31 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 self.guard(present, state);
                 let pair = self.pair(stored);
                 self.store_pair(self.heap_flags, pair, address, 0);
-                self.barrier(table, pair);
+                if self.may_collect(stored) {
+                    self.barrier(table, pair);
+                }
+                Word::None
+            }
+            Op::GuardNode { table, node, nodes, key, state } => {
+                let found = self.node_holds(table, (node, nodes), key);
+                self.guard(found, state);
+                Word::None
+            }
+            Op::LoadNode { table, node } => {
+                let address = self.node_value_address(table, node);
+                let (tag, payload) = self.load_pair(self.heap_flags, address, 0);
+                Word::Two(tag, payload)
+            }
+            Op::StoreNode { table, node, value: stored, state } => {
+                let address = self.node_value_address(table, node);
+                let tag = self.builder.ins().uload8(types::I64, self.heap_flags, address, 0);
+                let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, tag, NIL_TAG);
+                self.guard(present, state);
+                let pair = self.pair(stored);
+                self.store_pair(self.heap_flags, pair, address, 0);
+                if self.may_collect(stored) {
+                    self.barrier(table, pair);
+                }
                 Word::None
             }
             Op::Helper(helper) => Word::One(self.helper(helper.pc, helper.kind, helper.args)),
@@ -967,6 +1012,31 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.ins().iadd_imm_s(slots, i64::from(slot) * i64::from(VALUE_SIZE))
     }
 
+    /// Unshaped, still `nodes` long, and the node's key is the string: its value is the key's, as LuaJIT's `asm_hrefk` checks.
+    fn node_holds(&mut self, table: Val, (node, nodes): (u32, u32), key: u64) -> Value {
+        let layout = self.env.layout;
+        let address = self.table_address(self.one(table));
+        let shaped = self.builder.ins().uload8(types::I64, self.heap_flags, address, layout.shaped);
+        let length = self.builder.ins().load(types::I64, self.heap_flags, address, layout.nodes_len);
+        let unshaped = self.builder.ins().icmp_imm_s(IntCC::Equal, shaped, 0);
+        let same_length = self.builder.ins().icmp_imm_s(IntCC::Equal, length, i64::from(nodes));
+        let nodes_base = self.builder.ins().load(self.pointer, self.heap_flags, address, layout.nodes);
+        let key_address = self.builder.ins().iadd_imm_s(nodes_base, i64::from(node) * NODE_SIZE + NODE_KEY);
+        let key_tag = self.builder.ins().uload8(types::I64, self.heap_flags, key_address, 0);
+        let key_payload = self.builder.ins().load(types::I64, self.heap_flags, key_address, PAYLOAD);
+        let is_string = self.builder.ins().icmp_imm_s(IntCC::Equal, key_tag, STRING_TAG);
+        let same_key = self.builder.ins().icmp_imm_s(IntCC::Equal, key_payload, key as i64);
+        let layout_holds = self.builder.ins().band(unshaped, same_length);
+        let key_holds = self.builder.ins().band(is_string, same_key);
+        self.builder.ins().band(layout_holds, key_holds)
+    }
+
+    fn node_value_address(&mut self, table: Val, node: u32) -> Value {
+        let address = self.table_address(self.one(table));
+        let nodes_base = self.builder.ins().load(self.pointer, self.heap_flags, address, self.env.layout.nodes);
+        self.builder.ins().iadd_imm_s(nodes_base, i64::from(node) * NODE_SIZE + NODE_VALUE)
+    }
+
     fn inside(&mut self, table: Val, index: Value) -> Value {
         let address = self.table_address(self.one(table));
         let length = self.builder.ins().load(types::I64, self.heap_flags, address, self.env.layout.array_len);
@@ -996,34 +1066,38 @@ impl<'a, 'f> Lowering<'a, 'f> {
     }
 
     fn index(&mut self, object: Val, key: Val, state: StateId) -> Word {
+        let Some((index, is_int)) = self.integer_key(key) else {
+            let (tag, payload) = self.index_helper(object, key, state);
+            return Word::Two(tag, payload);
+        };
         let join = self.builder.create_block();
         let tag = self.builder.append_block_param(join, types::I64);
         let payload = self.builder.append_block_param(join, types::I64);
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
-        if let Some((index, is_int)) = self.integer_key(key) {
-            if let Some(is_int) = is_int {
-                self.continue_if(is_int, slow);
-            }
-            let inside = self.inside(object, index);
-            self.continue_if(inside, slow);
-            let element = self.element_address(object, index);
-            let (found_tag, found) = self.load_pair(self.heap_flags, element, 0);
-            let low = self.tag_of(found_tag);
-            let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, low, NIL_TAG);
-            self.builder.ins().brif(present, join, &[BlockArg::Value(found_tag), BlockArg::Value(found)], slow, &[]);
-        } else {
-            self.builder.ins().jump(slow, &[]);
+        if let Some(is_int) = is_int {
+            self.continue_if(is_int, slow);
         }
+        let inside = self.inside(object, index);
+        self.continue_if(inside, slow);
+        let element = self.element_address(object, index);
+        let (found_tag, found) = self.load_pair(self.heap_flags, element, 0);
+        let low = self.tag_of(found_tag);
+        let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, low, NIL_TAG);
+        self.builder.ins().brif(present, join, &[BlockArg::Value(found_tag), BlockArg::Value(found)], slow, &[]);
         self.builder.switch_to_block(slow);
+        let (result_tag, result) = self.index_helper(object, key, state);
+        self.builder.ins().jump(join, &[BlockArg::Value(result_tag), BlockArg::Value(result)]);
+        self.builder.switch_to_block(join);
+        Word::Two(tag, payload)
+    }
+
+    fn index_helper(&mut self, object: Val, key: Val, state: StateId) -> (Value, Value) {
         let table = self.table_pair(object);
         let key = self.pair(key);
         let ok = self.call_value(runtime::KIND_INDEX, &[table, key], 0);
         self.guard(ok, state);
-        let (result_tag, result) = self.scratch_load(0);
-        self.builder.ins().jump(join, &[BlockArg::Value(result_tag), BlockArg::Value(result)]);
-        self.builder.switch_to_block(join);
-        Word::Two(tag, payload)
+        self.scratch_load(0)
     }
 
     fn load_array(&mut self, table: Val, index: Val, state: StateId) -> Word {
@@ -1051,28 +1125,32 @@ impl<'a, 'f> Lowering<'a, 'f> {
 
     /// The raw store runs only when no `__newindex` can fire (`quick::raw_set` decides).
     fn new_index(&mut self, object: Val, key: Val, stored: Val, state: StateId) {
+        let value = self.pair(stored);
+        let Some((index, is_int)) = self.integer_key(key) else {
+            self.new_index_helper(object, key, value, state);
+            return;
+        };
         let done = self.builder.create_block();
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
-        let value = self.pair(stored);
-        if let Some((index, is_int)) = self.integer_key(key) {
-            if let Some(is_int) = is_int {
-                self.continue_if(is_int, slow);
-            }
-            let inside = self.inside(object, index);
-            self.continue_if(inside, slow);
-            self.array_store(object, index, value, slow);
-            self.builder.ins().jump(done, &[]);
-        } else {
-            self.builder.ins().jump(slow, &[]);
+        if let Some(is_int) = is_int {
+            self.continue_if(is_int, slow);
         }
+        let inside = self.inside(object, index);
+        self.continue_if(inside, slow);
+        self.array_store(object, index, value, slow);
+        self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(slow);
+        self.new_index_helper(object, key, value, state);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+    }
+
+    fn new_index_helper(&mut self, object: Val, key: Val, value: (Value, Value), state: StateId) {
         let table = self.table_pair(object);
         let key = self.pair(key);
         let ok = self.call_value(runtime::KIND_NEW_INDEX, &[table, key, value], 0);
         self.guard(ok, state);
-        self.builder.ins().jump(done, &[]);
-        self.builder.switch_to_block(done);
     }
 
     /// An empty item of a table with a metatable goes to `slow`, since `__newindex` may fire.
@@ -1092,6 +1170,11 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.switch_to_block(store);
         self.store_pair(self.heap_flags, value, element, 0);
         self.barrier(table, value);
+    }
+
+    fn may_collect(&self, value: Val) -> bool {
+        let ty = self.ir.ty(value);
+        (STRING_TAG as u8..LIGHT_USERDATA_TAG as u8).any(|tag| !ty.intersect(Type::of_tag(tag)).is_none())
     }
 
     /// Only a collectable value stored into a black table needs the collector's barrier.
@@ -1141,9 +1224,14 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.ins().load(types::I64, self.heap_flags, cell, upvalue::VALUE)
     }
 
-    /// A closed upvalue needs the collector's barrier, so its store runs the helper.
+    /// A closed upvalue needs the collector's barrier for a collectable value, so that store runs the helper.
     fn store_upvalue(&mut self, closure: Closure, index: u8, value: Val) {
         let pair = self.pair(value);
+        if !self.may_collect(value) {
+            let address = self.upvalue_address(closure, index);
+            self.store_pair(MemFlagsData::new().with_notrap(), pair, address, 0);
+            return;
+        }
         let done = self.builder.create_block();
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
@@ -1262,7 +1350,10 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 let result = self.builder.inst_results(call)[0];
                 self.exit_with(result);
             }
-            Term::Deopt { state } => self.deoptimize(*state),
+            Term::Deopt { state } => {
+                let stub = self.stub(*state);
+                self.builder.ins().jump(stub, &[]);
+            }
         }
     }
 

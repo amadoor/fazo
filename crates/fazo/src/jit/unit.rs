@@ -25,7 +25,7 @@ pub(crate) struct Compiler {
 }
 
 impl Compiler {
-    /// The optimizer and the backtracking allocator halve integer and float loop time against `opt_level = none` with the single-pass allocator.
+    /// Measured on the SSA IR, `opt_level = none` costs the integer loop 31% more run Ir and the single-pass allocator costs the float loop 73% more, against at most half the compile Ir saved.
     pub(crate) fn new() -> JitResult<Self> {
         let mut flags = settings::builder();
         let is_pic = if cfg!(target_arch = "x86_64") { "true" } else { "false" };
@@ -56,7 +56,6 @@ pub(crate) struct JitUnit {
     _unwind: Option<sys::UnwindRegistration>,
     _module: JITModule,
     entry: *const u8,
-    #[cfg(test)]
     ir_insts: usize,
 }
 
@@ -78,7 +77,6 @@ impl JitUnit {
         let ctx = &mut compiler.context;
         ctx.clear();
         let id = define(&mut module, &mut ctx.func, &mut compiler.builder)?;
-        #[cfg(test)]
         let ir_insts = ctx.func.dfg.num_insts();
         ctx.compile(module.isa(), &mut ControlPlane::default())
             .map_err(|err| Box::new(ModuleError::from(err)))?;
@@ -117,12 +115,10 @@ impl JitUnit {
             _unwind: unwind,
             _module: module,
             entry,
-            #[cfg(test)]
             ir_insts,
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn ir_insts(&self) -> usize {
         self.ir_insts
     }

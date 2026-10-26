@@ -113,7 +113,7 @@ pub(crate) fn payoff(proto: &Proto, policy: crate::TierPolicy) -> i64 {
     total
 }
 
-fn calls_lua(proto: &Proto, pc: usize) -> bool {
+pub(crate) fn calls_lua(proto: &Proto, pc: usize) -> bool {
     match proto.exec.feedback.get(pc) {
         Some(InlineCache::Callee(callee)) => matches!(callee.value, LuaValue::Closure(_)),
         Some(InlineCache::Callees(callees)) => callees.iter().any(|callee| matches!(callee.value, LuaValue::Closure(_))),
@@ -152,7 +152,7 @@ fn lowered_at(proto: &Proto, pc: usize, instruction: Instruction) -> Lowered {
     }
 }
 
-fn site_is_cached(proto: &Proto, pc: usize) -> bool {
+pub(crate) fn site_is_cached(proto: &Proto, pc: usize) -> bool {
     match proto.exec.feedback.get(pc) {
         Some(InlineCache::Monomorphic(entry)) => !entry.adds_key(),
         Some(InlineCache::Polymorphic(entries)) => entries.iter().any(|entry| !entry.adds_key()),
