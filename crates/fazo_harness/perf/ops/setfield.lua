@@ -11,3 +11,4 @@ for i = 1, 200000 do
     t.a = i
     t.a = i
 end
+print(t.a)

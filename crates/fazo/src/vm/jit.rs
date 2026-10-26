@@ -14,6 +14,8 @@ use super::{Builtin, CallRequest, CallStart, Direct, Operand, RunScope};
 use crate::jit::Tier;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::jit::{Control, EXIT_ERROR, EXIT_HOOK, EXIT_RELOAD, EXIT_RETURNED, JitCtx, NOT_DIRECT};
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+use crate::jit::ssa::ir::{KIND_FLOAT, KIND_INT, KIND_OTHER};
 
 #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 impl Vm {
@@ -74,7 +76,7 @@ impl Vm {
     ) -> Result<bool, LuaError> {
         let entry = match self.compiled_call_entry(proto, pc) {
             Some(entry) => entry,
-            None if pc != 0 && !self.tracing && self.heap.protos.live(proto).jit.code().is_some() => match self.jit_resume_compiled(proto, pc) {
+            None if pc != 0 && !self.tracing && self.heap.protos.live(proto).jit.code_at(pc).is_some() => match self.jit_resume_compiled(proto, pc) {
                 Some(entry) => entry,
                 None => return Ok(false),
             },
@@ -214,7 +216,7 @@ impl Vm {
         if tracing {
             return None;
         }
-        if function.jit.code().is_some() {
+        if function.jit.code_at(pc).is_some() {
             return self.jit_resume_compiled(proto, pc);
         }
         if let Some(tier) = forced {
@@ -224,11 +226,11 @@ impl Vm {
                 self.jit_watch_loop(proto, pc);
                 return None;
             }
-            return self.jit_compile_entry(proto, tier);
+            return self.jit_compile_entry(proto, tier, pc);
         }
         if function.jit.prepared {
             function.jit.prepared = false;
-            return self.jit_compile_entry(proto, Tier::Baseline);
+            return self.jit_compile_entry(proto, Tier::Baseline, pc);
         }
         if !function.jit.primed {
             function.jit.primed = true;
@@ -262,7 +264,7 @@ impl Vm {
             self.jit_trace(proto, "baseline declined");
             return None;
         }
-        self.jit_compile_entry(proto, Tier::Baseline)
+        self.jit_compile_entry(proto, Tier::Baseline, pc)
     }
 
     /// A prototype waiting inside its own body is one long activation, which calls do not count toward feedback, so it gets feedback now.
@@ -292,13 +294,13 @@ impl Vm {
         self.requests.fetch_or(crate::session::LOOP_CHARGE, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn jit_compile_entry(&mut self, proto: Ref<Proto>, tier: Tier) -> Option<CompiledEntry> {
+    fn jit_compile_entry(&mut self, proto: Ref<Proto>, tier: Tier, pc: usize) -> Option<CompiledEntry> {
         if !self.jit_compile(proto, tier) {
             return None;
         }
         let function = self.heap.protos.live(proto);
         Some(CompiledEntry {
-            code: function.jit.code()?,
+            code: function.jit.code_at(pc)?,
             constants: function.constants.as_ptr(),
         })
     }
@@ -381,7 +383,7 @@ impl Vm {
             if !matches!(instruction, Instruction::SetField { .. }) {
                 continue;
             }
-            for entry in crate::jit::compile::add_entries(function, pc) {
+            for entry in crate::jit::sites::add_entries(function, pc) {
                 if !function.jit.shapes.contains(&entry.next) && !added.contains(&entry.next) {
                     added.push(entry.next);
                 }
@@ -430,9 +432,14 @@ impl Vm {
 
     /// A prototype that already runs in Baseline keeps it when this fails.
     fn jit_compile_peak(&mut self, proto: Ref<Proto>) -> bool {
-        if self.heap.protos.live(proto).jit.unit.is_some() {
+        let limit = self.options.jit_policy.recompile_limit;
+        let function = self.heap.protos.live(proto);
+        if function.jit.unit.is_some() {
             self.jit_reveal(proto);
             return true;
+        }
+        if function.jit.deopts > limit.max(1) {
+            return false;
         }
         let budget = self.jit_code_budget();
         if self.jit.compiler.is_none() {
@@ -440,36 +447,133 @@ impl Vm {
         }
         let layout = *self.jit.layout.get_or_insert_with(crate::jit::TableLayout::probe);
         let frames = *self.jit.frames.get_or_insert_with(crate::jit::FrameLayout::probe);
+        let calls = self.jit_call_targets(proto);
+        let has_baseline = self.heap.protos.live(proto).jit.baseline.is_some();
+        self.jit_trace_sites(proto);
+        let avoid = self.heap.protos.live(proto).jit.avoid.clone();
+        let observed = self.heap.protos.live(proto).jit.observed.clone();
+        let dump = self.options.jit_trace;
+        let facts_stress = self.options.jit_stress;
+        let heap = &self.heap;
+        let interned = |constant: Value| matches!(constant, Value::String(string) if heap.key_view().is_interned(string));
+        let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
         let facts = crate::jit::CompileFacts {
             layout,
             frames,
-            calls: self.jit_call_targets(proto),
+            calls,
             call_depth_limit: JIT_CALL_DEPTH,
-            interned: self.jit_interned_constants(proto),
-            inline_caches: !self.options.jit_stress.inline_caches_off,
+            inline_caches: !facts_stress.inline_caches_off,
+            avoid: &avoid,
+            float_guess: self.heap.protos.live(proto).jit.float_guess,
+            observed: &observed,
+            interned: &interned,
+            proto_of: &proto_of,
+            stress_exits: facts_stress.exit_every != 0,
+            require_payoff: self.options.jit_policy.peak.estimate_payoff && self.jit_forced().is_none(),
         };
-        let has_baseline = self.heap.protos.live(proto).jit.baseline.is_some();
-        self.jit_trace_sites(proto);
-        let compiled = match self.jit.compiler.as_deref_mut() {
-            Some(compiler) => crate::jit::compile(compiler, budget, self.heap.protos.live(proto), &facts).ok(),
-            None => None,
-        };
-        let Some(unit) = compiled else {
-            if has_baseline {
-                self.jit_trace(proto, "peak compile failed");
-                return false;
+        let compiled = self.jit.compiler.as_deref_mut().map(|compiler| crate::jit::compile(compiler, budget, heap.protos.live(proto), &facts, dump));
+        let (unit, text) = match compiled {
+            Some(Ok(compiled)) => compiled,
+            failure => {
+                if let Some(Err(error)) = failure
+                    && self.options.jit_trace
+                {
+                    let line = format!("[jit] peak error: {error:?}\n");
+                    self.write_error(line.as_bytes());
+                }
+                if has_baseline {
+                    self.jit_trace(proto, "peak compile failed");
+                    return false;
+                }
+                return self.jit_compile_failed(proto);
             }
-            return self.jit_compile_failed(proto);
         };
+        if let Some(text) = text {
+            self.jit_trace(proto, "ir");
+            self.write_error(text.as_bytes());
+        }
         let function = self.heap.protos.live_mut(proto);
         if function.exec.feedback.is_empty() {
             function.exec.feedback = vec![super::InlineCache::Uninitialized; function.code.len()];
         }
-        function.jit.tier_budget().set(i64::MAX);
+        function.jit.tier_budget().set(0);
         function.jit.unit = Some(Box::new(unit));
         self.jit_reveal(proto);
         self.jit_trace(proto, "peak");
         true
+    }
+
+    /// Follows V8's `Deoptimizer::DoComputeOutputFrames` (src/deoptimizer/deoptimizer.cc): the compiled code has
+    /// written the frame state's registers back, so this pushes one interpreter frame per inlined call, outer first,
+    /// and resumes the innermost at the deoptimizing pc. The unit is retired and the site recompiles without the failed
+    /// speculation, as V8 discards optimized code on an eager deopt.
+    pub(crate) fn jit_deopt(&mut self, ctx: &mut JitCtx, point: &crate::jit::ssa::DeoptPoint) -> i64 {
+        self.jit_push_inlined_frames(ctx, point);
+        let proto = ctx.proto;
+        let forced = self.jit_forced().is_some();
+        let policy = self.options.jit_policy;
+        let divisor = self.options.jit_stress.threshold_divisor;
+        if self.options.jit_trace {
+            self.jit_trace(proto, &format!("deoptimize peak at pc {}", point.site));
+        }
+        let kinds = point.frames.is_empty().then(|| self.jit_observed_kinds(ctx, proto, point.site)).flatten();
+        let function = self.heap.protos.live_mut(proto);
+        function.jit.float_guess |= kinds.is_some_and(|kinds| kinds & KIND_FLOAT != 0);
+        let repeated = function.jit.avoid.contains(&point.site);
+        let learned = kinds.is_some_and(|kinds| learn_kinds(&mut function.jit.observed, point.site, kinds));
+        function.jit.deopts += 1;
+        if !repeated && !learned {
+            function.jit.avoid.push(point.site);
+        }
+        if let Some(unit) = function.jit.unit.take() {
+            function.jit.retired_peak.push(*unit);
+        }
+        let full = policy.peak.budget(function.code.len(), divisor);
+        let wait = if repeated { crate::JitPolicy::backed_off(full, function.jit.deopts) } else { policy.peak.budget(0, divisor) };
+        function.jit.tier_budget().set(wait);
+        self.jit_reveal(proto);
+        if forced {
+            self.jit_compile_peak(proto);
+        }
+        -EXIT_RELOAD
+    }
+
+    /// The kinds the site's registers hold now that the deoptimized frame has them back, as V8 updates feedback from
+    /// the values an eager deopt sees.
+    fn jit_observed_kinds(&self, ctx: &JitCtx, proto: Ref<Proto>, site: u32) -> Option<u8> {
+        let instruction = *self.heap.protos.live(proto).code.get(site as usize)?;
+        let (first, second) = numeric_registers(instruction)?;
+        let kind = |register: u8| match self.stack_get(ctx.base + usize::from(register)) {
+            Value::Integer(_) => KIND_INT,
+            Value::Float(_) => KIND_FLOAT,
+            _ => KIND_OTHER,
+        };
+        Some(kind(first) | second.map_or(0, kind))
+    }
+
+    fn jit_push_inlined_frames(&mut self, ctx: &JitCtx, point: &crate::jit::ssa::DeoptPoint) {
+        let Some(first) = point.frames.first() else {
+            self.save_pc(point.pc as usize);
+            return;
+        };
+        self.save_pc(first.caller_pc as usize);
+        for (index, frame) in point.frames.iter().enumerate() {
+            let base = ctx.base + frame.base as usize;
+            let Value::Closure(closure) = self.stack_get(base - 1) else {
+                unreachable!("an inlined call's function slot holds the closure its guard checked");
+            };
+            let pc = point.frames.get(index + 1).map_or(point.pc, |next| next.caller_pc);
+            let mut lua = crate::object::LuaFrame::called(closure, base, frame.wanted, 0);
+            lua.set_pc(pc as usize);
+            self.thread_mut().frames.push(crate::object::Frame::Lua(lua));
+        }
+    }
+
+    pub(crate) fn jit_set_closure_upvalue(&mut self, closure: Ref<Closure>, index: u8, value: Value) {
+        let captured = self.heap.closures.live(closure).upvalues[usize::from(index)];
+        if super::window::upvalue_write(self, captured.cell, value) && value.is_collectable() {
+            self.heap.closed_upvalue_barrier(captured.reference, value);
+        }
     }
 
     /// A prototype whose estimated gain pays a Peak compile compiles now, as V8's on-stack replacement does at a loop; one the estimate declines waits for a budget that doubles with each decline.
@@ -479,16 +583,23 @@ impl Vm {
         let divisor = self.options.jit_stress.threshold_divisor;
         let function = self.heap.protos.live(proto);
         function.jit.tier_budget().set(i64::MAX);
-        if self.tracing || function.jit.failed || function.jit.never || function.jit.unit.is_some() {
+        if self.tracing || function.jit.failed || function.jit.never {
+            return pc as i64;
+        }
+        if let Some(unit) = &function.jit.unit {
+            if unit.enters_at(pc) {
+                self.save_pc(pc);
+                return -EXIT_RELOAD;
+            }
+            function.jit.tier_budget().set(i64::from(crate::jit::ENTRY_CHARGE) * 128);
             return pc as i64;
         }
         let stale = function.jit.feedback_changes != function.jit.compiled_changes && function.jit.recompiles < policy.recompile_limit;
         if stale {
             return self.jit_recompile_at(proto, pc, true);
         }
-        let prepared = std::mem::take(&mut self.heap.protos.live_mut(proto).jit.prepared);
-        let function = self.heap.protos.live(proto);
-        let declined = self.jit_ceiling() != Tier::Peak || (!prepared && policy.peak.estimate_payoff && crate::jit::payoff(function, policy.peak) <= 0);
+        self.heap.protos.live_mut(proto).jit.prepared = false;
+        let declined = self.jit_ceiling() != Tier::Peak;
         if declined {
             self.jit_trace(proto, "peak declined");
             let function = self.heap.protos.live_mut(proto);
@@ -607,7 +718,7 @@ impl Vm {
         }
         let function = self.heap.protos.live(proto);
         Some(CompiledEntry {
-            code: function.jit.code()?,
+            code: function.jit.code_at(pc)?,
             constants: function.constants.as_ptr(),
         })
     }
@@ -1559,4 +1670,38 @@ fn trace_source(chunkname: &[u8]) -> &[u8] {
         Some(b'@' | b'=') => &chunkname[1..],
         _ => chunkname,
     }
+}
+
+/// True when the kinds are one number kind the site had not seen, so a recompile guesses it there instead of giving up the site.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn learn_kinds(observed: &mut Vec<(u32, u8)>, site: u32, kinds: u8) -> bool {
+    let uniform = kinds == KIND_INT || kinds == KIND_FLOAT;
+    match observed.iter_mut().find(|(known, _)| *known == site) {
+        Some((_, known)) if *known == kinds || !uniform => false,
+        Some((_, known)) => {
+            *known |= kinds;
+            *known == KIND_INT || *known == KIND_FLOAT
+        }
+        None if uniform => {
+            observed.push((site, kinds));
+            true
+        }
+        None => false,
+    }
+}
+
+/// The registers a numeric instruction reads; constants and immediates have a known kind.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn numeric_registers(instruction: crate::instruction::Instruction) -> Option<(u8, Option<u8>)> {
+    use crate::instruction::Instruction as I;
+    Some(match instruction {
+        I::Add { b, c, .. } | I::Sub { b, c, .. } | I::Mul { b, c, .. } | I::Mod { b, c, .. } | I::Pow { b, c, .. } | I::Div { b, c, .. }
+        | I::IDiv { b, c, .. } | I::BAnd { b, c, .. } | I::BOr { b, c, .. } | I::BXor { b, c, .. } | I::Shl { b, c, .. } | I::Shr { b, c, .. } => (b, Some(c)),
+        I::AddI { b, .. } | I::AddK { b, .. } | I::SubK { b, .. } | I::MulK { b, .. } | I::ModK { b, .. } | I::PowK { b, .. } | I::DivK { b, .. }
+        | I::IDivK { b, .. } | I::BAndK { b, .. } | I::BOrK { b, .. } | I::BXorK { b, .. } | I::ShrI { b, .. } | I::ShlI { b, .. } | I::Unm { b, .. }
+        | I::BNot { b, .. } => (b, None),
+        I::Eq { a, b, .. } | I::Lt { a, b, .. } | I::Le { a, b, .. } => (a, Some(b)),
+        I::LtI { a, .. } | I::LeI { a, .. } | I::GtI { a, .. } | I::GeI { a, .. } => (a, None),
+        _ => return None,
+    })
 }

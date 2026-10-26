@@ -8,7 +8,7 @@ mod event;
 mod exec;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use exec::Direct;
-mod fast;
+pub(crate) mod fast;
 mod hooks;
 pub(crate) mod ic;
 
@@ -49,6 +49,8 @@ pub(crate) use errors::RunScope;
 pub(crate) use hooks::{mask_from_text, mask_text};
 pub(crate) use builtin::{Builtin, TYPE_NAMES};
 pub(crate) use event::{Event, Field, MODE_ABSENCE_BIT};
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use quick::int_loop_count;
 pub(crate) use inspect::{Activation, ClosureFacts};
 pub(crate) use ops::table_address;
 pub(crate) use meta::{IndexStep, SetStep};

@@ -1,13 +1,14 @@
-local x, y = 1, true
+local y = true
 for i = 1, 200000 do
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
-    x = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
+    y = not y
 end
+print(y)

@@ -496,17 +496,25 @@ fn compiled_ir_size(statements: usize) -> usize {
     };
     let proto = vm.heap.closures.live(closure).proto;
     let budget = crate::jit::CodeBudget::new(64 * 1024 * 1024);
+    let heap = &vm.heap;
+    let interned = |_: crate::Value| false;
+    let proto_of = |reference: crate::arena::Ref<crate::proto::Proto>| heap.protos.try_get(reference);
     let facts = crate::jit::CompileFacts {
         layout: crate::jit::TableLayout::probe(),
         frames: crate::jit::FrameLayout::probe(),
         calls: Vec::new(),
         call_depth_limit: 0,
-        interned: Vec::new(),
         inline_caches: true,
+        avoid: &[],
+        float_guess: false,
+        observed: &[],
+        interned: &interned,
+        proto_of: &proto_of,
+        stress_exits: false,
+        require_payoff: false,
     };
-    crate::jit::compile(&mut compiler(), budget, vm.heap.protos.live(proto), &facts)
-        .expect("the chunk compiles")
-        .ir_insts()
+    let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
+    unit.unit.ir_insts()
 }
 
 #[test]

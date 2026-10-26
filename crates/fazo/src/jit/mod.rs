@@ -13,6 +13,11 @@ pub(crate) mod baseline;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) mod compile;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) mod sites;
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[expect(unsafe_code, reason = "Peak code reaches the VM and its deoptimization points through raw pointers")]
+pub(crate) mod ssa;
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[expect(unsafe_code, reason = "a compiled frame records its error through the slot its context names")]
 mod ctx;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -55,7 +60,9 @@ pub(crate) use memory::CodeBudget;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use unit::{Compiler, JitUnit};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use compile::{CallTarget, CompileFacts, calls_out, compile, payoff};
+pub(crate) use compile::{CompileFacts, compile};
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use sites::{CallTarget, calls_out, payoff};
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) mod jit_operand {
@@ -282,7 +289,15 @@ pub(crate) struct ProtoJit {
     pub(crate) declines: u32,
     pub(crate) set_asides: u32,
     pub(crate) settled: bool,
-    pub(crate) unit: Option<Box<JitUnit>>,
+    pub(crate) unit: Option<Box<ssa::PeakUnit>>,
+    /// Peak units replaced after a deoptimization, kept mapped for the frames that may still run them.
+    pub(crate) retired_peak: Vec<ssa::PeakUnit>,
+    /// Sites whose speculation failed; a recompile runs them through the interpreter's helpers.
+    pub(crate) avoid: Vec<u32>,
+    pub(crate) deopts: u32,
+    pub(crate) float_guess: bool,
+    /// Number kinds a numeric site's registers held when its guess failed, as `ssa::ir::KIND_*` bits.
+    pub(crate) observed: Vec<(u32, u8)>,
     /// Kept alive while the prototype lives, so compiled code never names a released shape.
     pub(crate) shapes: Vec<crate::arena::Ref<crate::shape::Shape>>,
 }
@@ -302,13 +317,18 @@ impl ProtoJit {
     }
 
     pub(crate) fn code(&self) -> Option<*const u8> {
+        self.code_at(0)
+    }
+
+    /// Peak code is entered only at the first instruction and at loop headers; anywhere else Baseline runs the frame.
+    pub(crate) fn code_at(&self, pc: usize) -> Option<*const u8> {
         if self.failed || self.hidden {
             return None;
         }
         match (&self.unit, &self.baseline) {
-            (Some(unit), _) => Some(unit.entry()),
-            (None, Some(baseline)) => Some(baseline.entry()),
-            (None, None) => None,
+            (Some(unit), _) if unit.enters_at(pc) => Some(unit.entry()),
+            (_, Some(baseline)) => Some(baseline.entry()),
+            _ => None,
         }
     }
 

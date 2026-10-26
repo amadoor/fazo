@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(super) fn arith(op: ArithOp, left: Value, right: Value) -> Option<Value> {
+pub(crate) fn arith(op: ArithOp, left: Value, right: Value) -> Option<Value> {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => integer(op, a, b),
         (Value::Float(a), Value::Float(b)) if !is_bitwise(op) => Some(Value::Float(number::float_arith(op, a, b))),
@@ -23,7 +23,7 @@ fn mixed(op: ArithOp, left: Value, right: Value) -> Option<Value> {
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(super) fn unary(op: UnaryOp, value: Value) -> Option<Value> {
+pub(crate) fn unary(op: UnaryOp, value: Value) -> Option<Value> {
     match (op, value) {
         (UnaryOp::Minus, Value::Integer(integer)) => Some(Value::Integer(integer.wrapping_neg())),
         (UnaryOp::Minus, Value::Float(float)) => Some(Value::Float(-float)),
@@ -33,7 +33,7 @@ pub(super) fn unary(op: UnaryOp, value: Value) -> Option<Value> {
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(super) fn equal(left: Value, right: Value) -> Option<bool> {
+pub(crate) fn equal(left: Value, right: Value) -> Option<bool> {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => Some(a == b),
         (Value::Float(a), Value::Float(b)) => Some(a == b),
@@ -45,7 +45,7 @@ pub(super) fn equal(left: Value, right: Value) -> Option<bool> {
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(super) fn less_than(left: Value, right: Value) -> Option<bool> {
+pub(crate) fn less_than(left: Value, right: Value) -> Option<bool> {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => Some(a < b),
         (Value::Float(a), Value::Float(b)) => Some(a < b),
@@ -56,7 +56,7 @@ pub(super) fn less_than(left: Value, right: Value) -> Option<bool> {
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(super) fn less_equal(left: Value, right: Value) -> Option<bool> {
+pub(crate) fn less_equal(left: Value, right: Value) -> Option<bool> {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => Some(a <= b),
         (Value::Float(a), Value::Float(b)) => Some(a <= b),

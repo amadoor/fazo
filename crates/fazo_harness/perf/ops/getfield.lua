@@ -1,13 +1,14 @@
-local x; local t = {a = 1, b = 2}
+local t = {a = 1, b = 2}; t.a = t; local x = t
 for i = 1, 200000 do
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
-    x = t.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
+    x = x.a
 end
+print(x == t)

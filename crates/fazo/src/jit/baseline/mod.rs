@@ -89,7 +89,7 @@ fn host_frame() -> Frame {
 
 impl Library {
     pub(crate) fn new(table: Option<TableLayout>, frames: Option<FrameLayout>, depth_limit: u32) -> Self {
-        let fast = super::compile::fast_symbols().map(|(_, address)| address as u64);
+        let fast = super::sites::fast_symbols().map(|(_, address)| address as u64);
         let helpers = HelperAddresses {
             step: helpers::step as extern "C" fn(*mut JitCtx, u32) -> i64 as usize as u64,
             safe_point: helpers::safe_point as extern "C" fn(*mut JitCtx, u32) -> i64 as usize as u64,

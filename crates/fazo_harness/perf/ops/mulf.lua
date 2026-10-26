@@ -1,13 +1,14 @@
-local x, y, z = 1.5, 2.5, 3.5
+local x, z = 1.5, 0.9999999
 for i = 1, 200000 do
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
-    x = y * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
+    x = x * z
 end
+print(x)

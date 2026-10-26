@@ -416,7 +416,7 @@ fn call_enter(m: &mut dyn Masm, env: &Env, callee: Callee) {
     m.arg_reg(0, Reg::Ctx);
     m.arg_imm(1, reg(slot::PC));
     m.arg_imm(4, fixed(0));
-    m.call(env.helpers.fast[crate::jit::compile::FAST_AFTER_CALL]);
+    m.call(env.helpers.fast[crate::jit::sites::FAST_AFTER_CALL]);
     m.load(Width::U64, Reg::Base, Reg::Ctx, context(offset_of!(JitCtx, registers)));
     m.mov_imm(Reg::T1, reg(slot::I));
     m.cmp(Reg::Ret, Reg::T1);

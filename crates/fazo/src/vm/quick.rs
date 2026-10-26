@@ -54,7 +54,7 @@ fn float_iterations(start: f64, limit: f64, step: f64) -> u64 {
     if iterations >= 1.0 { iterations as u64 } else { 0 }
 }
 
-pub(super) fn int_loop_count(start: i64, last: i64, increment: i64) -> u64 {
+pub(crate) fn int_loop_count(start: i64, last: i64, increment: i64) -> u64 {
     if increment > 0 {
         let mut count = (last as u64).wrapping_sub(start as u64);
         if increment != 1 {

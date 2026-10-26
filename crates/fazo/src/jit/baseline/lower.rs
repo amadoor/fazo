@@ -9,7 +9,7 @@ use super::{
 use crate::{
     instruction::{ArithOp, Instruction},
     jit::{
-        compile::{
+        sites::{
             FAST_ARITH, FAST_CALL, FAST_FOR_PREP, FAST_GET_FIELD, FAST_GET_INT, FAST_GET_SELF, FAST_GET_TABLE, FAST_GET_TABUP,
             FAST_CLOSE, FAST_CLOSURE, FAST_GET_UPVAL, FAST_SET_LIST, FAST_NEW_TABLE, FAST_RETURN, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
             CallTarget, FAST_TABLE_BARRIER, FAST_TAIL_CALL, add_entries, all_method_entries, field_entries,

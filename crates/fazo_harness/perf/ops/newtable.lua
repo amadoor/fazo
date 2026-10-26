@@ -11,3 +11,4 @@ for i = 1, 200000 do
     x = {}
     x = {}
 end
+print(type(x))

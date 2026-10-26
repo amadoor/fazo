@@ -1,13 +1,14 @@
-local x, y = 1, 2
+local x = 1
 for i = 1, 200000 do
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
-    x = y + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
+    x = x + i
 end
+print(x)

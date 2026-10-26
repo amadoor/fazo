@@ -1,13 +1,14 @@
-local x; local function f(...) return ... end
+local x = 1; local function f(...) return ... end
 for i = 1, 200000 do
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
-    x = f(i)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
+    x = f(x)
 end
+print(x)

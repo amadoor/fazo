@@ -11,3 +11,4 @@ for i = 1, 200000 do
     x = y
     x = y
 end
+print(x)
