@@ -4,6 +4,11 @@ use std::{
     env, fs,
     path::Path,
     process::{Command, Output},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
 };
 
 use crate::{reference, report};
@@ -24,6 +29,7 @@ const LUAJIT_REPOSITORY: &str = "https://github.com/LuaJIT/LuaJIT.git";
 const LUAJIT_DIR_VARIABLE: &str = "FAZO_LUAJIT_DIR";
 const LUAJIT_JIT_OFF: &[&str] = &["-joff"];
 const LUAJIT_SUFFIX: &str = ".luajit.lua";
+const PARALLEL_RUNS: usize = 4;
 const COMPILE_STATEMENTS: u32 = 500;
 const COMPILE_CALLS: u32 = 200;
 /// `aaa = aaa + 1` is GETTABUP, ADDI, MMBINI and SETTABUP in Lua 5.5, and GGET, ADDVN and GSET in LuaJIT (`luajit -bl`).
@@ -167,10 +173,17 @@ pub fn run() -> Result<(), String> {
     let operations_dir = scripts.join(OPERATIONS_DIR);
     let budgets = read_budgets(&operations_dir)?;
     check_every_statement_budgeted(&operations_dir, &budgets)?;
+    check_outputs(&interpreters, &scripts)?;
 
-    let measurements = measure_workloads(&interpreters, &out_dir, &scripts)?;
-    let operations = measure_operations(&interpreters, &out_dir, &operations_dir, &budgets)?;
-    let compile_cost = measure_compile_cost(&interpreters, &out_dir)?;
+    let mut plan = Plan::default();
+    plan_workloads(&mut plan, &interpreters, &scripts);
+    plan_operations(&mut plan, &interpreters, &operations_dir, &budgets);
+    plan_compile_cost(&mut plan, &interpreters, &out_dir)?;
+    let samples = plan.run(&out_dir)?;
+
+    let measurements = workload_measurements(&samples)?;
+    let operations = operation_measurements(&samples, &budgets)?;
+    let compile_cost = compile_cost(&samples)?;
     let path = report::update(|board| {
         record(board, &measurements, &operations);
         board.compile_cost = Some(compile_cost);
@@ -190,16 +203,117 @@ pub fn run() -> Result<(), String> {
     Err(failures.join("\n"))
 }
 
-fn measure_workloads(interpreters: &Interpreters, out_dir: &Path, scripts: &Path) -> Result<Vec<Measurement>, String> {
-    let empty_script = scripts.join(EMPTY_SCRIPT);
-    let empty_inputs = Scripts {
-        fazo: &empty_script,
-        luajit: Some(&empty_script),
-        arguments: &[],
-    };
-    let empty = Counts::measure(interpreters, out_dir, "empty", &empty_inputs)?;
+#[derive(Clone, Copy)]
+enum Probe {
+    Total,
+    Inside(&'static [&'static str]),
+    Split,
+}
 
-    let mut measurements = Vec::with_capacity(WORKLOADS.len());
+struct Request {
+    label: String,
+    program: String,
+    args: Vec<String>,
+    probe: Probe,
+}
+
+#[derive(Clone, Copy)]
+struct FazoSplit {
+    total: f64,
+    compile: f64,
+    before_optimized: f64,
+}
+
+#[derive(Clone, Copy)]
+enum Sample {
+    Total(f64),
+    Split(FazoSplit),
+}
+
+#[derive(Default)]
+struct Plan {
+    requests: Vec<Request>,
+}
+
+struct Samples {
+    by_label: BTreeMap<String, Sample>,
+}
+
+type Slot = Option<Result<Sample, String>>;
+
+impl Plan {
+    fn add(&mut self, label: String, program: &str, args: Vec<String>, probe: Probe) {
+        self.requests.push(Request {
+            label,
+            program: program.to_owned(),
+            args,
+            probe,
+        });
+    }
+
+    /// Ir counts do not depend on load, so the runs go in parallel, at most `PARALLEL_RUNS` at once for the machine's thermal limit.
+    fn run(self, out_dir: &Path) -> Result<Samples, String> {
+        let next = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Slot>> = Mutex::new((0..self.requests.len()).map(|_| None).collect());
+        let requests = &self.requests;
+
+        thread::scope(|scope| {
+            for _ in 0..PARALLEL_RUNS {
+                scope.spawn(|| run_requests(requests, &next, &slots, out_dir));
+            }
+        });
+
+        let slots = slots.into_inner().map_err(|_| "a perf run panicked".to_owned())?;
+        let mut by_label = BTreeMap::new();
+        for (request, slot) in self.requests.into_iter().zip(slots) {
+            let sample = slot.ok_or_else(|| format!("{} did not run", request.label))??;
+            by_label.insert(request.label, sample);
+        }
+        Ok(Samples { by_label })
+    }
+}
+
+fn run_requests(requests: &[Request], next: &AtomicUsize, slots: &Mutex<Vec<Slot>>, out_dir: &Path) {
+    loop {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        let Some(request) = requests.get(index) else {
+            return;
+        };
+        let sample = request.sample(out_dir);
+        if let Ok(mut slots) = slots.lock() {
+            slots[index] = Some(sample);
+        }
+    }
+}
+
+impl Request {
+    fn sample(&self, out_dir: &Path) -> Result<Sample, String> {
+        match self.probe {
+            Probe::Total => measure(&self.program, &self.args, out_dir, &self.label).map(Sample::Total),
+            Probe::Inside(symbols) => inside(&self.program, &self.args, symbols, out_dir, &self.label).map(Sample::Total),
+            Probe::Split => split(&self.program, &self.args, out_dir, &self.label).map(Sample::Split),
+        }
+    }
+}
+
+impl Samples {
+    fn total(&self, label: &str) -> Result<f64, String> {
+        match self.by_label.get(label) {
+            Some(Sample::Total(value)) => Ok(*value),
+            Some(Sample::Split(split)) => Ok(split.total),
+            None => Err(format!("no measurement for {label}")),
+        }
+    }
+
+    fn split(&self, label: &str) -> Result<FazoSplit, String> {
+        match self.by_label.get(label) {
+            Some(Sample::Split(split)) => Ok(*split),
+            _ => Err(format!("no split measurement for {label}")),
+        }
+    }
+}
+
+fn check_outputs(interpreters: &Interpreters, scripts: &Path) -> Result<(), String> {
     for workload in WORKLOADS {
         let script = scripts.join(workload.script);
         let luajit_script = workload.luajit_script().map(|name| scripts.join(name));
@@ -209,40 +323,95 @@ fn measure_workloads(interpreters: &Interpreters, out_dir: &Path, scripts: &Path
             arguments: workload.arguments,
         };
         check_same_output(interpreters, workload.name, &inputs)?;
-        let counts = Counts::measure(interpreters, out_dir, &slug(workload.name), &inputs)?;
-        measurements.push(Measurement {
-            workload,
-            counts: counts.minus(&empty),
-        });
     }
-    Ok(measurements)
+    Ok(())
+}
+
+fn plan_workloads(plan: &mut Plan, interpreters: &Interpreters, scripts: &Path) {
+    let empty_script = scripts.join(EMPTY_SCRIPT);
+    let empty = Scripts {
+        fazo: &empty_script,
+        luajit: Some(&empty_script),
+        arguments: &[],
+    };
+
+    plan_counts(plan, interpreters, "empty", &empty);
+    for workload in WORKLOADS {
+        let script = scripts.join(workload.script);
+        let luajit_script = workload.luajit_script().map(|name| scripts.join(name));
+        let inputs = Scripts {
+            fazo: &script,
+            luajit: luajit_script.as_deref(),
+            arguments: workload.arguments,
+        };
+        plan_counts(plan, interpreters, &slug(workload.name), &inputs);
+    }
+}
+
+const WORKLOAD_RUNS: [(&str, &[&str]); 5] = [
+    ("puc", &[]),
+    ("baseline", BASELINE_ONLY),
+    ("optimizing", OPTIMIZING_ONLY),
+    ("peak", PEAK_ONLY),
+    ("interpreter", INTERPRETER_ONLY),
+];
+
+fn plan_counts(plan: &mut Plan, interpreters: &Interpreters, label: &str, scripts: &Scripts) {
+    let script = scripts.fazo;
+
+    plan.add(format!("fazo-{label}"), &interpreters.fazo, arguments_for(&[], script, scripts.arguments), Probe::Split);
+    for (kind, options) in WORKLOAD_RUNS {
+        let program = if kind == "puc" { &interpreters.puc } else { &interpreters.fazo };
+        plan.add(format!("{kind}-{label}"), program, arguments_for(options, script, scripts.arguments), Probe::Total);
+    }
+    let Some(luajit) = scripts.luajit else {
+        return;
+    };
+    plan.add(format!("luajit-{label}"), &interpreters.luajit, arguments_for(&[], luajit, scripts.arguments), Probe::Total);
+    plan.add(
+        format!("luajit-interpreter-{label}"),
+        &interpreters.luajit,
+        arguments_for(LUAJIT_JIT_OFF, luajit, scripts.arguments),
+        Probe::Total,
+    );
+}
+
+fn workload_measurements(samples: &Samples) -> Result<Vec<Measurement>, String> {
+    let empty = Counts::read(samples, "empty", true)?;
+    WORKLOADS
+        .iter()
+        .map(|workload| {
+            let counts = Counts::read(samples, &slug(workload.name), workload.luajit_script().is_some())?;
+            Ok(Measurement {
+                workload,
+                counts: counts.minus(&empty),
+            })
+        })
+        .collect()
 }
 
 impl Counts {
-    fn measure(interpreters: &Interpreters, out_dir: &Path, label: &str, scripts: &Scripts) -> Result<Self, String> {
-        let run = |program: &str, options: &[&str], kind: &str, script: &Path| {
-            measure(program, options, out_dir, &format!("{kind}-{label}"), script, scripts.arguments)
-        };
-        let script = scripts.fazo;
-        let luajit = scripts
-            .luajit
-            .map(|script| -> Result<LuajitCounts, String> {
-                Ok(LuajitCounts {
-                    jit: run(&interpreters.luajit, &[], "luajit", script)?,
-                    interpreter: run(&interpreters.luajit, LUAJIT_JIT_OFF, "luajit-interpreter", script)?,
-                })
+    fn read(samples: &Samples, label: &str, has_luajit: bool) -> Result<Self, String> {
+        let total = |kind: &str| samples.total(&format!("{kind}-{label}"));
+        let split = samples.split(&format!("fazo-{label}"))?;
+        let luajit = if has_luajit {
+            Some(LuajitCounts {
+                jit: total("luajit")?,
+                interpreter: total("luajit-interpreter")?,
             })
-            .transpose()?;
+        } else {
+            None
+        };
 
         Ok(Self {
-            puc: run(&interpreters.puc, &[], "puc", script)?,
-            fazo: run(&interpreters.fazo, &[], "fazo", script)?,
-            baseline: run(&interpreters.fazo, BASELINE_ONLY, "baseline", script)?,
-            optimizing: run(&interpreters.fazo, OPTIMIZING_ONLY, "optimizing", script)?,
-            peak: run(&interpreters.fazo, PEAK_ONLY, "peak", script)?,
-            interpreter: run(&interpreters.fazo, INTERPRETER_ONLY, "interpreter", script)?,
-            compile: inside(&interpreters.fazo, &[], ALL_COMPILE_SYMBOLS, (out_dir, &format!("compile-{label}")), (script, scripts.arguments))?,
-            before_optimized: before_first(&interpreters.fazo, (out_dir, &format!("before-{label}")), (script, scripts.arguments))?,
+            puc: total("puc")?,
+            fazo: split.total,
+            baseline: total("baseline")?,
+            optimizing: total("optimizing")?,
+            peak: total("peak")?,
+            interpreter: total("interpreter")?,
+            compile: split.compile,
+            before_optimized: split.before_optimized,
             luajit,
         })
     }
@@ -492,36 +661,53 @@ fn check_every_statement_budgeted(dir: &Path, budgets: &[Budget]) -> Result<(), 
     Ok(())
 }
 
-fn measure_operations<'a>(
-    interpreters: &Interpreters,
-    out_dir: &Path,
-    dir: &Path,
-    budgets: &'a [Budget],
-) -> Result<Vec<Operation<'a>>, String> {
-    let empty = OperationCounts::measure(interpreters, out_dir, "op-empty", &dir.join(EMPTY_SCRIPT))?;
+const OPERATION_RUNS: [(&str, &[&str]); 5] = [
+    ("puc", &[]),
+    ("interpreter", INTERPRETER_ONLY),
+    ("baseline", BASELINE_ONLY),
+    ("optimizing", OPTIMIZING_ONLY),
+    ("peak", PEAK_ONLY),
+];
 
-    let mut operations = Vec::with_capacity(budgets.len());
+fn plan_operations(plan: &mut Plan, interpreters: &Interpreters, dir: &Path, budgets: &[Budget]) {
+    plan_operation(plan, interpreters, "op-empty", &dir.join(EMPTY_SCRIPT));
     for budget in budgets {
-        let script = dir.join(format!("{}.lua", budget.name));
-        let counts = OperationCounts::measure(interpreters, out_dir, &format!("op-{}", budget.name), &script)?;
-        operations.push(Operation {
-            budget,
-            counts: counts.per_operation(&empty),
-        });
+        plan_operation(plan, interpreters, &format!("op-{}", budget.name), &dir.join(format!("{}.lua", budget.name)));
     }
-    Ok(operations)
+}
+
+fn plan_operation(plan: &mut Plan, interpreters: &Interpreters, label: &str, script: &Path) {
+    for (kind, options) in OPERATION_RUNS {
+        let program = if kind == "puc" { &interpreters.puc } else { &interpreters.fazo };
+        plan.add(format!("{kind}-{label}"), program, arguments_for(options, script, &[]), Probe::Total);
+    }
+    plan.add(format!("luajit-{label}"), &interpreters.luajit, arguments_for(&[], script, &[]), Probe::Total);
+}
+
+fn operation_measurements<'a>(samples: &Samples, budgets: &'a [Budget]) -> Result<Vec<Operation<'a>>, String> {
+    let empty = OperationCounts::read(samples, "op-empty")?;
+    budgets
+        .iter()
+        .map(|budget| {
+            let counts = OperationCounts::read(samples, &format!("op-{}", budget.name))?;
+            Ok(Operation {
+                budget,
+                counts: counts.per_operation(&empty),
+            })
+        })
+        .collect()
 }
 
 impl OperationCounts {
-    fn measure(interpreters: &Interpreters, out_dir: &Path, label: &str, script: &Path) -> Result<Self, String> {
-        let run = |program: &str, options: &[&str], kind: &str| measure(program, options, out_dir, &format!("{kind}-{label}"), script, &[]);
+    fn read(samples: &Samples, label: &str) -> Result<Self, String> {
+        let total = |kind: &str| samples.total(&format!("{kind}-{label}"));
         Ok(Self {
-            puc: run(&interpreters.puc, &[], "puc")?,
-            interpreter: run(&interpreters.fazo, INTERPRETER_ONLY, "interpreter")?,
-            baseline: run(&interpreters.fazo, BASELINE_ONLY, "baseline")?,
-            optimizing: run(&interpreters.fazo, OPTIMIZING_ONLY, "optimizing")?,
-            peak: run(&interpreters.fazo, PEAK_ONLY, "peak")?,
-            luajit: run(&interpreters.luajit, &[], "luajit")?,
+            puc: total("puc")?,
+            interpreter: total("interpreter")?,
+            baseline: total("baseline")?,
+            optimizing: total("optimizing")?,
+            peak: total("peak")?,
+            luajit: total("luajit")?,
         })
     }
 
@@ -544,20 +730,33 @@ fn per_operation(instructions: f64, empty: f64) -> f64 {
 /// The difference between a chunk with the statements and one without leaves the hot function's own cost. fazo's is the Ir
 /// spent inside Peak compiles under `-X force=peak`; LuaJIT's, as the brief that set the target measured it, is its run with
 /// the JIT on less its run with `-joff`, which also credits LuaJIT the speedup of the 200 calls.
-fn measure_compile_cost(interpreters: &Interpreters, out_dir: &Path) -> Result<report::CompileCost, String> {
+fn plan_compile_cost(plan: &mut Plan, interpreters: &Interpreters, out_dir: &Path) -> Result<(), String> {
     let full = write_compile_chunk(out_dir, COMPILE_STATEMENTS)?;
     let empty = write_compile_chunk(out_dir, 0)?;
-    let peak = |script: &Path, label: &str| inside(&interpreters.fazo, PEAK_ONLY, PEAK_COMPILE_SYMBOLS, (out_dir, label), (script, &[]));
-    let peak_ir = peak(&full, "compile-peak")? - peak(&empty, "compile-peak-empty")?;
-    let optimizing = |script: &Path, label: &str| inside(&interpreters.fazo, OPTIMIZING_ONLY, OPTIMIZING_COMPILE_SYMBOLS, (out_dir, label), (script, &[]));
-    let optimizing_ir = optimizing(&full, "compile-optimizing")? - optimizing(&empty, "compile-optimizing-empty")?;
-    let luajit = |script: &Path, label: &str| -> Result<f64, String> {
-        let on = measure(&interpreters.luajit, &[], out_dir, label, script, &[])?;
-        let off = measure(&interpreters.luajit, LUAJIT_JIT_OFF, out_dir, &format!("{label}-off"), script, &[])?;
-        Ok(on - off)
-    };
-    let luajit_ir = luajit(&full, "compile-luajit")? - luajit(&empty, "compile-luajit-empty")?;
+
+    for (suffix, script) in [("", &full), ("-empty", &empty)] {
+        let options = |options: &[&str]| arguments_for(options, script, &[]);
+        plan.add(format!("compile-peak{suffix}"), &interpreters.fazo, options(PEAK_ONLY), Probe::Inside(PEAK_COMPILE_SYMBOLS));
+        plan.add(
+            format!("compile-optimizing{suffix}"),
+            &interpreters.fazo,
+            options(OPTIMIZING_ONLY),
+            Probe::Inside(OPTIMIZING_COMPILE_SYMBOLS),
+        );
+        plan.add(format!("compile-luajit{suffix}"), &interpreters.luajit, options(&[]), Probe::Total);
+        plan.add(format!("compile-luajit{suffix}-off"), &interpreters.luajit, options(LUAJIT_JIT_OFF), Probe::Total);
+    }
+    Ok(())
+}
+
+fn compile_cost(samples: &Samples) -> Result<report::CompileCost, String> {
+    let difference = |label: &str| -> Result<f64, String> { Ok(samples.total(label)? - samples.total(&format!("{label}-empty"))?) };
+    let peak_ir = difference("compile-peak")?;
+    let optimizing_ir = difference("compile-optimizing")?;
+    let luajit_ir = (samples.total("compile-luajit")? - samples.total("compile-luajit-off")?)
+        - (samples.total("compile-luajit-empty")? - samples.total("compile-luajit-empty-off")?);
     let statements = f64::from(COMPILE_STATEMENTS);
+
     Ok(report::CompileCost {
         statements: COMPILE_STATEMENTS,
         peak_per_bytecode: tenths(peak_ir / (statements * FAZO_BYTECODES_PER_STATEMENT)),
@@ -700,7 +899,7 @@ fn plain_run(interpreter: &str, options: &[&str], script: &Path, arguments: &[&s
     Ok((output.stdout, output.status.code()))
 }
 
-fn measure(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, script: &Path, arguments: &[&str]) -> Result<f64, String> {
+fn measure(interpreter: &str, arguments: &[String], out_dir: &Path, label: &str) -> Result<f64, String> {
     let out = out_dir.join(format!("{label}.out"));
     let mut args = vec![
         "--tool=cachegrind".to_owned(),
@@ -708,39 +907,135 @@ fn measure(interpreter: &str, options: &[&str], out_dir: &Path, label: &str, scr
         format!("--cachegrind-out-file={}", guest_path(&out)),
         interpreter.to_owned(),
     ];
-    args.extend(arguments_for(options, script, arguments));
-    let output = host_command("valgrind", &args)
-        .output()
-        .map_err(|error| format!("starting valgrind: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
-    }
+    args.extend_from_slice(arguments);
+
+    valgrind(&args, label)?;
     read_totals(&out)?
         .get("Ir")
         .copied()
         .ok_or_else(|| format!("cachegrind output for {label} has no Ir total"))
 }
 
-/// Callgrind dumps before each `OPTIMIZED_COMPILE_SYMBOL` call, so the first dump holds the work before the first compile, or the whole run when nothing compiles.
-fn before_first(interpreter: &str, (out_dir, label): (&Path, &str), (script, arguments): (&Path, &[&str])) -> Result<f64, String> {
-    let out = out_dir.join(format!("{label}.callgrind"));
-    let first = out_dir.join(format!("{label}.callgrind.1"));
-    let _ = fs::remove_file(&first);
-    let mut args = vec![
-        "--tool=callgrind".to_owned(),
-        format!("--callgrind-out-file={}", guest_path(&out)),
-        format!("--dump-before={OPTIMIZED_COMPILE_SYMBOL}"),
-    ];
-    args.push(interpreter.to_owned());
-    args.extend(arguments_for(&[], script, arguments));
-    let output = host_command("valgrind", &args)
+fn valgrind(args: &[String], label: &str) -> Result<(), String> {
+    let output = host_command("valgrind", args)
         .output()
         .map_err(|error| format!("starting valgrind: {error}"))?;
     if !output.status.success() {
         return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
     }
-    let path = if first.exists() { first } else { out };
-    callgrind_total(&path, label)
+    Ok(())
+}
+
+/// One callgrind run gives fazo's total, the Ir inside compiles and, because callgrind dumps before each
+/// `OPTIMIZED_COMPILE_SYMBOL` call, the work before the first compile in its first part.
+fn split(interpreter: &str, arguments: &[String], out_dir: &Path, label: &str) -> Result<FazoSplit, String> {
+    let out = out_dir.join(format!("{label}.callgrind"));
+    let mut args = vec![
+        "--tool=callgrind".to_owned(),
+        format!("--callgrind-out-file={}", guest_path(&out)),
+        format!("--dump-before={OPTIMIZED_COMPILE_SYMBOL}"),
+        interpreter.to_owned(),
+    ];
+    args.extend_from_slice(arguments);
+
+    remove_parts(out_dir, label)?;
+    valgrind(&args, label)?;
+    let mut parts: Vec<_> = (1..)
+        .map(|part| out_dir.join(format!("{label}.callgrind.{part}")))
+        .take_while(|path| path.exists())
+        .collect();
+    parts.push(out);
+
+    let mut names = BTreeMap::new();
+    let mut totals = Vec::with_capacity(parts.len());
+    let mut compile = 0.0;
+    for path in &parts {
+        let text = fs::read_to_string(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+        let part = callgrind_part(&text, &mut names).ok_or_else(|| format!("callgrind output for {label} has no total"))?;
+        totals.push(part.total);
+        compile += part.compile;
+    }
+    Ok(FazoSplit {
+        total: totals.iter().sum(),
+        compile,
+        before_optimized: totals[0],
+    })
+}
+
+fn remove_parts(out_dir: &Path, label: &str) -> Result<(), String> {
+    let prefix = format!("{label}.callgrind.");
+    let entries = fs::read_dir(out_dir).map_err(|error| format!("reading {}: {error}", out_dir.display()))?;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            fs::remove_file(entry.path()).map_err(|error| format!("removing {}: {error}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+struct CallgrindPart {
+    total: f64,
+    compile: f64,
+}
+
+/// The compile share sums the inclusive cost of calls from outside the compile functions into them, so nested compiles count once.
+fn callgrind_part(text: &str, names: &mut BTreeMap<String, String>) -> Option<CallgrindPart> {
+    let mut total = None;
+    let mut compile = 0.0;
+    let mut caller_compiles = false;
+    let mut callee_compiles = false;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if let Some(rest) = line.strip_prefix("fn=") {
+            caller_compiles = is_compile(&function_name(rest, names));
+        } else if let Some(rest) = line.strip_prefix("cfn=") {
+            callee_compiles = is_compile(&function_name(rest, names));
+        } else if line.starts_with("calls=") {
+            let cost = lines.next().and_then(|cost| cost.split_whitespace().nth(1)?.parse::<f64>().ok()).unwrap_or(0.0);
+            if callee_compiles && !caller_compiles {
+                compile += cost;
+            }
+        } else if let Some(rest) = line.strip_prefix("totals: ").or_else(|| line.strip_prefix("summary: ")) {
+            total = total.or_else(|| rest.split_whitespace().next()?.parse::<f64>().ok());
+        }
+    }
+    Some(CallgrindPart { total: total?, compile })
+}
+
+fn function_name(field: &str, names: &mut BTreeMap<String, String>) -> String {
+    let Some((id, name)) = field.strip_prefix('(').and_then(|rest| rest.split_once(')')) else {
+        return field.to_owned();
+    };
+    let name = name.trim_start();
+    if name.is_empty() {
+        return names.get(id).cloned().unwrap_or_default();
+    }
+    names.insert(id.to_owned(), name.to_owned());
+    name.to_owned()
+}
+
+fn is_compile(name: &str) -> bool {
+    ALL_COMPILE_SYMBOLS.iter().any(|pattern| glob_matches(pattern, name))
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pieces: Vec<&str> = pattern.split('*').collect();
+    let Some((first, rest)) = pieces.split_first() else {
+        return text.is_empty();
+    };
+    let Some(mut remaining) = text.strip_prefix(first) else {
+        return false;
+    };
+    let Some((last, middle)) = rest.split_last() else {
+        return remaining.is_empty();
+    };
+    for piece in middle {
+        let Some(at) = remaining.find(piece) else {
+            return false;
+        };
+        remaining = &remaining[at + piece.len()..];
+    }
+    remaining.ends_with(last)
 }
 
 fn callgrind_total(path: &Path, label: &str) -> Result<f64, String> {
@@ -751,18 +1046,14 @@ fn callgrind_total(path: &Path, label: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("callgrind output for {label} has no total"))
 }
 
-fn inside(interpreter: &str, options: &[&str], symbols: &[&str], (out_dir, label): (&Path, &str), (script, arguments): (&Path, &[&str])) -> Result<f64, String> {
+fn inside(interpreter: &str, arguments: &[String], symbols: &[&str], out_dir: &Path, label: &str) -> Result<f64, String> {
     let out = out_dir.join(format!("{label}.callgrind"));
     let mut args = vec!["--tool=callgrind".to_owned(), format!("--callgrind-out-file={}", guest_path(&out))];
     args.extend(symbols.iter().map(|symbol| format!("--toggle-collect={symbol}")));
     args.push(interpreter.to_owned());
-    args.extend(arguments_for(options, script, arguments));
-    let output = host_command("valgrind", &args)
-        .output()
-        .map_err(|error| format!("starting valgrind: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("valgrind on {label} failed with {}: {}", output.status, combined(&output)));
-    }
+    args.extend_from_slice(arguments);
+
+    valgrind(&args, label)?;
     callgrind_total(&out, label)
 }
 
@@ -823,7 +1114,29 @@ fn combined(output: &Output) -> String {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{CRATE_DIR, LUAJIT_SUFFIX, WORKLOADS, guest_path};
+    use std::collections::BTreeMap;
+
+    use super::{CRATE_DIR, LUAJIT_SUFFIX, WORKLOADS, callgrind_part, glob_matches, guest_path};
+
+    #[test]
+    fn globs_match_mangled_symbols() {
+        assert!(glob_matches("*4fazo3jit7compile7compile", "_RNvNtNtCs1_4fazo3jit7compile7compile"));
+        assert!(!glob_matches("*4fazo3jit7compile7compile", "_RNvNtNtCs1_4fazo3jit7compile7compile2"));
+        assert!(glob_matches("*4fazo3jit8baseline7compile*", "_RNvNtNtCs1_4fazo3jit8baseline7compile.llvm.1"));
+        assert!(glob_matches("fazo::jit::compile::compile", "fazo::jit::compile::compile"));
+    }
+
+    #[test]
+    fn callgrind_parts_count_compile_calls_once() {
+        let text = "events: Ir\nsummary: 1000\n\
+                    fn=(1) main\n5 10\ncfn=(2) _RNvNtNtCs1_4fazo3jit7compile7compile\ncalls=1 3\n6 300\n\
+                    fn=(2)\n7 20\ncfn=(3) _RNvNtNtCs1_4fazo3jit8baseline7compile\ncalls=1 3\n8 50\n\
+                    fn=(1)\ncfn=(3)\ncalls=2 3\n9 70\n";
+        let mut names = BTreeMap::new();
+        let part = callgrind_part(text, &mut names).expect("the part has a total");
+        assert_eq!(part.total, 1000.0);
+        assert_eq!(part.compile, 370.0);
+    }
 
     #[test]
     fn every_luajit_version_exists_and_is_used() {

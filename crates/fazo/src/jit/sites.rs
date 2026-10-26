@@ -121,6 +121,14 @@ pub(crate) fn calls_lua(proto: &Proto, pc: usize) -> bool {
     }
 }
 
+/// Forced compiles meet sites the interpreter never reached; those and Lua sites with no known callee read the callee's facts at run time.
+pub(crate) fn calls_unknown_lua(proto: &Proto, pc: usize, forced: bool) -> bool {
+    match proto.exec.feedback.get(pc) {
+        None | Some(InlineCache::Uninitialized) => forced,
+        _ => calls_lua(proto, pc),
+    }
+}
+
 pub(crate) fn calls_out(proto: &Proto) -> bool {
     let depths = loop_depths(proto);
     proto.code.iter().zip(depths).any(|(instruction, depth)| {

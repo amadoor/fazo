@@ -84,12 +84,32 @@ impl Vm {
                 Some(entry) => entry,
                 None => return Ok(false),
             },
+            None if pc != 0 && !self.tracing && self.jit_resumes_in_baseline(proto, pc) => match self.jit_resume_compiled(proto, pc) {
+                Some(entry) => entry,
+                None => return Ok(false),
+            },
             None => match self.jit_tier_up(proto, pc) {
                 Some(entry) => entry,
                 None => return Ok(false),
             },
         };
         self.jit_run_entry(closure, base, proto, pc, entry, registers)
+    }
+
+    /// Optimized code enters only at the first instruction and at loop headers, so a frame the interpreter resumes elsewhere,
+    /// after a return or a yield, gets Baseline code to resume in, which goes back at its next back edge. After a deopt the
+    /// interpreter runs the frame instead, since its feedback is what the recompile needs.
+    fn jit_resumes_in_baseline(&mut self, proto: Ref<Proto>, pc: usize) -> bool {
+        let function = self.heap.protos.live(proto);
+        let optimized_only = function.jit.unit.is_some() && function.jit.baseline.is_none();
+        if !optimized_only || function.jit.deopts > 0 || function.jit.failed || function.jit.hidden || function.jit.never {
+            return false;
+        }
+        let Some(unit) = self.jit_emit_baseline(proto, true) else {
+            return false;
+        };
+        self.jit_install_baseline(proto, unit);
+        self.heap.protos.live(proto).jit.code_at(pc).is_some()
     }
 
     /// A call's first instruction is neither a resume nor a policy decision, so it skips `jit_tier_up`.
@@ -348,6 +368,11 @@ impl Vm {
         let Some(unit) = self.jit_emit_baseline(proto, charges) else {
             return self.jit_compile_failed(proto);
         };
+        self.jit_install_baseline(proto, unit);
+        true
+    }
+
+    fn jit_install_baseline(&mut self, proto: Ref<Proto>, unit: crate::jit::baseline::BaselineUnit) {
         let function = self.heap.protos.live_mut(proto);
         if function.exec.feedback.is_empty() {
             function.exec.feedback = vec![super::InlineCache::Uninitialized; function.code.len()];
@@ -357,7 +382,6 @@ impl Vm {
         function.jit.baseline = Some(Box::new(unit));
         self.jit_reveal(proto);
         self.jit_trace(proto, "baseline");
-        true
     }
 
     fn jit_emit_baseline(&mut self, proto: Ref<Proto>, charges: bool) -> Option<crate::jit::baseline::BaselineUnit> {
@@ -511,6 +535,7 @@ impl Vm {
             inline_caches: !facts_stress.inline_caches_off,
             avoid: &avoid,
             float_guess: self.heap.protos.live(proto).jit.float_guess,
+            forced: self.jit_forced().is_some(),
             observed: &observed,
             interned: &interned,
             proto_of: &proto_of,

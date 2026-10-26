@@ -6,6 +6,7 @@ use super::{
     asm::{Alu, Asm, Cond, Label, Width},
     codegen::{CLOSURE_TAG, Gen, PAYLOAD, Src, VALUE_SIZE},
 };
+use crate::vm::exec_layout;
 use crate::jit::{
     JitCtx,
     layout::lua_frame,
@@ -13,9 +14,17 @@ use crate::jit::{
     ssa::ir::Val,
 };
 
+/// A callee known from feedback, or one whose facts the call reads from its closure's `Exec`, as Baseline's `CallAny` does.
+#[derive(Clone, Copy)]
+enum Callee<'t> {
+    Known(&'t CallTarget),
+    Any,
+}
+
 /// Registers a direct call works in, all clobbered by the call.
 #[derive(Clone, Copy)]
 struct Temps {
+    exec: u8,
     closure: u8,
     entry: u8,
     depth_pointer: u8,
@@ -42,6 +51,7 @@ impl<A: Asm> Gen<'_, A> {
         let targets = self.call_targets(pc);
         let out = self.out(value);
         let temps = Temps {
+            exec: self.temp(),
             closure: self.temp(),
             entry: self.temp(),
             depth_pointer: self.temp(),
@@ -55,14 +65,18 @@ impl<A: Asm> Gen<'_, A> {
         let helper = self.asm.new_label();
         let join = self.asm.new_label();
         self.save(&saves);
-        if b != 0 && !targets.is_empty() {
-            let matched = self.match_callee(a, &targets, temps, helper);
+        let unknown = targets.is_empty() && self.env.unknown_calls.get(pc).copied().unwrap_or(false);
+        if b != 0 && (unknown || !targets.is_empty()) {
+            let any = if unknown { self.asm.new_label() } else { helper };
+            let matched = self.match_callee(a, &targets, temps, (helper, any));
             for (target, label) in targets.iter().zip(matched) {
                 self.asm.bind(label);
-                self.direct_call(pc, (a, b, c), target, temps, (helper, join, out));
+                self.direct_call(pc, (a, b, c), Callee::Known(target), temps, (helper, join, out));
             }
-        } else {
-            self.asm.jump(helper);
+            if unknown {
+                self.asm.bind(any);
+                self.direct_call(pc, (a, b, c), Callee::Any, temps, (helper, join, out));
+            }
         }
         self.asm.bind(helper);
         self.fast_args(pc as u32, [u32::from(a), u32::from(b), u32::from(c)]);
@@ -72,7 +86,7 @@ impl<A: Asm> Gen<'_, A> {
         self.restore(&saves);
     }
 
-    fn match_callee(&mut self, a: u8, targets: &[CallTarget], temps: Temps, helper: Label) -> Vec<Label> {
+    fn match_callee(&mut self, a: u8, targets: &[CallTarget], temps: Temps, (helper, any): (Label, Label)) -> Vec<Label> {
         let at = i32::from(a) * VALUE_SIZE;
         let matched: Vec<Label> = targets.iter().map(|_| self.asm.new_label()).collect();
         self.registers(temps.entry);
@@ -80,6 +94,10 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.cmp_imm(A::SCRATCH, i32::from(CLOSURE_TAG));
         self.asm.branch(Cond::Ne, helper);
         self.asm.load(Width::Q, temps.closure, temps.entry, at + PAYLOAD);
+        if targets.is_empty() {
+            self.asm.jump(any);
+            return matched;
+        }
         for (target, &label) in targets.iter().zip(&matched) {
             self.asm.cmp_imm64(temps.closure, target.closure as i64);
             self.asm.branch(Cond::Eq, label);
@@ -90,23 +108,19 @@ impl<A: Asm> Gen<'_, A> {
             self.asm.cmp_imm64(temps.entry, target.proto as i64);
             self.asm.branch(Cond::Eq, label);
         }
-        self.asm.jump(helper);
+        self.asm.jump(any);
         matched
     }
 
     /// Mirrors `Vm::jit_call_compiled`; other exits go to `Vm::jit_after_call`. The depth and frame count are stashed in the scratch area across the call.
-    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), target: &CallTarget, t: Temps, (helper, join, out): (Label, Label, u8)) {
+    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, t: Temps, (helper, join, out): (Label, Label, u8)) {
         let frames = self.env.frames;
         let arguments = u32::from(b) - 1;
         let wanted = i64::from(c) - 1;
         let callee_offset = (i32::from(a) + 1) * VALUE_SIZE;
-        let register_count = i64::from(arguments) + i64::from(target.max_stack);
         let stash = self.scratch_at;
 
-        self.asm.mov_imm(t.entry, target.entry as i64);
-        self.asm.load(Width::Q, t.entry, t.entry, 0);
-        self.asm.cmp_imm(t.entry, 0);
-        self.asm.branch(Cond::Eq, helper);
+        self.load_entry(callee, t, helper);
         self.ctx_load(t.depth_pointer, offset_of!(JitCtx, call_depth));
         self.asm.load(Width::W, t.depth, t.depth_pointer, 0);
         self.asm.cmp_imm64(t.depth, i64::from(self.env.call_depth_limit));
@@ -114,22 +128,13 @@ impl<A: Asm> Gen<'_, A> {
         self.ctx_load(t.thread, offset_of!(JitCtx, thread));
         self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
         self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, i32::from(a) + 1);
-        self.asm.load(Width::Q, t.count, t.thread, frames.stack_len);
-        self.asm.alu_imm(Alu::Add, A::SCRATCH, t.callee_base, register_count.max(crate::vm::REGISTER_SPAN as i64) as i32);
-        self.asm.cmp(A::SCRATCH, t.count);
-        self.asm.branch(Cond::Above, helper);
-        self.asm.alu_imm(Alu::Add, A::SCRATCH, t.callee_base, register_count as i32);
-        self.asm.cmp_imm64(A::SCRATCH, crate::vm::MAX_STACK_SLOTS as i64);
-        self.asm.branch(Cond::Above, helper);
+        self.check_stack_room(callee, arguments, t, helper);
+        self.clear_missing_parameters(callee, arguments, callee_offset, t);
         self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
         self.asm.load(Width::Q, A::SCRATCH, t.thread, frames.frames_capacity);
         self.asm.cmp(t.count, A::SCRATCH);
         self.asm.branch(Cond::AboveEq, helper);
 
-        self.registers(A::SCRATCH);
-        for parameter in arguments..u32::from(target.num_params) {
-            self.asm.store_imm(Width::B, A::SCRATCH, callee_offset + parameter as i32 * VALUE_SIZE, 0);
-        }
         self.asm.alu_imm(Alu::Mul, t.frame, t.count, frames.frame_size as i32);
         self.asm.load(Width::Q, A::SCRATCH, t.thread, frames.frames_data);
         self.asm.alu(Alu::Add, t.frame, t.frame, A::SCRATCH);
@@ -138,7 +143,7 @@ impl<A: Asm> Gen<'_, A> {
         self.push_lua_frame(t, wanted);
         self.asm.alu_imm(Alu::Add, A::SCRATCH, t.count, 1);
         self.asm.store(Width::Q, A::SCRATCH, t.thread, frames.frames_len);
-        self.fill_callee_context(target, t, (callee_offset, wanted));
+        self.fill_callee_context(callee, t, (callee_offset, wanted));
         self.asm.alu_imm(Alu::Add, A::SCRATCH, t.depth, 1);
         self.asm.store(Width::W, A::SCRATCH, t.depth_pointer, 0);
         self.asm.store(Width::Q, t.depth, A::SP, stash);
@@ -178,6 +183,68 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.jump(join);
     }
 
+    /// A vararg prototype's entry cell stays zero, so its calls take the helper.
+    fn load_entry(&mut self, callee: Callee<'_>, t: Temps, helper: Label) {
+        match callee {
+            Callee::Known(target) => self.asm.mov_imm(t.entry, target.entry as i64),
+            Callee::Any => {
+                self.closure_address(t.exec, t.closure);
+                self.asm.load(Width::Q, t.exec, t.exec, exec_layout::CLOSURE_CODE as i32);
+                self.asm.load(Width::Q, t.entry, t.exec, exec_layout::ENTRY as i32);
+            }
+        }
+        self.asm.load(Width::Q, t.entry, t.entry, 0);
+        self.asm.cmp_imm(t.entry, 0);
+        self.asm.branch(Cond::Eq, helper);
+    }
+
+    /// `luaD_precall` checks the callee's `maxstacksize` (ldo.c); the interpreter keeps `REGISTER_SPAN` slots past every base.
+    fn check_stack_room(&mut self, callee: Callee<'_>, arguments: u32, t: Temps, helper: Label) {
+        let frames = self.env.frames;
+        self.asm.load(Width::Q, t.count, t.thread, frames.stack_len);
+        if let Callee::Known(target) = callee {
+            let register_count = i64::from(arguments) + i64::from(target.max_stack);
+            self.asm.alu_imm(Alu::Add, A::SCRATCH, t.callee_base, register_count.max(crate::vm::REGISTER_SPAN as i64) as i32);
+            self.asm.cmp(A::SCRATCH, t.count);
+            self.asm.branch(Cond::Above, helper);
+            self.asm.alu_imm(Alu::Add, A::SCRATCH, t.callee_base, register_count as i32);
+        } else {
+            self.asm.alu_imm(Alu::Add, A::SCRATCH, t.callee_base, crate::vm::REGISTER_SPAN as i32);
+            self.asm.cmp(A::SCRATCH, t.count);
+            self.asm.branch(Cond::Above, helper);
+            self.asm.load(Width::B, A::SCRATCH, t.exec, exec_layout::MAX_STACK as i32);
+            self.asm.alu(Alu::Add, A::SCRATCH, A::SCRATCH, t.callee_base);
+            self.asm.alu_imm(Alu::Add, A::SCRATCH, A::SCRATCH, arguments as i32);
+            self.asm.cmp(A::SCRATCH, t.count);
+            self.asm.branch(Cond::Above, helper);
+        }
+        self.asm.cmp_imm64(A::SCRATCH, crate::vm::MAX_STACK_SLOTS as i64);
+        self.asm.branch(Cond::Above, helper);
+    }
+
+    fn clear_missing_parameters(&mut self, callee: Callee<'_>, arguments: u32, callee_offset: i32, t: Temps) {
+        if let Callee::Known(target) = callee {
+            self.registers(A::SCRATCH);
+            for parameter in arguments..u32::from(target.num_params) {
+                self.asm.store_imm(Width::B, A::SCRATCH, callee_offset + parameter as i32 * VALUE_SIZE, 0);
+            }
+            return;
+        }
+        let next = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.load(Width::B, t.count, t.exec, exec_layout::NUM_PARAMS as i32);
+        self.asm.mov_imm(t.frame, i64::from(arguments));
+        self.asm.bind(next);
+        self.asm.cmp(t.frame, t.count);
+        self.asm.branch(Cond::AboveEq, done);
+        self.asm.shl_imm(A::SCRATCH, t.frame, 4);
+        self.asm.add_mem(A::SCRATCH, A::CTX, offset_of!(JitCtx, registers) as i32);
+        self.asm.store_imm(Width::B, A::SCRATCH, callee_offset, 0);
+        self.asm.alu_imm(Alu::Add, t.frame, t.frame, 1);
+        self.asm.jump(next);
+        self.asm.bind(done);
+    }
+
     fn push_lua_frame(&mut self, t: Temps, wanted: i64) {
         let frames = self.env.frames;
         let status = (crate::object::LuaFrame::call_status(wanted as i32, 0) as i64) << lua_frame::STATUS_SHIFT;
@@ -191,7 +258,7 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::NVARARGS), 0);
     }
 
-    fn fill_callee_context(&mut self, target: &CallTarget, t: Temps, (callee_offset, wanted): (i32, i64)) {
+    fn fill_callee_context(&mut self, callee: Callee<'_>, t: Temps, (callee_offset, wanted): (i32, i64)) {
         let context = self.ctx_at;
         let copied = [
             offset_of!(JitCtx, requests),
@@ -211,17 +278,27 @@ impl<A: Asm> Gen<'_, A> {
         self.registers(A::SCRATCH);
         self.asm.alu_imm(Alu::Add, A::SCRATCH, A::SCRATCH, callee_offset);
         self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, registers) as i32);
-        if target.has_upvalues {
+        if matches!(callee, Callee::Known(target) if !target.has_upvalues) {
+            self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, upvalues) as i32, 0);
+        } else {
             self.closure_address(t.frame, t.closure);
             self.asm.load(Width::Q, t.frame, t.frame, self.env.frames.closure_upvalues);
             self.asm.store(Width::Q, t.frame, A::SP, context + offset_of!(JitCtx, upvalues) as i32);
-        } else {
-            self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, upvalues) as i32, 0);
         }
-        self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, constants) as i32, target.constants as i64);
+        match callee {
+            Callee::Known(target) => {
+                self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, constants) as i32, target.constants as i64);
+                self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, proto) as i32, target.proto as i64);
+            }
+            Callee::Any => {
+                self.asm.load(Width::Q, A::SCRATCH, t.exec, exec_layout::CONSTANTS as i32);
+                self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, constants) as i32);
+                self.asm.load(Width::Q, A::SCRATCH, t.exec, exec_layout::PROTO as i32);
+                self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, proto) as i32);
+            }
+        }
         self.asm.store(Width::Q, t.closure, A::SP, context + offset_of!(JitCtx, closure) as i32);
         self.asm.store(Width::Q, t.callee_base, A::SP, context + offset_of!(JitCtx, base) as i32);
-        self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, proto) as i32, target.proto as i64);
         self.asm.store_imm(Width::W, A::SP, context + offset_of!(JitCtx, direct_results) as i32, wanted);
         self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, ret_offset) as i32, -i64::from(VALUE_SIZE));
     }

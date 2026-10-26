@@ -511,6 +511,7 @@ fn compiled_ir_size(statements: usize) -> usize {
         inline_caches: true,
         avoid: &[],
         float_guess: false,
+        forced: false,
         observed: &[],
         interned: &interned,
         proto_of: &proto_of,

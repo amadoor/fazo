@@ -22,6 +22,7 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) inline_caches: bool,
     pub(crate) avoid: &'a [u32],
     pub(crate) float_guess: bool,
+    pub(crate) forced: bool,
     pub(crate) observed: &'a [(u32, u8)],
     pub(crate) interned: &'a dyn Fn(LuaValue) -> bool,
     pub(crate) proto_of: &'a dyn Fn(Ref<Proto>) -> Option<&'a Proto>,
@@ -42,12 +43,14 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         return Err(unsupported("the table and frame layouts are unknown"));
     };
     let func = optimized(proto, facts, passes::PEAK)?;
+    let unknown_calls = unknown_calls(proto, facts.forced);
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
     let env = lower::Env {
         layout,
         frames,
         calls: &facts.calls,
+        unknown_calls: &unknown_calls,
         call_depth_limit: facts.call_depth_limit,
         points: &points,
         stress_exits: facts.stress_exits,
@@ -63,17 +66,23 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     Ok((PeakUnit { code: ssa::Code::Cranelift { unit: Box::new(unit), _points: points }, entries, shapes }, text))
 }
 
+fn unknown_calls(proto: &Proto, forced: bool) -> Vec<bool> {
+    (0..proto.code.len()).map(|pc| super::sites::calls_unknown_lua(proto, pc, forced)).collect()
+}
+
 pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, facts: &CompileFacts<'a>, dump: bool) -> JitResult<(PeakUnit, Option<String>)> {
     let (Some(layout), Some(frames)) = (facts.layout, facts.frames) else {
         return Err(unsupported("the table and frame layouts are unknown"));
     };
     let func = optimized(proto, facts, passes::OPTIMIZING)?;
+    let unknown_calls = unknown_calls(proto, facts.forced);
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
     let env = lower::Env {
         layout,
         frames,
         calls: &facts.calls,
+        unknown_calls: &unknown_calls,
         call_depth_limit: facts.call_depth_limit,
         points: &[],
         stress_exits: facts.stress_exits,

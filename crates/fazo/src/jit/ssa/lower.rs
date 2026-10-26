@@ -1,6 +1,7 @@
 //! Helpers answer the next pc or a negative exit code.
 
 use std::mem::offset_of;
+use crate::vm::exec_layout;
 
 use cranelift_codegen::ir::{
     AbiParam, AliasRegionData, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlagsData, SigRef, StackSlot, StackSlotData,
@@ -39,6 +40,7 @@ pub(crate) struct Env<'a> {
     pub(crate) layout: TableLayout,
     pub(crate) frames: FrameLayout,
     pub(crate) calls: &'a [Vec<CallTarget>],
+    pub(crate) unknown_calls: &'a [bool],
     pub(crate) call_depth_limit: u32,
     pub(crate) points: &'a [DeoptPoint],
     pub(crate) stress_exits: bool,
@@ -1615,11 +1617,17 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let result = self.builder.append_block_param(join, types::I64);
         let targets = self.call_targets(pc);
         let helper = self.builder.create_block();
-        if b != 0 && !targets.is_empty() {
-            let (closure, matched) = self.match_callee(a, &targets, helper);
+        let unknown = targets.is_empty() && self.env.unknown_calls.get(pc).copied().unwrap_or(false);
+        if b != 0 && (unknown || !targets.is_empty()) {
+            let any = if unknown { self.builder.create_block() } else { helper };
+            let (closure, matched) = self.match_callee(a, &targets, (helper, any));
             for (target, &block) in targets.iter().zip(&matched) {
                 self.builder.switch_to_block(block);
-                self.direct_call(pc, (a, b, c), target, closure, (helper, join));
+                self.direct_call(pc, (a, b, c), Callee::Known(target), closure, (helper, join));
+            }
+            if unknown {
+                self.builder.switch_to_block(any);
+                self.direct_call(pc, (a, b, c), Callee::Any, closure, (helper, join));
             }
         } else {
             self.builder.ins().jump(helper, &[]);
@@ -1649,7 +1657,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.switch_to_block(next);
     }
 
-    fn match_callee(&mut self, a: u8, targets: &[CallTarget], helper: Block) -> (Value, Vec<Block>) {
+    fn match_callee(&mut self, a: u8, targets: &[CallTarget], (helper, any): (Block, Block)) -> (Value, Vec<Block>) {
         let check = self.builder.create_block();
         let base = self.registers();
         let tag = self.builder.ins().uload8(types::I64, self.value_flags, base, slot_offset(u32::from(a)));
@@ -1658,6 +1666,10 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.switch_to_block(check);
         let closure = self.builder.ins().load(types::I64, self.value_flags, base, slot_offset(u32::from(a)) + PAYLOAD);
         let matched: Vec<Block> = targets.iter().map(|_| self.builder.create_block()).collect();
+        if targets.is_empty() {
+            self.builder.ins().jump(any, &[]);
+            return (closure, matched);
+        }
         for (target, &block) in targets.iter().zip(&matched) {
             self.continue_unless(closure, IntCC::Equal, target.closure as i64, block);
         }
@@ -1666,7 +1678,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         for (target, &block) in targets.iter().zip(&matched) {
             self.continue_unless(proto, IntCC::Equal, target.proto as i64, block);
         }
-        self.builder.ins().jump(helper, &[]);
+        self.builder.ins().jump(any, &[]);
         (closure, matched)
     }
 
@@ -1683,7 +1695,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
     }
 
     /// Mirrors `Vm::jit_call_compiled`; other exits go to `Vm::jit_after_call`.
-    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), target: &CallTarget, closure: Value, (helper, join): (Block, Block)) {
+    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, closure: Value, (helper, join): (Block, Block)) {
         let frames = self.env.frames;
         let depth_limit = self.env.call_depth_limit;
         let signature = self.imports.entry_signature;
@@ -1693,8 +1705,8 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let wanted = i64::from(c) - 1;
         let callee_offset = (i32::from(a) + 1) * VALUE_SIZE;
 
-        let cell = self.iconst(types::I64, target.entry as i64);
-        let entry = self.builder.ins().load(types::I64, flags, cell, 0);
+        let facts = self.callee_facts(callee, closure);
+        let entry = self.builder.ins().load(types::I64, flags, facts.cell, 0);
         self.continue_unless(entry, IntCC::Equal, 0, helper);
         let depth_pointer = self.ctx_load(self.pointer, offset_of!(JitCtx, call_depth));
         let depth = self.builder.ins().load(types::I32, flags, depth_pointer, 0);
@@ -1703,13 +1715,22 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let stack_len = self.builder.ins().load(types::I64, flags, thread, frames.stack_len);
         let caller_base = self.ctx_load(types::I64, offset_of!(JitCtx, base));
         let callee_base = self.builder.ins().iadd_imm_s(caller_base, i64::from(a) + 1);
-        let register_count = i64::from(arguments) + i64::from(target.max_stack);
-        let needed = self.builder.ins().iadd_imm_s(callee_base, register_count.max(crate::vm::REGISTER_SPAN as i64));
-        let short = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, needed, stack_len);
-        let roomy = self.builder.create_block();
-        self.builder.ins().brif(short, helper, &[], roomy, &[]);
-        self.builder.switch_to_block(roomy);
-        let top = self.builder.ins().iadd_imm_s(callee_base, register_count);
+        let top = match callee {
+            Callee::Known(target) => {
+                let register_count = i64::from(arguments) + i64::from(target.max_stack);
+                let needed = self.builder.ins().iadd_imm_s(callee_base, register_count.max(crate::vm::REGISTER_SPAN as i64));
+                self.leave_if(IntCC::UnsignedGreaterThan, needed, stack_len, helper);
+                self.builder.ins().iadd_imm_s(callee_base, register_count)
+            }
+            Callee::Any => {
+                let span = self.builder.ins().iadd_imm_s(callee_base, crate::vm::REGISTER_SPAN as i64);
+                self.leave_if(IntCC::UnsignedGreaterThan, span, stack_len, helper);
+                let top = self.builder.ins().iadd(callee_base, facts.max_stack);
+                let top = self.builder.ins().iadd_imm_s(top, i64::from(arguments));
+                self.leave_if(IntCC::UnsignedGreaterThan, top, stack_len, helper);
+                top
+            }
+        };
         self.continue_unless(top, IntCC::UnsignedGreaterThan, crate::vm::MAX_STACK_SLOTS as i64, helper);
         let count = self.builder.ins().load(types::I64, flags, thread, frames.frames_len);
         let capacity = self.builder.ins().load(types::I64, flags, thread, frames.frames_capacity);
@@ -1719,11 +1740,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.builder.switch_to_block(fits);
 
         let base = self.registers();
-        let nil = self.iconst(types::I8, NIL_TAG);
-        for parameter in arguments..u32::from(target.num_params) {
-            let offset = callee_offset + parameter as i32 * VALUE_SIZE;
-            self.builder.ins().store(self.value_flags, nil, base, offset);
-        }
+        self.clear_missing_parameters(callee, &facts, base, (arguments, callee_offset));
         let data = self.builder.ins().load(types::I64, flags, thread, frames.frames_data);
         let frame_offset = self.builder.ins().imul_imm_s(count, frames.frame_size);
         let frame = self.builder.ins().iadd(data, frame_offset);
@@ -1733,15 +1750,13 @@ impl<'a, 'f> Lowering<'a, 'f> {
         self.push_lua_frame(frame, closure, callee_base, wanted);
         let pushed = self.builder.ins().iadd_imm_s(count, 1);
         self.builder.ins().store(flags, pushed, thread, frames.frames_len);
-        let upvalues = if target.has_upvalues {
+        let upvalues = if matches!(callee, Callee::Known(target) if !target.has_upvalues) {
+            self.iconst(types::I64, 0)
+        } else {
             let address = self.closure_address(closure);
             self.builder.ins().load(types::I64, self.heap_flags, address, frames.closure_upvalues)
-        } else {
-            self.iconst(types::I64, 0)
         };
-        let constants = self.iconst(types::I64, target.constants as i64);
-        let proto = self.iconst(types::I64, target.proto as i64);
-        self.fill_callee_context(context, (upvalues, constants, proto), base, (callee_offset, callee_base, closure), wanted);
+        self.fill_callee_context(context, (upvalues, facts.constants, facts.proto), base, (callee_offset, callee_base, closure), wanted);
         let deeper = self.builder.ins().iadd_imm_s(depth, 1);
         self.builder.ins().store(flags, deeper, depth_pointer, 0);
         let callee_context = self.builder.ins().stack_addr(self.pointer, context, 0);
@@ -1772,6 +1787,72 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let call = self.builder.ins().call(after, &[self.ctx, pc_value, code, before, zero]);
         let result = self.builder.inst_results(call)[0];
         self.builder.ins().jump(join, &[BlockArg::Value(result)]);
+    }
+
+    /// Baseline's `CallAny` reads the same facts from the closure's `Exec`.
+    fn callee_facts(&mut self, callee: Callee<'_>, closure: Value) -> CalleeFacts {
+        let target = match callee {
+            Callee::Known(target) => target,
+            Callee::Any => {
+                let flags = self.frame_flags;
+                let address = self.closure_address(closure);
+                let exec = self.builder.ins().load(types::I64, self.heap_flags, address, exec_layout::CLOSURE_CODE as i32);
+                let max_stack = self.builder.ins().uload8(types::I64, flags, exec, exec_layout::MAX_STACK as i32);
+                let num_params = self.builder.ins().uload8(types::I64, flags, exec, exec_layout::NUM_PARAMS as i32);
+                return CalleeFacts {
+                    cell: self.builder.ins().load(types::I64, flags, exec, exec_layout::ENTRY as i32),
+                    max_stack,
+                    num_params: Some(num_params),
+                    constants: self.builder.ins().load(types::I64, flags, exec, exec_layout::CONSTANTS as i32),
+                    proto: self.builder.ins().load(types::I64, flags, exec, exec_layout::PROTO as i32),
+                };
+            }
+        };
+        CalleeFacts {
+            cell: self.iconst(types::I64, target.entry as i64),
+            max_stack: self.iconst(types::I64, i64::from(target.max_stack)),
+            num_params: None,
+            constants: self.iconst(types::I64, target.constants as i64),
+            proto: self.iconst(types::I64, target.proto as i64),
+        }
+    }
+
+    fn leave_if(&mut self, condition: IntCC, left: Value, right: Value, target: Block) {
+        let taken = self.builder.ins().icmp(condition, left, right);
+        let next = self.builder.create_block();
+        self.builder.ins().brif(taken, target, &[], next, &[]);
+        self.builder.switch_to_block(next);
+    }
+
+    fn clear_missing_parameters(&mut self, callee: Callee<'_>, facts: &CalleeFacts, base: Value, (arguments, callee_offset): (u32, i32)) {
+        let nil = self.iconst(types::I8, NIL_TAG);
+        if let Callee::Known(target) = callee {
+            for parameter in arguments..u32::from(target.num_params) {
+                let offset = callee_offset + parameter as i32 * VALUE_SIZE;
+                self.builder.ins().store(self.value_flags, nil, base, offset);
+            }
+            return;
+        }
+        let Some(num_params) = facts.num_params else {
+            return;
+        };
+        let fill = self.builder.create_block();
+        let store = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(fill, types::I64);
+        let first = self.iconst(types::I64, i64::from(arguments));
+        self.builder.ins().jump(fill, &[BlockArg::Value(first)]);
+        self.builder.switch_to_block(fill);
+        let index = self.builder.block_params(fill)[0];
+        let filled = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, num_params);
+        self.builder.ins().brif(filled, done, &[], store, &[]);
+        self.builder.switch_to_block(store);
+        let offset = self.builder.ins().imul_imm_s(index, i64::from(VALUE_SIZE));
+        let slot = self.builder.ins().iadd(base, offset);
+        self.builder.ins().store(self.value_flags, nil, slot, callee_offset);
+        let next = self.builder.ins().iadd_imm_s(index, 1);
+        self.builder.ins().jump(fill, &[BlockArg::Value(next)]);
+        self.builder.switch_to_block(done);
     }
 
     fn push_lua_frame(&mut self, frame: Value, closure: Value, callee_base: Value, wanted: i64) {
@@ -1843,6 +1924,21 @@ impl<'a, 'f> Lowering<'a, 'f> {
             self.builder.ins().store(self.context_flags, value, self.ctx, offset as i32);
         }
     }
+}
+
+/// A callee known from feedback, or one whose facts the call reads from its closure's `Exec`.
+#[derive(Clone, Copy)]
+enum Callee<'t> {
+    Known(&'t CallTarget),
+    Any,
+}
+
+struct CalleeFacts {
+    cell: Value,
+    max_stack: Value,
+    num_params: Option<Value>,
+    constants: Value,
+    proto: Value,
 }
 
 fn int_cc(cc: Cc) -> IntCC {
