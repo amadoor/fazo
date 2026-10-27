@@ -553,6 +553,7 @@ impl Vm {
         let builtin_of = |native: Ref<crate::object::Native>| heap.natives.try_get(native).and_then(|native| native.builtin);
         let type_names = self.type_name_refs();
         let call_targets = |inlined: Ref<Proto>, pc: usize| inlined_call_targets(heap, proto, inlined, pc);
+        let upvalues_of = |closure: Ref<Closure>| heap.closures.try_get(closure).map(|function| function.upvalues.as_ptr() as u64);
         let node_hint = |function: &Proto, pc: usize, root: bool| {
             if root {
                 return nodes.get(pc).copied().flatten();
@@ -580,6 +581,7 @@ impl Vm {
             running_floats: &running_floats,
             tier_budget: charges.then(|| std::ptr::from_ref(heap.protos.live(proto).jit.tier_budget())),
             call_targets: &call_targets,
+            upvalues_of: &upvalues_of,
         };
         let compiled = if tier == Tier::Optimizing {
             Some(crate::jit::compile_optimizing(budget, heap.protos.live(proto), &facts, dump))

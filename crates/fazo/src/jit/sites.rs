@@ -116,19 +116,29 @@ pub(crate) fn payoff(proto: &Proto, policy: crate::TierPolicy) -> i64 {
     total
 }
 
-/// Instructions whose helpers need the callee's heap frame, so a direct call pushes it up front.
+fn needs_frame_at(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::NewTable { .. } | Instruction::SetList { .. } | Instruction::Closure { .. } | Instruction::Concat { .. } | Instruction::GetI { .. } | Instruction::GetTable { .. }
+    )
+}
+
+/// Some instructions' helpers need the callee's heap frame, so a direct call pushes it up front when every path to a
+/// return runs one; a callee that can return without them pushes it lazily, only when such a helper runs.
 pub(crate) fn needs_frame(function: &Proto) -> bool {
-    function.code.iter().any(|instruction| {
-        matches!(
-            instruction,
-            Instruction::NewTable { .. }
-                | Instruction::SetList { .. }
-                | Instruction::Closure { .. }
-                | Instruction::Concat { .. }
-                | Instruction::GetI { .. }
-                | Instruction::GetTable { .. }
-        )
-    })
+    let mut seen = vec![false; function.code.len()];
+    let mut stack = vec![0];
+    while let Some(pc) = stack.pop() {
+        if pc >= seen.len() || std::mem::replace(&mut seen[pc], true) || needs_frame_at(function.code[pc]) {
+            continue;
+        }
+        let next = crate::jit::ssa::flow::successors(function, pc);
+        if next.is_empty() {
+            return false;
+        }
+        stack.extend(next);
+    }
+    true
 }
 
 /// Only frameless callees keep a call from an inlined frame cheap; any other callee pushes the inlined frames on every call.

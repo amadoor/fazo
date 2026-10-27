@@ -401,6 +401,25 @@ impl Asm for A64 {
         self.cmp_imm(SCRATCH2, i32::from(value));
     }
 
+    fn cmp_mem(&mut self, left: u8, base: u8, disp: i32) {
+        self.load(Width::Q, SCRATCH2, base, disp);
+        if left == STACK {
+            self.lea(LINK, STACK, 0);
+            self.asm().cmp(r(LINK), r(SCRATCH2));
+            return;
+        }
+        self.asm().cmp(r(left), r(SCRATCH2));
+    }
+
+    fn cmp_mem_imm(&mut self, width: Width, base: u8, disp: i32, value: i32) {
+        if width == Width::W {
+            self.load_i32(LINK, base, disp);
+        } else {
+            self.load(Width::Q, LINK, base, disp);
+        }
+        self.compare_imm(LINK, i64::from(value));
+    }
+
     fn cmp_byte(&mut self, left: u8, value: u8) {
         self.asm().uxtb(rw(SCRATCH2), rw(left));
         self.asm().cmp(rw(SCRATCH2), imm(value));
@@ -520,7 +539,7 @@ impl Asm for A64 {
     }
 
     /// Follows Baseline's AArch64 prologue (`baseline/a64.rs`, `frame::prologue`) with two more pairs.
-    fn prologue(&mut self, frame: u32, _floats: &[(u8, u32)], pc_dst: u8, _saved: &[u8]) -> unwind::Prologue {
+    fn prologue(&mut self, frame: u32, _floats: &[(u8, u32)], pc_dst: Option<u8>, _saved: &[u8]) -> unwind::Prologue {
         let mut prologue = unwind::Prologue { arch: unwind::Arch::A64, frame, ..unwind::Prologue::default() };
         self.asm().stp(r(FRAME), r(LINK), ptr_pre(r(STACK), -16));
         prologue.save_frame = self.offset();
@@ -535,7 +554,9 @@ impl Asm for A64 {
         }
         prologue.alloc = self.offset();
         self.asm().mov(r(CTX), r(0));
-        self.asm().mov(rw(pc_dst), rw(1));
+        if let Some(pc_dst) = pc_dst {
+            self.asm().mov(rw(pc_dst), rw(1));
+        }
         prologue
     }
 

@@ -19,6 +19,14 @@ impl Default for Policy {
 pub(crate) struct Candidate<'a> {
     pub(crate) proto: &'a Proto,
     pub(crate) reference: Ref<Proto>,
+    /// The only closure the site has seen and its upvalue list, which the call guards instead of the prototype.
+    pub(crate) closure: Option<KnownClosure>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct KnownClosure {
+    pub(crate) closure: u64,
+    pub(crate) upvalues: u64,
 }
 
 pub(crate) fn candidate<'a>(proto: &'a Proto, reference: Ref<Proto>, policy: &Policy) -> Option<Candidate<'a>> {
@@ -26,7 +34,7 @@ pub(crate) fn candidate<'a>(proto: &'a Proto, reference: Ref<Proto>, policy: &Po
         return None;
     }
     let inlinable = proto.code.iter().enumerate().all(|(pc, &instruction)| inlinable(proto, pc, instruction));
-    inlinable.then_some(Candidate { proto, reference })
+    inlinable.then_some(Candidate { proto, reference, closure: None })
 }
 
 /// `RETURN` with every result follows each `TAILCALL`, which never reaches it when the callee inlines.

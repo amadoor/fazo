@@ -14,6 +14,9 @@ const MAX_VICINITY: usize = 4;
 const HASH_SEARCH_SEED: u64 = 0x9E37_79B9;
 const SMALL_ARRAY_BYTES: usize = 1024;
 
+/// No shape has this reference, so compiled code compares an unshaped table's shape without reading `shaped`.
+pub(crate) const UNSHAPED: Ref<Shape> = Ref::new(u32::MAX, u32::MAX);
+
 #[repr(C)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Table {
@@ -429,7 +432,7 @@ impl Table {
         let hash_size = entries.len() + self.nodes.iter().filter(|node| !node.value.is_nil()).count();
         self.resize(self.array.len(), hash_size.max(1), headroom)?;
         self.shaped = false;
-        self.shape = ROOT;
+        self.shape = UNSHAPED;
         self.slots = Vec::new();
         self.length_hint.set(length_hint);
         for (key, value) in entries {

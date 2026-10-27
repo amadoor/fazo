@@ -155,6 +155,8 @@ pub(super) struct Gen<'a, A: Asm> {
     /// A call into a vararg prototype moves the results' place, so every call writes `ret_offset`.
     pub(super) calls_vararg: bool,
     pub(super) failed: bool,
+    /// A latch's poll left its flags for the block's jump, which branches back on them and leaves to the stub.
+    pub(super) poll: Option<Label>,
 }
 
 pub(super) struct Generated<A> {
@@ -166,6 +168,8 @@ pub(super) struct Generated<A> {
     pub(super) exit_with: Label,
     pub(super) tail_exit: Label,
     pub(super) roots: Vec<(u32, Label)>,
+    /// The prologue runs straight into the only root, which is the first block.
+    pub(super) falls_into: bool,
 }
 
 /// One extra value past the instructions holds the VM register base between nodes that cannot move the stack.
@@ -223,13 +227,16 @@ impl<'a, A: Asm> Gen<'a, A> {
             idom: None,
             settled: None,
             calls_vararg: env.calls.iter().flatten().any(|target| target.vararg),
+            poll: None,
             failed: false,
         }
     }
 
     pub(super) fn run(mut self) -> Option<Generated<A>> {
         let roots = self.roots();
+        let falls_into = roots.len() == 1 && self.func.osr.is_empty() && self.env.tier_budget.is_none() && self.live.order.first() == self.func.entry.as_ref();
         let order = self.live.order.clone();
+        debug_assert_eq!(self.asm.offset(), 0, "the first block starts the body");
         for (index, &block) in order.iter().enumerate() {
             self.next_block = order.get(index + 1).copied();
             self.block(block);
@@ -247,6 +254,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             exit_with: self.exit_with,
             tail_exit: self.tail_exit,
             roots,
+            falls_into,
         })
     }
 
@@ -722,7 +730,10 @@ impl<'a, A: Asm> Gen<'a, A> {
     pub(super) fn saves(&mut self, after: &[Val]) -> Vec<(PReg, u32, bool)> {
         self.alloc.release(self.base_value());
         let value = self.current;
-        let needed = self.state_values(value);
+        let mut needed = self.state_values(value);
+        if let Some(&Op::CallLua { callee: Some(callee), .. }) = self.func.insts.get(value.0 as usize).map(|inst| &inst.op) {
+            needed.retain(|&used| used != callee);
+        }
         let dying = self.dying.get(self.position).cloned().unwrap_or_default();
         self.alloc.across_call(|part| {
             let held = value_of(part);
@@ -818,6 +829,15 @@ impl<'a, A: Asm> Gen<'a, A> {
     }
 
     fn jump(&mut self, edge: &Edge) {
+        if let Some(slow) = self.poll.take() {
+            if !self.needs_moves(edge) && self.next_block != Some(edge.block) {
+                let label = self.label(edge.block);
+                self.asm.branch(Cond::Eq, label);
+                self.asm.jump(slow);
+                return;
+            }
+            self.asm.branch(Cond::Ne, slow);
+        }
         self.edge_moves(edge);
         if self.next_block != Some(edge.block) {
             let label = self.label(edge.block);

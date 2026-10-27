@@ -711,7 +711,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 self.guard(flagged, state);
                 Word::None
             }
-            Op::CallLua { pc, a, b, c, inlined: None } => Word::One(self.call_lua(pc as usize, (a, b, c))),
+            Op::CallLua { pc, a, b, c, inlined: None, .. } => Word::One(self.call_lua(pc as usize, (a, b, c))),
             Op::CallLua { inlined: Some(_), .. } => unreachable!("Peak graphs make no calls from inlined frames"),
             Op::Safepoint { pc, state, .. } => {
                 self.safepoint(pc, state);
@@ -1397,6 +1397,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 let address = self.closure_address(self.one(value));
                 self.builder.ins().load(types::I64, self.heap_flags, address, self.env.frames.closure_upvalues)
             }
+            Closure::Known(known) => self.iconst(types::I64, known.upvalues as i64),
         }
     }
 
@@ -1436,6 +1437,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let owner = match closure {
             Closure::Root => self.ctx_load(types::I64, offset_of!(JitCtx, closure)),
             Closure::Value(value) => self.one(value),
+            Closure::Known(known) => self.iconst(types::I64, known.closure as i64),
         };
         let owner = (self.iconst(types::I64, CLOSURE_TAG), owner);
         self.call_value(runtime::KIND_SET_UPVALUE, &[pair, owner], u32::from(index));

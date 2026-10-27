@@ -152,6 +152,7 @@ fn closure_text(closure: Closure) -> String {
     match closure {
         Closure::Root => "root".to_owned(),
         Closure::Value(value) => format!("v{}", value.0),
+        Closure::Known(known) => format!("k{:#x}", known.closure),
     }
 }
 
@@ -221,7 +222,7 @@ pub(crate) fn describe(op: &Op) -> String {
         }
         Op::Materialize { object } => format!("materialize {}", virtual_text(object)),
         Op::GuardAbsent { table, bit, state } => format!("guard.absent {} bit{bit} s{}", v(table), state.0),
-        Op::CallLua { pc, a, b, c, inlined: None } => format!("call @{pc} r{a} b{b} c{c}"),
+        Op::CallLua { pc, a, b, c, inlined: None, .. } => format!("call @{pc} r{a} b{b} c{c}"),
         Op::CallLua { pc, b, c, inlined: Some(call), .. } => format!("call inlined{call} @{pc} b{b} c{c}"),
         Op::Safepoint { pc, weight, requests, state } => format!("safepoint @{pc} x{weight} {} s{}", v(requests), state.0),
         Op::Requests => "requests".to_string(),

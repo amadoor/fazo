@@ -11,6 +11,9 @@ pub(crate) fn run(func: &mut Func) {
     if untag_loop_params(func) {
         propagate(func);
     }
+    if merge_nil_guards(func) {
+        propagate(func);
+    }
     eliminate_guards(func);
     specialize(func);
     propagate(func);
@@ -249,6 +252,45 @@ fn set_operands(func: &mut Func, value: Val, new_left: Val, new_right: Val) {
         *left = new_left;
         *right = new_right;
     }
+}
+
+/// A not-nil guard whose value a later type guard of the same block checks again, with nothing in between that can
+/// act, checks the type itself: deoptimizing at the earlier state only repeats reads.
+fn merge_nil_guards(func: &mut Func) -> bool {
+    if !func.insts.iter().any(|inst| matches!(inst.op, Op::GuardNotNil { .. })) {
+        return false;
+    }
+    let mut merged = false;
+    let mut open: Vec<Val> = Vec::new();
+    for block in 0..func.blocks.len() {
+        open.clear();
+        for position in 0..func.blocks[block].insts.len() {
+            let value = func.blocks[block].insts[position];
+            match *func.op(value) {
+                Op::GuardType { value: input, ty, .. } if ty.intersect(Type::NIL).is_none() => {
+                    if open.contains(&input)
+                        && let Op::GuardNotNil { value: loaded, state } = *func.op(input)
+                    {
+                        func.inst_mut(input).op = Op::GuardType { value: loaded, ty, state };
+                        merged = true;
+                    }
+                }
+                Op::GuardNotNil { .. } => open.push(value),
+                _ if quiet(func.op(value)) => {}
+                _ => open.clear(),
+            }
+        }
+    }
+    merged
+}
+
+fn quiet(op: &Op) -> bool {
+    op.is_pure()
+        || matches!(
+            op,
+            Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadUpval { .. } | Op::TableAddr { .. } | Op::ArrayBase { .. } | Op::ShapeIs { .. }
+                | Op::GuardType { .. } | Op::GuardShape { .. } | Op::GuardEq { .. } | Op::GuardNotNil { .. } | Op::GuardNoMeta { .. } | Op::GuardHasMeta { .. }
+        )
 }
 
 fn eliminate_guards(func: &mut Func) {

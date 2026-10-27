@@ -575,6 +575,15 @@ mod x64_encoding {
     fn the_budget_is_spent_in_memory() {
         let i = one(|x| x.cmp_mem_byte(0, 0, 0));
         assert_eq!((i.mnemonic(), i.memory_size()), (Mnemonic::Cmp, iced_x86::MemorySize::UInt8));
+        let i = one(|x| x.cmp_mem(4, 3, 0x38));
+        assert_eq!((i.mnemonic(), i.op0_register(), i.memory_size()), (Mnemonic::Cmp, Register::RSP, iced_x86::MemorySize::UInt64));
+        at(&i, 3, 0x38);
+        let i = one(|x| x.cmp_mem_imm(Width::Q, 3, 0x98, 0));
+        assert_eq!((i.mnemonic(), i.memory_size(), i.immediate(1)), (Mnemonic::Cmp, iced_x86::MemorySize::UInt64, 0));
+        at(&i, 3, 0x98);
+        let i = one(|x| x.cmp_mem_imm(Width::W, 3, 0x80, 1));
+        assert_eq!((i.mnemonic(), i.memory_size(), i.immediate(1)), (Mnemonic::Cmp, iced_x86::MemorySize::UInt32, 1));
+        at(&i, 3, 0x80);
         let i = one(|x| x.add_mem(13, 3, 0x18));
         assert_eq!((i.mnemonic(), i.op0_register()), (Mnemonic::Add, Register::R13));
         at(&i, 3, 0x18);
@@ -610,7 +619,7 @@ mod x64_encoding {
     #[test]
     fn prologue_and_tail_epilogue_save_only_the_given_registers() {
         let head = listing(|a| {
-            a.prologue(32, &[], 0, &[3, 13]);
+            a.prologue(32, &[], Some(0), &[3, 13]);
         });
         assert_eq!(head[..4], ["push rbp", "mov rbp,rsp", "push rbx", "push r13"], "{head:?}");
         assert_eq!(listing(|a| a.tail_epilogue(32, &[], &[3, 13])), ["lea rsp,[rbp-10h]", "pop r13", "pop rbx", "pop rbp", "jmp rax"]);
@@ -690,6 +699,10 @@ mod a64_encoding {
         assert_eq!(listing(|a| a.load_f(3, 19, 8)), ["ldr d3, [x19, #0x8]"]);
         assert_eq!(listing(|a| a.copy16(3, (31, 64), (19, 16))), ["ldr q3, [x19, #0x10]", "str q3, [sp, #0x40]"]);
         assert_eq!(listing(|a| a.lea(3, 31, 48)), ["add x3, sp, #0x30"]);
+        assert_eq!(listing(|a| a.cmp_mem(31, 19, 0x38)), ["ldr x17, [x19, #0x38]", "mov x30, sp", "cmp x30, x17"]);
+        assert_eq!(listing(|a| a.cmp_mem(3, 19, 0x38)), ["ldr x17, [x19, #0x38]", "cmp x3, x17"]);
+        assert_eq!(listing(|a| a.cmp_mem_imm(Width::Q, 19, 0x98, 0)), ["ldr x30, [x19, #0x98]", "cmp x30, #0x0"]);
+        assert_eq!(listing(|a| a.cmp_mem_imm(Width::W, 19, 0x80, 1)).last().map(String::as_str), Some("cmp x30, #0x1"));
     }
 
     #[test]
@@ -726,7 +739,7 @@ mod a64_encoding {
     #[test]
     fn the_prologue_and_epilogue_mirror_each_other() {
         let mut asm = A64::new();
-        let prologue = asm.prologue(64, &[], 16, &[]);
+        let prologue = asm.prologue(64, &[], Some(16), &[]);
         asm.epilogue(64, &[], 3, &[]);
         let lines = words(&asm.finish().expect("the code assembles"));
         assert_eq!(lines[0], "stp x29, x30, [sp, #-0x10]!");

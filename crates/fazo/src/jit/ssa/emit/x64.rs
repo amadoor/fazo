@@ -620,6 +620,15 @@ impl Asm for X64 {
         self.byte(value);
     }
 
+    fn cmp_mem(&mut self, left: u8, base: u8, disp: i32) {
+        self.op(None, Size::Qword, &[0x3b], left, Rm::Mem(base, disp));
+    }
+
+    fn cmp_mem_imm(&mut self, width: Width, base: u8, disp: i32, value: i32) {
+        let size = if width == Width::W { Size::Dword } else { Size::Qword };
+        self.group_imm(CMP, size, Rm::Mem(base, disp), value);
+    }
+
     fn test_imm(&mut self, left: u8, mask: i32) {
         self.op(None, Size::Qword, &[0xf7], 0, Rm::Reg(left));
         self.imm32(mask);
@@ -795,7 +804,7 @@ impl Asm for X64 {
         self.bytes(&[0x0f, 0x0b]);
     }
 
-    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8, saved: &[u8]) -> unwind::Prologue {
+    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: Option<u8>, saved: &[u8]) -> unwind::Prologue {
         let mut prologue = unwind::Prologue { arch: unwind::Arch::X64, frame, ..unwind::Prologue::default() };
         self.push(RBP);
         prologue.save_frame = self.offset();
@@ -813,7 +822,9 @@ impl Asm for X64 {
             prologue.float_saves.push((self.offset(), reg, at));
         }
         self.mov_rr(RBX, ARGS[0]);
-        self.op(None, Size::Dword, &[0x89], ARGS[1], Rm::Reg(pc_dst));
+        if let Some(pc_dst) = pc_dst {
+            self.op(None, Size::Dword, &[0x89], ARGS[1], Rm::Reg(pc_dst));
+        }
         prologue
     }
 

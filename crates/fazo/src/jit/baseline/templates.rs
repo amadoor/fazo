@@ -1252,9 +1252,6 @@ fn register_table(m: &mut dyn Masm, env: &Env) {
 
 fn table_shape(m: &mut dyn Masm, env: &Env) {
     let layout = layout(env);
-    m.load(Width::U8, Reg::T1, Reg::T0, fixed(i64::from(layout.shaped)));
-    m.cmp_imm(Reg::T1, 0);
-    m.branch(Cond::Eq, slow());
     m.load(Width::U64, Reg::T1, Reg::T0, fixed(i64::from(layout.shape)));
 }
 
@@ -1387,9 +1384,6 @@ fn index_class(m: &mut dyn Masm, env: &Env, other: Target) {
     m.branch(Cond::Eq, other);
     m.load(Width::U32, Reg::T2, Reg::T0, fixed(i64::from(layout.metatable_index)));
     table_address(m, env, Reg::T2);
-    m.load(Width::U8, Reg::T1, Reg::T0, fixed(i64::from(layout.shaped)));
-    m.cmp_imm(Reg::T1, 0);
-    m.branch(Cond::Eq, other);
     m.load(Width::U64, Reg::T1, Reg::T0, fixed(i64::from(layout.shape)));
     m.mov_imm(Reg::T2, reg(slot::Z));
     m.cmp(Reg::T1, Reg::T2);
@@ -1406,9 +1400,6 @@ fn index_class(m: &mut dyn Masm, env: &Env, other: Target) {
     m.branch(Cond::Ne, other);
     m.mov_imm(Reg::T0, reg(slot::C));
     table_address(m, env, Reg::T0);
-    m.load(Width::U8, Reg::T1, Reg::T0, fixed(i64::from(layout.shaped)));
-    m.cmp_imm(Reg::T1, 0);
-    m.branch(Cond::Eq, other);
     m.load(Width::U64, Reg::T1, Reg::T0, fixed(i64::from(layout.shape)));
     m.mov_imm(Reg::T2, reg(slot::U));
     m.cmp(Reg::T1, Reg::T2);

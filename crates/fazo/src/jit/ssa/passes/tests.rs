@@ -117,6 +117,7 @@ fn built_with(source: &str, insufficient: &[u32]) -> Func {
         builtin_of: &builtin_of,
         running_floats: &[],
         inlined_calls: true,
+        upvalues_of: &|_| None,
     };
     build::build(heap.protos.live(reference), &facts)
 }
@@ -144,6 +145,7 @@ fn built_after_running(source: &str, inlined_calls: bool) -> Func {
         builtin_of: &builtin_of,
         running_floats: &[],
         inlined_calls,
+        upvalues_of: &|_| None,
     };
     build::build(heap.protos.live(reference), &facts)
 }
@@ -246,6 +248,29 @@ fn type_propagation_guards_integer_division_by_zero_and_drops_proven_guards() {
 }
 
 #[test]
+fn a_not_nil_guard_takes_the_type_a_later_guard_checks_when_nothing_acts_between() {
+    let (mut func, block) = straight_line();
+    let read = state(&mut func, 1);
+    let add = state(&mut func, 2);
+    let loaded = func.append(block, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let present = func.append(block, Op::GuardNotNil { value: loaded, state: read }, Type::ANY.without(Type::NIL), Rep::Boxed);
+    let one = constant(&mut func, block, Const::Int(1));
+    let integer = func.append(block, Op::GuardType { value: present, ty: Type::INT, state: add }, Type::INT, Rep::Boxed);
+    let sum = func.append(block, Op::Binary(BinOp::IAdd, integer, one), Type::INT, Rep::Int);
+    returns(&mut func, block, sum);
+    let other = func.append(block, Op::LoadReg { slot: 2 }, Type::ANY, Rep::Boxed);
+    let kept = func.append(block, Op::GuardNotNil { value: other, state: read }, Type::ANY.without(Type::NIL), Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 3, value: one }, Type::NONE, Rep::None);
+    let later = func.append(block, Op::GuardType { value: kept, ty: Type::INT, state: add }, Type::INT, Rep::Boxed);
+    returns(&mut func, block, later);
+    types::run(&mut func);
+    assert_eq!(func.op(present), &Op::GuardType { value: loaded, ty: Type::INT, state: read });
+    assert!(!func.block(block).insts.contains(&integer), "the later guard checks nothing new");
+    assert!(matches!(func.op(kept), Op::GuardNotNil { .. }), "a store between keeps the guards apart");
+    assert!(func.block(block).insts.contains(&later));
+}
+
+#[test]
 fn type_propagation_meets_loop_parameters_at_a_fixpoint() {
     let mut func = built("local function f(n) local s = 0 for i = 1, n do s = s + 0.5 end return s end");
     types::run(&mut func);
@@ -344,6 +369,28 @@ fn cse_merges_guards_but_not_across_a_store_that_moves_shapes() {
 }
 
 #[test]
+fn cse_merges_array_loads_until_an_op_that_may_run_code() {
+    let (mut func, block) = straight_line();
+    let s = state(&mut func, 1);
+    let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let table = func.append(block, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
+    let base = func.append(block, Op::ArrayBase { table }, Type::NONE, Rep::Word);
+    let index = constant(&mut func, block, Const::Int(1));
+    let first = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
+    let second = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 1, value: second }, Type::NONE, Rep::None);
+    let read = func.append(block, Op::Index { object: loaded, key: index, state: s }, Type::ANY, Rep::Boxed);
+    let third = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 2, value: read }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreReg { slot: 3, value: third }, Type::NONE, Rep::None);
+    func.block_mut(block).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
+    fold::run(&mut func);
+    let insts = &func.block(block).insts;
+    assert!(insts.contains(&first) && !insts.contains(&second), "a repeated array load is merged");
+    assert!(insts.contains(&third), "an index may run a metamethod that writes the array");
+}
+
+#[test]
 fn representation_selection_unboxes_loop_parameters_and_boxes_at_stores() {
     let mut func = built("local function f(n) local s = 0 for i = 1, n do s = s + i end return s end");
     types::run(&mut func);
@@ -407,7 +454,7 @@ fn hoisting_leaves_memory_guards_in_loops_that_call_out() {
     let shape = fixture.func.add_inst(Op::GuardShape { table: fixture.guard, shape: 3, state: s }, Type::NONE, Rep::None);
     let header = fixture.header;
     fixture.func.block_mut(header).insts.insert(1, shape);
-    let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }, Type::NONE, Rep::Word);
+    let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None, callee: None }, Type::NONE, Rep::Word);
     fixture.func.block_mut(header).insts.insert(2, call);
     hoist::run(&mut fixture.func);
     assert!(fixture.func.block(fixture.preheader).insts.contains(&fixture.guard), "a type guard reads no memory");
@@ -470,7 +517,7 @@ fn hoisting_moves_the_request_flags_out_of_a_loop_without_calls_only() {
         let poll = fixture.func.add_inst(Op::Safepoint { pc: 3, weight: 2, requests, state: s }, Type::NONE, Rep::None);
         fixture.func.block_mut(header).insts.insert(1, poll);
         if calls {
-            let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }, Type::NONE, Rep::Word);
+            let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None, callee: None }, Type::NONE, Rep::Word);
             fixture.func.block_mut(header).insts.insert(2, call);
         }
         hoist::run(&mut fixture.func);
@@ -567,7 +614,7 @@ fn load_forwarding_forgets_fields_across_calls() {
     let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
     let table = func.append(block, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
     let first = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
-    func.append(block, Op::CallLua { pc: 1, a: 2, b: 1, c: 1, inlined: None }, Type::NONE, Rep::None);
+    func.append(block, Op::CallLua { pc: 1, a: 2, b: 1, c: 1, inlined: None, callee: None }, Type::NONE, Rep::None);
     let second = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
     func.append(block, Op::StoreReg { slot: 1, value: first }, Type::NONE, Rep::None);
     func.append(block, Op::StoreReg { slot: 2, value: second }, Type::NONE, Rep::None);
@@ -819,7 +866,7 @@ fn table_addresses_move_to_the_preheader_of_a_loop_that_cannot_allocate() {
 fn table_addresses_are_recomputed_after_a_call() {
     let mut fixture = counted_loop();
     hoist::run(&mut fixture.func);
-    let reads = table_reads(&mut fixture, Some(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }));
+    let reads = table_reads(&mut fixture, Some(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None, callee: None }));
     address::run(&mut fixture.func);
     check::check(&fixture.func, true).expect("the graph stays valid");
     let preheader = ops(&fixture.func, fixture.preheader);
@@ -834,7 +881,11 @@ fn an_accumulator_that_starts_as_an_integer_loops_as_a_float() {
     let header = func.loops.last().expect("one loop").header;
     let params = &func.block(header).params;
     assert!(params.iter().any(|&param| func.rep(param) == Rep::Float), "the sum is a float parameter:\n{func}");
-    assert!(params.iter().any(|&param| func.rep(param) == Rep::Bool), "a flag marks the first iteration:\n{func}");
+    assert!(params.iter().all(|&param| func.rep(param) != Rep::Bool), "the counted index marks the first iteration, so no flag loops:
+{func}");
+    let counted = func.loops.last().and_then(|entry| entry.counted.as_ref()).map(|counted| counted.index);
+    assert!(func.states.iter().flat_map(|state| &state.mixed).all(|mixed| mixed.start.is_some() && Some(mixed.first) == counted), "exits test the index:
+{func}");
     assert!(params.iter().all(|&param| func.rep(param) != Rep::Boxed), "no boxed number goes around the loop:\n{func}");
     assert!(func.states.iter().any(|state| !state.mixed.is_empty()), "the loop's frame states rebuild the sum:\n{func}");
 }

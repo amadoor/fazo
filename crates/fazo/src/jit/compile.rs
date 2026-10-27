@@ -36,6 +36,8 @@ pub(crate) struct CompileFacts<'a> {
     /// The cell Optimizing code charges its work to, when it may tier up to Peak.
     pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
     pub(crate) call_targets: &'a dyn Fn(Ref<Proto>, usize) -> Vec<CallTarget>,
+    /// A live closure's upvalue list, which stays put for the closure's lifetime.
+    pub(crate) upvalues_of: &'a dyn Fn(Ref<crate::object::Closure>) -> Option<u64>,
 }
 
 /// The compiled unit, and the optimized graph's text when `dump` asks for it.
@@ -137,6 +139,7 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, (pipelin
         builtin_of: facts.builtin_of,
         running_floats: facts.running_floats,
         inlined_calls,
+        upvalues_of: facts.upvalues_of,
     };
     let mut func = build::build(proto, &builder_facts);
     func.float_guess = facts.float_guess;

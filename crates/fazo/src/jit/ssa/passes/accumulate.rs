@@ -98,10 +98,11 @@ fn split(func: &mut Func, entry: &Loop, position: usize, found: Found) {
     let Found { param, entry: start, conversions } = found;
     let conversion = if func.ty(start).within(Type::INT) { UnOp::IToF } else { UnOp::NumToF };
     let float_start = func.append(entry.preheader, Op::Unary(conversion, start), Type::FLOAT, Rep::Float);
+    let counted = counted_start(func, entry);
     let first = func.append(entry.preheader, Op::Const(Const::Bool(true)), Type::BOOL, Rep::Bool);
     let later = func.append(entry.preheader, Op::Const(Const::Bool(false)), Type::BOOL, Rep::Bool);
     let float = func.add_param(entry.header, Type::FLOAT, Rep::Float);
-    let flag = func.add_param(entry.header, Type::BOOL, Rep::Bool);
+    let flag = counted.is_none().then(|| func.add_param(entry.header, Type::BOOL, Rep::Bool));
     func.block_mut(entry.header).params.remove(position);
     for block in std::iter::once(entry.preheader).chain(entry.blocks.iter().copied()) {
         let from_entry = block == entry.preheader;
@@ -111,7 +112,9 @@ fn split(func: &mut Func, entry: &Loop, position: usize, found: Found) {
             }
             let arg = edge.args.remove(position);
             edge.args.push(if from_entry { float_start } else { arg });
-            edge.args.push(if from_entry { first } else { later });
+            if flag.is_some() {
+                edge.args.push(if from_entry { first } else { later });
+            }
         }
     }
     let mut map = func.identity_map();
@@ -120,11 +123,29 @@ fn split(func: &mut Func, entry: &Loop, position: usize, found: Found) {
         map[conversion.0 as usize] = float;
         dead[conversion.0 as usize] = true;
     }
+    dead[first.0 as usize] = flag.is_none();
+    dead[later.0 as usize] = flag.is_none();
     func.rewrite_uses(&map);
     remove(func, &dead);
+    let (first, start_index) = match (flag, counted) {
+        (Some(flag), _) => (flag, None),
+        (None, Some((index, start_index))) => (index, Some(start_index)),
+        (None, None) => unreachable!("a loop without a counted index keeps a flag"),
+    };
     for state in &mut func.states {
         if state.slots.iter().any(|&(_, value)| value == param) {
-            state.mixed.push(Mixed { value: param, first: flag, float, entry: start });
+            state.mixed.push(Mixed { value: param, first, start: start_index, float, entry: start });
         }
     }
+}
+
+/// A counted loop's index moves by a nonzero step every iteration, so it equals its entry value only in the first one
+/// and an exit can test it instead of a flag that lives through the loop.
+fn counted_start(func: &Func, entry: &Loop) -> Option<(Val, Val)> {
+    let index = entry.counted.as_ref()?.index;
+    let position = func.block(entry.header).params.iter().position(|&param| param == index)?;
+    let Term::Jump(edge) = &func.block(entry.preheader).term else {
+        return None;
+    };
+    Some((index, *edge.args.get(position)?))
 }

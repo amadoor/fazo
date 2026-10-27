@@ -79,12 +79,32 @@ pub(crate) fn format_string(out: &mut Vec<u8>, spec: &Spec, text: &[u8]) {
     pad(out, spec, b"", kept, false)
 }
 
+/// The digits are counted first, so they fill the inline buffer in place and nothing is copied or reversed.
 pub(crate) fn decimal(value: i64) -> smallvec::SmallVec<[u8; 24]> {
-    let mut digits = radix_digits(value.unsigned_abs(), 10, false);
-    if value < 0 {
-        digits.insert(0, b'-');
+    let mut magnitude = value.unsigned_abs();
+    let mut buffer = [0u8; 24];
+    let mut length = usize::from(value < 0) + decimal_width(magnitude);
+    let size = length;
+
+    buffer[0] = b'-';
+    loop {
+        length -= 1;
+        buffer[length] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
     }
-    digits
+    smallvec::SmallVec::from_buf_and_len(buffer, size)
+}
+
+fn decimal_width(mut magnitude: u64) -> usize {
+    let mut width = 1;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        width += 1;
+    }
+    width
 }
 
 pub(crate) fn quote_string(text: &[u8]) -> Vec<u8> {

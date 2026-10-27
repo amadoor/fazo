@@ -35,6 +35,7 @@ pub(crate) struct Facts<'a> {
     /// An accumulator that changed kind inside the loop is entered as a number, so the guard checks only that.
     pub(crate) running_floats: &'a [bool],
     pub(crate) inlined_calls: bool,
+    pub(crate) upvalues_of: &'a dyn Fn(Ref<crate::object::Closure>) -> Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -80,6 +81,7 @@ struct Frame<'a> {
     inline_prep: Vec<bool>,
     returns: Vec<Incoming>,
     caller: Option<(u32, i32)>,
+    known: Option<inline::KnownClosure>,
 }
 
 pub(crate) fn build<'a>(proto: &'a Proto, facts: &Facts<'a>) -> Func {
@@ -179,6 +181,7 @@ impl<'a> Builder<'a, '_> {
             inline_prep: vec![false; length],
             returns: Vec::new(),
             caller,
+            known: None,
         }
     }
 
@@ -289,6 +292,13 @@ impl<'a> Builder<'a, '_> {
                 self.effect(Op::StoreReg { slot: slot as u32, value });
                 self.regs[slot] = Reg::Val(value, false);
             }
+        }
+    }
+
+    fn known(&self, slot: u32) -> Option<Val> {
+        match self.regs.get(slot as usize) {
+            Some(&Reg::Val(value, _)) => Some(value),
+            _ => None,
         }
     }
 
@@ -884,6 +894,9 @@ impl<'a> Builder<'a, '_> {
         if frame.chain.is_empty() {
             return Closure::Root;
         }
+        if let Some(known) = frame.known {
+            return Closure::Known(known);
+        }
         let slot = frame.base - 1;
         let value = match self.regs.get(slot as usize).copied() {
             Some(Reg::Val(value, _)) => value,
@@ -1439,8 +1452,9 @@ impl<'a> Builder<'a, '_> {
         if frame.site.is_some() {
             return self.inlined_call(frame, pc, (a, b, c));
         }
+        let callee = self.known(Self::slot(frame, a));
         self.flush();
-        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined: None }, Type::NONE, Rep::Word);
+        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined: None, callee }, Type::NONE, Rep::Word);
         self.forget();
         self.switch(frame, pc, code)
     }
@@ -1453,13 +1467,14 @@ impl<'a> Builder<'a, '_> {
         if !self.facts.inlined_calls || b == 0 || c == 0 || !self.speculates(frame, pc) {
             return self.deopt(frame, pc);
         }
+        let callee = self.known(Self::slot(frame, a));
         self.flush();
         let eager = self.state_at(frame, pc);
         let resume = self.lazy_state_at(frame, pc + 1);
         let call = InlinedCall { proto, pc: pc as u32, slot: Self::slot(frame, a), b, c, eager, resume };
         self.func.inlined_calls.push(call);
         let inlined = Some(self.func.inlined_calls.len() as u32 - 1);
-        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined }, Type::NONE, Rep::Word);
+        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined, callee }, Type::NONE, Rep::Word);
         self.forget();
         self.switch(frame, pc, code)
     }
@@ -1487,7 +1502,10 @@ impl<'a> Builder<'a, '_> {
         if base as usize + usize::from(function.max_stack) > crate::vm::REGISTER_SPAN {
             return None;
         }
-        let candidate = inline::candidate(function, reference, &self.facts.policy)?;
+        let mut candidate = inline::candidate(function, reference, &self.facts.policy)?;
+        if let (false, LuaValue::Closure(closure)) = (callee.shared, callee.value) {
+            candidate.closure = (self.facts.upvalues_of)(closure).map(|upvalues| inline::KnownClosure { closure: closure.packed(), upvalues });
+        }
         self.calls_inline(function, base, depth).then_some(candidate)
     }
 
@@ -1620,8 +1638,12 @@ impl<'a> Builder<'a, '_> {
         let state = self.state_at(frame, pc);
         let function = self.read(frame, a);
         let closure = self.emit(Op::GuardType { value: function, ty: Type::CLOSURE, state }, Type::CLOSURE, Rep::Boxed);
-        let proto = self.emit(Op::LoadProto { closure }, Type::NONE, Rep::Word);
-        self.effect(Op::GuardEq { value: proto, expected: candidate.reference.packed(), state });
+        if let Some(known) = candidate.closure {
+            self.effect(Op::GuardEq { value: closure, expected: known.closure, state });
+        } else {
+            let proto = self.emit(Op::LoadProto { closure }, Type::NONE, Rep::Word);
+            self.effect(Op::GuardEq { value: proto, expected: candidate.reference.packed(), state });
+        }
         let returns = self.inline_body(frame, pc, (a, b, c), closure, candidate);
         self.finish_inline(frame, pc, returns)
     }
@@ -1640,7 +1662,7 @@ impl<'a> Builder<'a, '_> {
             let same = self.emit(Op::EqConst(proto, Const::Int(candidate.reference.packed() as i64)), Type::BOOL, Rep::Bool);
             self.branch_or(same, next);
             self.regs.clone_from(&regs);
-            returns.append(&mut self.inline_body(frame, pc, (a, b, c), closure, candidate));
+            returns.append(&mut self.inline_body(frame, pc, (a, b, c), closure, inline::Candidate { closure: None, ..candidate }));
             self.current = Some(next);
         }
         self.regs = regs;
@@ -1662,6 +1684,7 @@ impl<'a> Builder<'a, '_> {
         chain.push(InlineFrame { base, caller_pc: pc as u32 + 1, wanted, proto: candidate.reference.packed(), tail: false });
         let site = frame.site.unwrap_or(pc as u32);
         let mut callee = self.frame(candidate.proto, base, chain, Some(site), Some((Self::slot(frame, a), wanted)));
+        callee.known = candidate.closure;
         for slot in base + u32::from(candidate.proto.num_params).max(arguments)..base + u32::from(candidate.proto.max_stack) {
             self.ensure_slot(slot);
             self.regs[slot as usize] = Reg::Mem;

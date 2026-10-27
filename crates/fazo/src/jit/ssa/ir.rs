@@ -221,6 +221,7 @@ pub(crate) enum NumOp {
 pub(crate) enum Closure {
     Root,
     Value(Val),
+    Known(super::passes::inline::KnownClosure),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -283,7 +284,8 @@ pub(crate) enum Op {
     NewTable { hash_log: u8, top: u32, shape: Option<u64>, fields: Box<[Val]>, state: StateId, after: StateId },
     Materialize { object: Box<Virtual> },
     GuardAbsent { table: Val, bit: u8, state: StateId },
-    CallLua { pc: u32, a: u8, b: u8, c: u8, inlined: Option<u32> },
+    /// `callee` is the value the call's function register holds, when the graph knows it.
+    CallLua { pc: u32, a: u8, b: u8, c: u8, inlined: Option<u32>, callee: Option<Val> },
     /// `weight` is the loop's length in bytecodes, the work one iteration stands for.
     Safepoint { pc: u32, weight: u32, requests: Val, state: StateId },
     /// Fixed for the whole run, so a loop's poll can keep it in a register.
@@ -299,7 +301,8 @@ impl Op {
 
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
         match self {
-            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
+            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { callee: None, .. } | Op::Requests => {}
+            Op::CallLua { callee: Some(callee), .. } => f(*callee),
             Op::Safepoint { requests, .. } => f(*requests),
             Op::ArrayBase { table } | Op::TableAddr { table } => f(*table),
             Op::NewTable { fields, .. } => fields.iter().for_each(|&field| f(field)),
@@ -358,7 +361,8 @@ impl Op {
 
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Val) -> Val) {
         match self {
-            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
+            Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { callee: None, .. } | Op::Requests => {}
+            Op::CallLua { callee: Some(callee), .. } => *callee = f(*callee),
             Op::Safepoint { requests, .. } => *requests = f(*requests),
             Op::ArrayBase { table } | Op::TableAddr { table } => *table = f(*table),
             Op::NewTable { fields, .. } => fields.iter_mut().for_each(|field| *field = f(*field)),
@@ -658,7 +662,9 @@ pub(crate) struct FrameState {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct Mixed {
     pub(crate) value: Val,
+    /// A flag, or with `start` the counted loop's index, which equals `start` only in the first iteration.
     pub(crate) first: Val,
+    pub(crate) start: Option<Val>,
     pub(crate) float: Val,
     pub(crate) entry: Val,
 }
@@ -685,6 +691,7 @@ impl FrameState {
             match self.mixed(value) {
                 Some(mixed) => {
                     f(mixed.first);
+                    mixed.start.into_iter().for_each(&mut f);
                     f(mixed.float);
                     f(mixed.entry);
                 }
@@ -903,6 +910,7 @@ impl Func {
             state.objects.iter_mut().for_each(|object| object.map_operands(&mut map));
             for mixed in &mut state.mixed {
                 mixed.first = resolve(mixed.first);
+                mixed.start = mixed.start.map(&resolve);
                 mixed.float = resolve(mixed.float);
                 mixed.entry = resolve(mixed.entry);
             }

@@ -524,6 +524,7 @@ fn compiled_ir_size(statements: usize) -> usize {
         running_floats: &[],
         tier_budget: None,
         call_targets: &|_, _| Vec::new(),
+        upvalues_of: &|_| None,
     };
     let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
     unit.size()

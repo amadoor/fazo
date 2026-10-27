@@ -395,8 +395,10 @@ fn key(op: &Op, rep: Rep, map: &[Val]) -> Option<(Key, bool)> {
         Op::GuardNoMeta { bit, .. } => (14, [u64::from(*bit), 0], true),
         Op::ShapeIs { shape, .. } => (15, [*shape, 0], true),
         Op::GuardNode { node, nodes, key, .. } => (16, [u64::from(*node) << 32 | u64::from(*nodes), *key], true),
+        Op::LoadUpval { closure: Closure::Known(known), index } => (UPVALUE_KIND, [u64::from(*index) | 1 << 8, known.closure], true),
         Op::LoadUpval { closure, index } => (UPVALUE_KIND, [u64::from(*index), u64::from(matches!(closure, Closure::Root))], true),
         Op::LoadNode { node, .. } => (NODE_KIND, [u64::from(*node), 0], true),
+        Op::LoadArray { .. } => (ARRAY_KIND, [0, 0], true),
         Op::LoadProto { .. } => (19, [0, 0], false),
         Op::Requests => (21, [0, 0], false),
         Op::Builtin { function, .. } if function.is_pure() => (20, [*function as u64, 0], false),
@@ -495,6 +497,7 @@ fn cse(func: &mut Func, order: &[BlockId]) -> bool {
 
 const UPVALUE_KIND: u64 = 17;
 const NODE_KIND: u64 = 18;
+const ARRAY_KIND: u64 = 22;
 
 /// Follows LuaJIT's `fwd_ahload` (lj_opt_mem.c): a load of the node just stored reads the stored value. A store to the same node of another table may alias every load of that node.
 fn forward_store(local: &mut HashMap<Key, Val>, map: &[Val], (table, node, stored): (Val, u32, Val)) {
@@ -502,6 +505,17 @@ fn forward_store(local: &mut HashMap<Key, Val>, map: &[Val], (table, node, store
     let table = u64::from(super::super::ir::resolve(map, table).0);
     let key = Key([NODE_KIND, rep_code(Rep::Boxed), u64::from(node), 0, table, u64::MAX, u64::MAX]);
     local.insert(key, super::super::ir::resolve(map, stored));
+}
+
+/// Array loads are merged only across ops that run no metamethod and write no table.
+fn reads_quietly(op: &Op) -> bool {
+    op.is_pure()
+        || matches!(
+            op,
+            Op::LoadReg { .. } | Op::StoreReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadUpval { .. } | Op::LoadArray { .. } | Op::TableAddr { .. } | Op::ArrayBase { .. }
+                | Op::ShapeIs { .. } | Op::GuardType { .. } | Op::GuardShape { .. } | Op::GuardEq { .. } | Op::GuardNotNil { .. } | Op::GuardRange { .. }
+                | Op::GuardFalse { .. } | Op::GuardNoMeta { .. } | Op::GuardHasMeta { .. } | Op::GuardAbsent { .. } | Op::GuardNode { .. }
+        )
 }
 
 /// A store to a captured register writes through its open upvalue.
@@ -512,12 +526,17 @@ fn clobbers_upvalues(op: &Op) -> bool {
 fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key, Val>, &mut Vec<Val>, &mut Vec<bool>), changed: &mut bool) -> Vec<Key> {
     let mut added = Vec::new();
     let mut local: HashMap<Key, Val> = HashMap::new();
+    let mut arrays = false;
     for &value in &func.block(block).insts {
         let op = func.op(value);
         if clobbers_tables(op) {
             local.clear();
         } else if clobbers_upvalues(op) {
             local.retain(|key, _| key.0[0] != UPVALUE_KIND);
+        }
+        if arrays && !reads_quietly(op) {
+            local.retain(|key, _| key.0[0] != ARRAY_KIND);
+            arrays = false;
         }
         if let Op::StoreNode { table, node, value: stored, .. } = op {
             forward_store(&mut local, map, (*table, *node, *stored));
@@ -533,6 +552,7 @@ fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key,
             continue;
         }
         if memory {
+            arrays |= key.0[0] == ARRAY_KIND;
             local.insert(key, value);
         } else {
             table.insert(key, value);

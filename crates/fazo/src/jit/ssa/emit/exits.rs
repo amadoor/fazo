@@ -136,7 +136,7 @@ fn store_state(ctx: &mut JitCtx, vm: &mut crate::Vm, table: &ExitTable, exit: &E
             continue;
         }
         let words = match state.mixed(held) {
-            Some(mixed) if lookup(mixed.first)[1] & 0xff != 0 => lookup(mixed.entry),
+            Some(mixed) if first_iteration(mixed, &lookup) => lookup(mixed.entry),
             Some(mixed) => [u64::from(FLOAT_TAG), lookup(mixed.float)[1]],
             None => lookup(held),
         };
@@ -166,5 +166,12 @@ fn write(ctx: &JitCtx, slot: u32, [tag, payload]: [u64; 2]) {
         let at = ctx.registers.add(slot as usize).cast::<u64>();
         at.write(tag);
         at.add(1).write(payload);
+    }
+}
+
+fn first_iteration(mixed: &crate::jit::ssa::ir::Mixed, lookup: &impl Fn(Val) -> [u64; 2]) -> bool {
+    match mixed.start {
+        Some(start) => lookup(mixed.first)[1] == lookup(start)[1],
+        None => lookup(mixed.first)[1] & 0xff != 0,
     }
 }

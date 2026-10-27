@@ -141,6 +141,9 @@ pub(crate) trait Asm {
     fn cmp_imm64(&mut self, left: u8, value: i64);
     fn cmp_byte(&mut self, left: u8, value: u8);
     fn cmp_mem_byte(&mut self, base: u8, disp: i32, value: u8);
+    fn cmp_mem(&mut self, left: u8, base: u8, disp: i32);
+    /// `Width::W` compares the sign-extended word.
+    fn cmp_mem_imm(&mut self, width: Width, base: u8, disp: i32, value: i32);
     /// Sets the flags as `cmp` against zero would for `left & mask`.
     fn test_imm(&mut self, left: u8, mask: i32);
     fn set(&mut self, cond: Cond, dst: u8);
@@ -175,7 +178,7 @@ pub(crate) trait Asm {
     fn trap(&mut self);
 
     /// `floats` are callee-saved float registers, stored at their offsets from the stack pointer.
-    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8, saved: &[u8]) -> super::unwind::Prologue;
+    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: Option<u8>, saved: &[u8]) -> super::unwind::Prologue;
     /// Returns `code` to the caller from any stack depth inside the frame.
     fn epilogue(&mut self, frame: u32, floats: &[(u8, u32)], code: u8, saved: &[u8]);
     fn tail_epilogue(&mut self, frame: u32, floats: &[(u8, u32)], saved: &[u8]);

@@ -173,33 +173,29 @@ fn assemble<A: Asm>(func: &Func, env: &Env<'_>, points: Box<[DeoptPoint]>) -> Op
     place_entry_arguments(asm);
     asm.tail_epilogue(frame, &floats, &saved);
     let dispatch = asm.offset();
-    if ctx_size != 0 {
-        let asm::ArgLoc::Reg(temp) = A::arg(1) else {
-            unreachable!("the second argument goes in a register");
-        };
-        asm.store_imm(asm::Width::Q, A::SP, ctx_at + std::mem::offset_of!(JitCtx, requests) as i32, 0);
-        asm.lea(temp, A::SP, ctx_at);
-        asm.store(asm::Width::Q, temp, A::CTX, std::mem::offset_of!(JitCtx, child) as i32);
-    }
-    for &(pc, label) in &generated.roots {
-        asm.cmp_imm(A::SCRATCH, pc as i32);
-        match env.tier_budget {
-            Some(cell) if pc == super::entry_pc(env.vararg) => {
-                let skip = asm.new_label();
-                asm.branch(asm::Cond::Ne, skip);
-                charge_entry(asm, cell as i64, (label, generated.exit_with), addresses.tier_check);
-                asm.bind(skip);
+    if !generated.falls_into {
+        for &(pc, label) in &generated.roots {
+            asm.cmp_imm(A::SCRATCH, pc as i32);
+            match env.tier_budget {
+                Some(cell) if pc == super::entry_pc(env.vararg) => {
+                    let skip = asm.new_label();
+                    asm.branch(asm::Cond::Ne, skip);
+                    charge_entry(asm, cell as i64, (label, generated.exit_with), addresses.tier_check);
+                    asm.bind(skip);
+                }
+                _ => asm.branch(asm::Cond::Eq, label),
             }
-            _ => asm.branch(asm::Cond::Eq, label),
         }
+        asm.trap();
     }
-    asm.trap();
     let body = generated.asm.finish()?;
 
     let mut head = A::new();
-    let prologue = head.prologue(frame, &floats, A::SCRATCH, &saved);
+    let prologue = head.prologue(frame, &floats, (!generated.falls_into).then_some(A::SCRATCH), &saved);
     let mut code = head.finish()?;
-    code.extend(A::raw_jump(dispatch));
+    if !generated.falls_into {
+        code.extend(A::raw_jump(dispatch));
+    }
     code.extend_from_slice(&body);
 
     let code_len = code.len();

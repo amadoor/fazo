@@ -223,8 +223,8 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.test_imm(A::SCRATCH, i32::from(*bit));
                 self.asm.branch(Cond::Eq, exit);
             }
-            Op::CallLua { pc, a, b, c, inlined: None } => self.call_lua(value, *pc as usize, (*a, *b, *c)),
-            Op::CallLua { inlined: Some(call), .. } => self.call_inlined(value, *call as usize),
+            Op::CallLua { pc, a, b, c, inlined: None, callee } => self.call_lua(value, *pc as usize, (*a, *b, *c), *callee),
+            Op::CallLua { inlined: Some(call), callee, .. } => self.call_inlined(value, *call as usize, *callee),
             Op::Safepoint { pc, weight, requests, state } => self.safepoint(*pc, *weight, *requests, *state),
         }
     }
@@ -274,35 +274,35 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.add_mem(dst, A::CTX, offset_of!(JitCtx, closures) as i32);
     }
 
+    /// An unshaped table holds `table::UNSHAPED`, which no guard expects.
     fn check_shape(&mut self, address: u8, shape: u64, fail: Label) {
         let layout = self.env.layout;
-        self.asm.load(Width::B, A::SCRATCH, address, layout.shaped);
-        self.asm.cmp_imm(A::SCRATCH, 0);
-        self.asm.branch(Cond::Eq, fail);
         self.asm.load(Width::Q, A::SCRATCH, address, layout.shape);
         self.asm.cmp_imm64(A::SCRATCH, shape as i64);
         self.asm.branch(Cond::Ne, fail);
     }
 
-    fn closure_reg(&mut self, closure: Closure) -> Option<u8> {
+    fn closure_reg(&mut self, closure: Closure) -> Owner {
         match closure {
-            Closure::Root => None,
-            Closure::Value(value) => Some(self.reg(value)),
+            Closure::Root => Owner::Root,
+            Closure::Value(value) => Owner::Reg(self.reg(value)),
+            Closure::Known(known) => Owner::Known(known),
         }
     }
 
-    fn upvalue_cell(&mut self, dst: u8, owner: Option<u8>, index: u8) {
+    fn upvalue_cell(&mut self, dst: u8, owner: Owner, index: u8) {
         match owner {
-            None => self.ctx_load(dst, offset_of!(JitCtx, upvalues)),
-            Some(closure) => {
+            Owner::Root => self.ctx_load(dst, offset_of!(JitCtx, upvalues)),
+            Owner::Reg(closure) => {
                 self.closure_address(dst, closure);
                 self.asm.load(Width::Q, dst, dst, self.env.frames.closure_upvalues);
             }
+            Owner::Known(known) => self.asm.mov_imm(dst, known.upvalues as i64),
         }
         self.asm.load(Width::Q, dst, dst, upvalue::cell(index) as i32);
     }
 
-    fn upvalue_address(&mut self, dst: u8, owner: Option<u8>, index: u8) {
+    fn upvalue_address(&mut self, dst: u8, owner: Owner, index: u8) {
         self.upvalue_cell(dst, owner, index);
         self.asm.load(Width::Q, dst, dst, upvalue::VALUE);
     }
@@ -329,13 +329,14 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.jump(done);
         self.asm.bind(slow);
         let owner = match owner {
-            Some(closure) => closure,
-            None => {
+            Owner::Reg(closure) => Src::R(closure),
+            Owner::Root => {
                 self.ctx_load(address, offset_of!(JitCtx, closure));
-                address
+                Src::R(address)
             }
+            Owner::Known(known) => Src::I(known.closure as i64),
         };
-        self.call_value(runtime::KIND_SET_UPVALUE, &[pair, (Src::I(i64::from(CLOSURE_TAG)), Src::R(owner))], u32::from(index), &saves);
+        self.call_value(runtime::KIND_SET_UPVALUE, &[pair, (Src::I(i64::from(CLOSURE_TAG)), owner)], u32::from(index), &saves);
         self.asm.bind(done);
     }
 
@@ -455,6 +456,12 @@ impl<A: Asm> Gen<'_, A> {
             BinOp::IAdd | BinOp::ISub | BinOp::IMul | BinOp::IBand | BinOp::IBor | BinOp::IBxor => self.int_binary(value, op, left, right),
             BinOp::IMod | BinOp::IDiv => self.floor_division(value, op, left, right),
             BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FIDiv => {
+                if let Src::I(bits) = self.word(left)
+                    && !matches!(self.word(right), Src::I(_))
+                {
+                    self.constant_left_float(value, (op, bits as u64), right);
+                    return;
+                }
                 let x = self.freg(left);
                 let y = match self.word(right) {
                     Src::I(bits) if bits != 0 => Err((bits as u64, self.ftemp())),
@@ -475,6 +482,23 @@ impl<A: Asm> Gen<'_, A> {
                     self.asm.ffloor(out, out);
                 }
             }
+        }
+    }
+
+    /// The constant goes straight into the result register, which the allocator keeps apart from the operand.
+    fn constant_left_float(&mut self, value: Val, (op, bits): (BinOp, u64), right: Val) {
+        let y = self.freg(right);
+        let out = self.out(value);
+        let alu = match op {
+            BinOp::FAdd => FAlu::Add,
+            BinOp::FSub => FAlu::Sub,
+            BinOp::FMul => FAlu::Mul,
+            _ => FAlu::Div,
+        };
+        self.asm.fconst(out, bits);
+        self.asm.falu(alu, out, out, y);
+        if op == BinOp::FIDiv {
+            self.asm.ffloor(out, out);
         }
     }
 
@@ -1255,9 +1279,8 @@ impl<A: Asm> Gen<'_, A> {
         let done = self.asm.new_label();
         match tag {
             Src::R(reg) => {
-                self.asm.alu_imm(Alu::And, A::SCRATCH, reg, 0xff);
-                self.asm.alu_imm(Alu::Sub, A::SCRATCH, A::SCRATCH, i32::from(STRING_TAG));
-                self.asm.cmp_imm(A::SCRATCH, i32::from(super::codegen::LIGHT_USERDATA_TAG - STRING_TAG));
+                self.asm.lea(A::SCRATCH, reg, -i32::from(STRING_TAG));
+                self.asm.cmp_byte(A::SCRATCH, super::codegen::LIGHT_USERDATA_TAG - STRING_TAG);
                 self.asm.branch(Cond::AboveEq, done);
             }
             Src::I(known) if !(i64::from(STRING_TAG)..i64::from(super::codegen::LIGHT_USERDATA_TAG)).contains(&known) => return,
@@ -1532,8 +1555,6 @@ impl<A: Asm> Gen<'_, A> {
     /// `SCRATCH` holds the table's address; the shape is compared in place, so no flag lives in a register.
     fn shape_branch(&mut self, (table, shape): (Val, u64), negate: bool, target: Label) {
         let layout = self.env.layout;
-        let skip = self.asm.new_label();
-        let unshaped = if negate { target } else { skip };
         let address = match self.func.op(table) {
             Op::TableAddr { .. } => self.reg(table),
             _ => {
@@ -1542,12 +1563,9 @@ impl<A: Asm> Gen<'_, A> {
                 A::SCRATCH
             }
         };
-        self.asm.cmp_mem_byte(address, layout.shaped, 0);
-        self.asm.branch(Cond::Eq, unshaped);
         self.asm.load(Width::Q, A::SCRATCH, address, layout.shape);
         self.asm.cmp_imm64(A::SCRATCH, shape as i64);
         self.asm.branch(if negate { Cond::Ne } else { Cond::Eq }, target);
-        self.asm.bind(skip);
     }
 
     fn equal_branch(&mut self, operand: Val, constant: Const, negate: bool, target: Label) {
@@ -1589,6 +1607,11 @@ impl<A: Asm> Gen<'_, A> {
         }
         let flags = self.reg(requests);
         self.asm.cmp_mem_byte(flags, 0, 0);
+        let block = self.func.block(self.block_now);
+        if charge.is_none() && self.position + 1 == block.insts.len() && matches!(block.term, crate::jit::ssa::ir::Term::Jump(_)) {
+            self.poll = Some(slow);
+            return;
+        }
         self.asm.branch(Cond::Ne, slow);
         if let (Some(address), Some(cell)) = (charge, cell) {
             self.spend(cell, address as i64, weight);
@@ -1624,4 +1647,12 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.branch(Cond::Ne, self.exit_with);
     }
 
+}
+
+/// Where an upvalue access finds its closure's upvalue list.
+#[derive(Clone, Copy)]
+enum Owner {
+    Root,
+    Reg(u8),
+    Known(crate::jit::ssa::passes::inline::KnownClosure),
 }

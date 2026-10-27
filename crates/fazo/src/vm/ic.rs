@@ -87,9 +87,15 @@ pub(crate) enum InlineCache {
 pub(crate) struct Callee {
     pub(crate) value: Value,
     pub(crate) proto: Option<Ref<Proto>>,
+    /// The site has seen more than one closure of the prototype.
+    pub(crate) shared: bool,
 }
 
 impl Callee {
+    fn merged(self, newer: Self) -> Self {
+        Self { shared: self.shared || newer.shared || !same_callee(self.value, newer.value), ..newer }
+    }
+
     fn same(self, other: Self) -> bool {
         same_callee(self.value, other.value) || (self.proto.is_some() && self.proto == other.proto)
     }
@@ -136,7 +142,7 @@ impl InlineCache {
             Self::Monomorphic(_) => (1, 1),
             Self::Polymorphic(entries) => (2, entries.len()),
             Self::Method(methods) => (3, methods.len()),
-            Self::Callee(_) => (4, 1),
+            Self::Callee(callee) => (4, 1 + usize::from(callee.shared)),
             Self::Callees(callees) => (5, callees.len()),
             Self::Megamorphic => (6, 0),
         }
@@ -154,10 +160,10 @@ impl InlineCache {
         }
         *self = match std::mem::take(self) {
             Self::Uninitialized => Self::Callee(callee),
-            Self::Callee(previous) if previous.same(callee) => Self::Callee(callee),
+            Self::Callee(previous) if previous.same(callee) => Self::Callee(previous.merged(callee)),
             Self::Callee(previous) => Self::Callees(Box::new([previous, callee])),
             Self::Callees(mut callees) if let Some(index) = callees.iter().position(|known| known.same(callee)) => {
-                callees[index] = callee;
+                callees[index] = callees[index].merged(callee);
                 Self::Callees(callees)
             }
             Self::Callees(callees) if callees.len() < WAYS => {
@@ -424,7 +430,7 @@ impl Vm {
             return;
         };
         let before = cache.state();
-        cache.record_callee(Callee { value: callee, proto: called });
+        cache.record_callee(Callee { value: callee, proto: called, shared: false });
         if cache.state() != before {
             self.jit_feedback_changed(proto);
         }

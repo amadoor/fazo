@@ -54,7 +54,7 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
         Op::Select { .. } => vec![Some(Rep::Bool), Some(inst.rep), Some(inst.rep)],
         Op::StoreReg { .. } => vec![boxed],
         Op::StoreUpval { closure, .. } => match closure {
-            Closure::Root => vec![boxed],
+            Closure::Root | Closure::Known(_) => vec![boxed],
             Closure::Value(_) => vec![payload, boxed],
         },
         Op::LoadUpval { closure: Closure::Value(_), .. } | Op::LoadProto { .. } => vec![payload],
