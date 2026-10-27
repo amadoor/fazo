@@ -13,8 +13,7 @@ use crate::{
 
 pub(crate) fn run(func: &mut Func) {
     for _ in 0..8 {
-        let mut changed = merge_blocks(func);
-        let mut order = func.reverse_postorder();
+        let (mut changed, mut order) = merge_blocks(func);
         changed |= remove_trivial_params(func, &order);
         changed |= fold_constants(func, &order);
         if fold_branches(func, &order) {
@@ -29,12 +28,14 @@ pub(crate) fn run(func: &mut Func) {
 }
 
 /// Joins a block to its only predecessor so block-local memory CSE sees the whole straight line; loop headers and preheaders stay.
-pub(crate) fn merge_blocks(func: &mut Func) -> bool {
-    let order = func.reverse_postorder();
+/// Answers the new reverse postorder too: a joined block came right after its predecessor, so the rest keep their order.
+pub(crate) fn merge_blocks(func: &mut Func) -> (bool, Vec<BlockId>) {
+    let mut order = func.reverse_postorder();
     let incoming = incoming_edges(func, &order);
     let pinned: Vec<BlockId> = func.loops.iter().flat_map(|entry| [entry.header, entry.preheader]).chain(func.entry).chain(func.osr.iter().map(|&(_, block)| block)).collect();
     let mut map = func.identity_map();
     let mut changed = false;
+    let mut joined = vec![false; func.blocks.len()];
     for &block in &order {
         while let Term::Jump(edge) = func.block(block).term.clone() {
             let next = edge.block;
@@ -48,13 +49,16 @@ pub(crate) fn merge_blocks(func: &mut Func) -> bool {
             let data = func.block_mut(block);
             data.insts.extend(taken.insts);
             data.term = taken.term;
+            joined[next.0 as usize] = true;
             changed = true;
         }
     }
     if changed {
         func.rewrite_uses(&map);
+        order.retain(|block| !joined[block.0 as usize]);
+        debug_assert_eq!(order, func.reverse_postorder());
     }
-    changed
+    (changed, order)
 }
 
 /// Braun et al., "Simple and Efficient Construction of Static Single Assignment Form", section 3.1.

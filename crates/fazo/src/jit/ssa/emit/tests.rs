@@ -337,6 +337,7 @@ mod x64_encoding {
         assert_eq!(listing(|a| a.load_i32(1, 3, 88)), ["movsxd rcx,[rbx+58h]"]);
         assert_eq!(listing(|a| a.store_imm(Width::Q, 12, 8, 1 << 40)), ["mov r11,10000000000h", "mov [r12+8],r11"]);
         assert_eq!(listing(|a| a.load_f(3, 13, -16)), ["movsd xmm3,[r13-10h]"]);
+        assert_eq!(listing(|a| a.copy16(15, (4, 64), (3, 16))), ["movups xmm15,[rbx+10h]", "movups [rsp+40h],xmm15"]);
     }
 
     fn decoded(build: impl FnOnce(&mut X64)) -> Vec<Instruction> {
@@ -687,6 +688,7 @@ mod a64_encoding {
         assert_eq!(listing(|a| a.store_imm(Width::B, 2, 0, 0)), ["mov x30, #0x0", "strb w30, [x2]"]);
         assert_eq!(listing(|a| a.load(Width::Q, 1, 2, 40000)), ["mov x17, #0x9c40", "ldr x1, [x2, x17]"]);
         assert_eq!(listing(|a| a.load_f(3, 19, 8)), ["ldr d3, [x19, #0x8]"]);
+        assert_eq!(listing(|a| a.copy16(3, (31, 64), (19, 16))), ["ldr q3, [x19, #0x10]", "str q3, [sp, #0x40]"]);
         assert_eq!(listing(|a| a.lea(3, 31, 48)), ["add x3, sp, #0x30"]);
     }
 

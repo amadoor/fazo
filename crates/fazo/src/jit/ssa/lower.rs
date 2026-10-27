@@ -413,6 +413,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         if data.slots.is_empty() {
             return;
         }
+        debug_assert!(data.mixed.is_empty(), "Peak's pipeline leaves numbers whole");
         let registers = self.registers();
         for &(slot, value) in &data.slots {
             if data.object(value).is_some() {

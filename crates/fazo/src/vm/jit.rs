@@ -472,6 +472,7 @@ impl Vm {
         let Some(unit) = self.jit_emit_baseline(proto, charges) else {
             return false;
         };
+        let start = unit.entry() as usize;
         let function = self.heap.protos.live_mut(proto);
         if let Some(old) = function.jit.baseline.replace(Box::new(unit)) {
             function.jit.retired.push(*old);
@@ -480,7 +481,7 @@ impl Vm {
         function.jit.settled = !charges;
         function.jit.compiled_changes = function.jit.feedback_changes;
         self.jit_reveal(proto);
-        self.jit_trace(proto, if charges { "baseline recompiled" } else { "baseline settled" });
+        self.jit_trace(proto, &format!("{} at {start:#x}", if charges { "baseline recompiled" } else { "baseline settled" }));
         true
     }
 
@@ -747,6 +748,7 @@ impl Vm {
     }
 
     /// Compiles now when the estimated gain pays the next tier's compile, as V8's on-stack replacement does at a loop; otherwise waits for a budget that doubles with each decline.
+    /// A frame left running below its prototype's tier keeps a budget so a later check enters the code again, as V8 resets the interrupt budget on every tick (src/execution/tiering-manager.cc `OnInterruptTick`).
     pub(crate) fn jit_tier_check(&mut self, ctx: &mut JitCtx, pc: usize, running: Tier) -> i64 {
         let proto = ctx.proto;
         let policy = self.options.jit_policy;
@@ -756,11 +758,12 @@ impl Vm {
             return pc as i64;
         }
         if let Some(unit) = function.jit.unit.as_ref().filter(|unit| unit.tier() > running) {
-            if unit.enters_at(pc) {
+            let enters = unit.enters_at(pc);
+            function.jit.tier_budget().set(i64::from(crate::jit::ENTRY_CHARGE) * 128);
+            if enters {
                 self.save_pc(pc);
                 return -EXIT_RELOAD;
             }
-            function.jit.tier_budget().set(i64::from(crate::jit::ENTRY_CHARGE) * 128);
             return pc as i64;
         }
         let stale = running == Tier::Baseline && function.jit.feedback_changes != function.jit.compiled_changes && function.jit.recompiles < policy.recompile_limit;

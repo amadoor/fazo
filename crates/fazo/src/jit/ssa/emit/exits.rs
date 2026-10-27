@@ -1,8 +1,11 @@
 //! Eager deopt exits, after Maglev and V8's `TranslationArray` (src/deoptimizer/translation-array.h): the runtime rebuilds frame state from a side table of value locations.
 
-use super::super::{
-    DeoptPoint,
-    ir::{FrameState, Val},
+use super::{
+    super::{
+        DeoptPoint,
+        ir::{FrameState, Val},
+    },
+    codegen::FLOAT_TAG,
 };
 use crate::{jit::JitCtx, value::Value};
 
@@ -132,7 +135,12 @@ fn store_state(ctx: &mut JitCtx, vm: &mut crate::Vm, table: &ExitTable, exit: &E
         if state.object(held).is_some() {
             continue;
         }
-        write(ctx, slot, lookup(held));
+        let words = match state.mixed(held) {
+            Some(mixed) if lookup(mixed.first)[1] & 0xff != 0 => lookup(mixed.entry),
+            Some(mixed) => [u64::from(FLOAT_TAG), lookup(mixed.float)[1]],
+            None => lookup(held),
+        };
+        write(ctx, slot, words);
     }
     for &(slot, held) in &state.slots {
         let Some(object) = state.object(held) else {

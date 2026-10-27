@@ -191,10 +191,11 @@ fn setmetatable_args(func: &Func, set: Val) -> (Val, Val, StateId) {
 }
 
 fn state_positions(func: &Func, candidate: &Candidate) -> Option<Vec<(StateId, bool)>> {
-    let idom = func.dominators();
+    let order = func.reverse_postorder();
+    let idom = func.dominators_in(&order);
     let set_at = candidate.setmetatable.and_then(|set| position(func, set));
     let mut decided: Vec<(StateId, bool)> = Vec::new();
-    for block in func.reverse_postorder() {
+    for block in order {
         if candidate.exits.iter().any(|&exit| Func::dominates(&idom, exit, block)) {
             continue;
         }

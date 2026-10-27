@@ -871,10 +871,15 @@ impl<'a, A: Asm> Gen<'a, A> {
         self.asm.mov(A::SCRATCH, result);
         self.asm.jump(self.exit_with);
         let settled = self.settled.take();
-        for ((pc, edge), stub) in cases.iter().zip(stubs) {
+        let last = cases.len().saturating_sub(1);
+        for (index, ((pc, edge), stub)) in cases.iter().zip(stubs).enumerate() {
             self.asm.bind(stub);
             if let Some((_, label)) = settled.filter(|&(at, _)| at == *pc) {
                 self.asm.bind(label);
+            }
+            if index == last {
+                self.jump(edge);
+                continue;
             }
             self.edge_moves(edge);
             let label = self.label(edge.block);

@@ -129,7 +129,12 @@ impl Func {
             write!(text, " frame(base {} caller {} wanted {})", frame.base, frame.caller_pc, frame.wanted)?;
         }
         let slots: Vec<String> = data.slots.iter().map(|(slot, value)| format!("r{slot}=v{}", value.0)).collect();
-        let objects: Vec<String> = data.objects.iter().map(virtual_text).collect();
+        let objects: Vec<String> = data
+            .objects
+            .iter()
+            .map(virtual_text)
+            .chain(data.mixed.iter().map(|mixed| format!("v{}=first v{} ? v{} : v{}", mixed.value.0, mixed.first.0, mixed.entry.0, mixed.float.0)))
+            .collect();
         let lazy = if data.lazy { " lazy" } else { "" };
         writeln!(text, " [{}]{lazy} {}", slots.join(" "), objects.join(" "))
     }

@@ -1,3 +1,4 @@
+pub(crate) mod accumulate;
 pub(crate) mod address;
 pub(crate) mod bounds;
 pub(crate) mod dce;
@@ -38,6 +39,7 @@ pub(crate) const OPTIMIZING: &[Pass] = &[
     ("types", types::run),
     ("fold", fold::run),
     ("escape", escape::run),
+    ("accumulate", accumulate::run),
     ("repr", repr::run),
     ("hoist", hoist::run),
     ("bounds", bounds::run),

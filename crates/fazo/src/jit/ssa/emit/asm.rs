@@ -108,6 +108,8 @@ pub(crate) trait Asm {
     fn store_imm(&mut self, width: Width, base: u8, disp: i32, value: i64);
     fn load_f(&mut self, dst: u8, base: u8, disp: i32);
     fn store_f(&mut self, src: u8, base: u8, disp: i32);
+    /// Copies 16 bytes through the vector register `via`.
+    fn copy16(&mut self, via: u8, to: (u8, i32), from: (u8, i32));
     fn fmov(&mut self, dst: u8, src: u8);
     fn bits_to_float(&mut self, dst: u8, src: u8);
     fn fconst(&mut self, dst: u8, bits: u64) {

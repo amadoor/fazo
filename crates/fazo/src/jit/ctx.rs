@@ -6,27 +6,29 @@ use crate::{LuaError, Vm, arena::Ref, object::{Captured, Closure, Thread}, proto
 /// pointers are refreshed after every helper that can move their storage.
 #[repr(C)]
 pub(crate) struct JitCtx {
+    /// The fields up to `moves` are the same in every frame of one nest, so a callee's context copies them in pairs.
     pub(crate) requests: *const AtomicU8,
-    pub(crate) registers: *mut Value,
-    pub(crate) constants: *const Value,
+    pub(crate) vm: *mut Vm,
     pub(crate) tables: *const Table,
     pub(crate) table_marks: *const u8,
     pub(crate) closures: *const Closure,
-    /// Stable for the closure's lifetime.
-    pub(crate) upvalues: *const Captured,
-    pub(crate) vm: *mut Vm,
-    pub(crate) closure: Ref<Closure>,
-    pub(crate) base: usize,
-    pub(crate) proto: Ref<Proto>,
-    /// Results the compiled caller takes from this frame, or `NOT_DIRECT` for a frame the driver entered.
-    pub(crate) direct_results: i32,
-    pub(crate) ret_offset: i64,
     pub(crate) thread: *mut Thread,
     pub(crate) thread_ref: Ref<Thread>,
     /// Native stack floor that compiled calls check before recursing (V8 `StackCheck`).
     pub(crate) stack_limit: usize,
     /// Error slot shared by every frame of one nest; `EXIT_ERROR` writes into it.
     pub(crate) error: *mut Option<LuaError>,
+    pub(crate) moves: u64,
+    pub(crate) registers: *mut Value,
+    pub(crate) constants: *const Value,
+    /// Stable for the closure's lifetime.
+    pub(crate) upvalues: *const Captured,
+    pub(crate) closure: Ref<Closure>,
+    pub(crate) base: usize,
+    pub(crate) proto: Ref<Proto>,
+    /// Results the compiled caller takes from this frame, or `NOT_DIRECT` for a frame the driver entered.
+    pub(crate) direct_results: i32,
+    pub(crate) ret_offset: i64,
     /// Caller context an optimized direct call filled; such callers skip the refresh after the call.
     pub(crate) parent: *mut JitCtx,
     pub(crate) child: *mut JitCtx,
@@ -34,7 +36,6 @@ pub(crate) struct JitCtx {
     pub(crate) pending: u32,
     pub(crate) saved_pc: u32,
     pub(crate) frame_index: u32,
-    pub(crate) moves: u64,
     /// Valid only while `saved_pc` is `INLINED_CALL`.
     pub(crate) inline_point: *const crate::jit::ssa::DeoptPoint,
 }

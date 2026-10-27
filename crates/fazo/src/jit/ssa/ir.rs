@@ -651,6 +651,16 @@ pub(crate) struct FrameState {
     /// Follows V8's lazy deoptimization: the instruction ran code the frame cannot account for, and no speculation failed.
     pub(crate) lazy: bool,
     pub(crate) objects: Vec<Virtual>,
+    pub(crate) mixed: Vec<Mixed>,
+}
+
+/// A number held as a float and a first-iteration flag: `entry` while `first` holds, else `float`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Mixed {
+    pub(crate) value: Val,
+    pub(crate) first: Val,
+    pub(crate) float: Val,
+    pub(crate) entry: Val,
 }
 
 impl FrameState {
@@ -658,10 +668,26 @@ impl FrameState {
         self.objects.iter().find(|object| object.value == value)
     }
 
+    pub(crate) fn mixed(&self, value: Val) -> Option<&Mixed> {
+        self.mixed.iter().find(|mixed| mixed.value == value)
+    }
+
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(Val)) {
+        if self.objects.is_empty() && self.mixed.is_empty() {
+            self.slots.iter().for_each(|&(_, value)| f(value));
+            return;
+        }
         for &(_, value) in &self.slots {
-            match self.object(value) {
-                Some(object) => object.for_each_operand(&mut f),
+            if let Some(object) = self.object(value) {
+                object.for_each_operand(&mut f);
+                continue;
+            }
+            match self.mixed(value) {
+                Some(mixed) => {
+                    f(mixed.first);
+                    f(mixed.float);
+                    f(mixed.entry);
+                }
                 None => f(value),
             }
         }
@@ -844,8 +870,12 @@ impl Func {
     }
 
     pub(crate) fn definitions(&self) -> Vec<Option<BlockId>> {
+        self.definitions_in(&self.reverse_postorder())
+    }
+
+    pub(crate) fn definitions_in(&self, order: &[BlockId]) -> Vec<Option<BlockId>> {
         let mut defined = vec![None; self.insts.len()];
-        for block in self.reverse_postorder() {
+        for &block in order {
             let data = self.block(block);
             for &value in data.params.iter().chain(&data.insts) {
                 defined[value.0 as usize] = Some(block);
@@ -867,10 +897,15 @@ impl Func {
             inst.op.map_operands(resolve);
         }
         for state in &mut self.states {
-            let placeholders: Vec<Val> = state.objects.iter().map(|object| object.value).collect();
+            let placeholders: Vec<Val> = state.objects.iter().map(|object| object.value).chain(state.mixed.iter().map(|mixed| mixed.value)).collect();
             state.slots.iter_mut().filter(|(_, value)| !placeholders.contains(value)).for_each(|(_, value)| *value = resolve(*value));
             let mut map = resolve;
             state.objects.iter_mut().for_each(|object| object.map_operands(&mut map));
+            for mixed in &mut state.mixed {
+                mixed.first = resolve(mixed.first);
+                mixed.float = resolve(mixed.float);
+                mixed.entry = resolve(mixed.entry);
+            }
         }
     }
 
@@ -888,7 +923,7 @@ impl Func {
         for (index, block) in order.iter().enumerate() {
             position[block.0 as usize] = index + 1;
         }
-        let predecessors = self.predecessors();
+        let (starts, sources) = self.predecessor_lists(order);
         let roots: Vec<BlockId> = self.entry.into_iter().chain(self.osr.iter().map(|&(_, block)| block)).collect();
         let mut idom: Vec<Option<BlockId>> = vec![None; self.blocks.len()];
         for &root in &roots {
@@ -902,7 +937,8 @@ impl Func {
                     continue;
                 }
                 let mut new = None;
-                for &predecessor in &predecessors[block.0 as usize] {
+                let index = block.0 as usize;
+                for &predecessor in &sources[starts[index] as usize..starts[index + 1] as usize] {
                     if idom[predecessor.0 as usize].is_none() {
                         continue;
                     }
@@ -918,6 +954,27 @@ impl Func {
             }
         }
         idom
+    }
+
+    /// Each block's predecessors among `order`, packed: block `b`'s are `sources[starts[b]..starts[b + 1]]`.
+    fn predecessor_lists(&self, order: &[BlockId]) -> (Vec<u32>, Vec<BlockId>) {
+        let mut starts = vec![0u32; self.blocks.len() + 1];
+        for &block in order {
+            self.block(block).term.for_each_successor(|successor| starts[successor.0 as usize + 1] += 1);
+        }
+        for index in 1..starts.len() {
+            starts[index] += starts[index - 1];
+        }
+        let mut filled = starts.clone();
+        let mut sources = vec![BlockId(0); starts[self.blocks.len()] as usize];
+        for &block in order {
+            self.block(block).term.for_each_successor(|successor| {
+                let at = &mut filled[successor.0 as usize];
+                sources[*at as usize] = block;
+                *at += 1;
+            });
+        }
+        (starts, sources)
     }
 
     pub(crate) fn dominates(idom: &[Option<BlockId>], dominator: BlockId, block: BlockId) -> bool {

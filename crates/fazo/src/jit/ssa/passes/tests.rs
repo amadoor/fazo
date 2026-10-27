@@ -6,7 +6,7 @@ use super::{address, bounds, dce, escape, fold, forward, hoist, inline, repr, ty
 use crate::{arena::Ref, proto::Proto};
 
 fn state(func: &mut Func, pc: u32) -> StateId {
-    func.add_state(FrameState { pc, frames: Vec::new(), slots: Vec::new(), site: pc, lazy: false, objects: Vec::new() })
+    func.add_state(FrameState { pc, frames: Vec::new(), slots: Vec::new(), site: pc, lazy: false, objects: Vec::new(), mixed: Vec::new() })
 }
 
 fn constant(func: &mut Func, block: BlockId, constant: Const) -> Val {
@@ -825,4 +825,16 @@ fn table_addresses_are_recomputed_after_a_call() {
     let preheader = ops(&fixture.func, fixture.preheader);
     assert!(!preheader.iter().any(|op| matches!(op, Op::TableAddr { .. })), "the loop may grow the arena");
     assert_eq!(table_operand_of(&fixture.func, reads[1]), fixture.guard, "a lone read after the call computes its own address");
+}
+
+#[test]
+fn an_accumulator_that_starts_as_an_integer_loops_as_a_float() {
+    let mut func = built("local function f(t, n) local a = 0 for i = 1, n do a = a + t[i] * 0.5 end return a end");
+    super::optimize(&mut func, super::OPTIMIZING, true).expect("the passes keep the graph valid");
+    let header = func.loops.last().expect("one loop").header;
+    let params = &func.block(header).params;
+    assert!(params.iter().any(|&param| func.rep(param) == Rep::Float), "the sum is a float parameter:\n{func}");
+    assert!(params.iter().any(|&param| func.rep(param) == Rep::Bool), "a flag marks the first iteration:\n{func}");
+    assert!(params.iter().all(|&param| func.rep(param) != Rep::Boxed), "no boxed number goes around the loop:\n{func}");
+    assert!(func.states.iter().any(|state| !state.mixed.is_empty()), "the loop's frame states rebuild the sum:\n{func}");
 }

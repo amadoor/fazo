@@ -101,9 +101,10 @@ pub(crate) fn arith_type(op: NumOp, left: Type, right: Type) -> Type {
 
 /// Follows Maglev's feedback speculation (src/maglev/maglev-graph-builder.cc); after a failed guess the function guesses floats.
 fn speculate(func: &mut Func) {
-    let idom = func.dominators();
+    let order = func.reverse_postorder();
+    let idom = func.dominators_in(&order);
     let mut refined = Refined { idom, guards: Vec::new() };
-    for block in func.reverse_postorder() {
+    for block in order {
         let mut position = 0;
         while position < func.block(block).insts.len() {
             let value = func.block(block).insts[position];

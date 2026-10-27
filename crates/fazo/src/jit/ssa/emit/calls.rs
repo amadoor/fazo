@@ -14,6 +14,10 @@ use crate::jit::{
     ssa::ir::{MULTIPLE_RESULTS, Val},
 };
 
+/// The context fields from `requests` to `moves`, which every frame of a nest shares.
+const SHARED_PAIRS: i32 = ((offset_of!(JitCtx, moves) + 8) / 16) as i32;
+const _: () = assert!(offset_of!(JitCtx, requests) == 0 && (offset_of!(JitCtx, moves) + 8) % 16 == 0);
+
 /// A callee known from feedback, or one whose facts the call reads from its closure's `Exec`, as Baseline's `CallAny` does.
 #[derive(Clone, Copy)]
 enum Callee<'t> {
@@ -381,20 +385,9 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.load(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, requests) as i32);
         self.asm.cmp_imm(A::SCRATCH, 0);
         self.asm.branch(Cond::Ne, filled);
-        for offset in [
-            offset_of!(JitCtx, requests),
-            offset_of!(JitCtx, vm),
-            offset_of!(JitCtx, thread_ref),
-            offset_of!(JitCtx, stack_limit),
-            offset_of!(JitCtx, error),
-            offset_of!(JitCtx, tables),
-            offset_of!(JitCtx, table_marks),
-            offset_of!(JitCtx, closures),
-            offset_of!(JitCtx, thread),
-            offset_of!(JitCtx, moves),
-        ] {
-            self.ctx_load(A::SCRATCH, offset);
-            self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset as i32);
+        for pair in 0..SHARED_PAIRS {
+            let offset = pair * 16;
+            self.asm.copy16(A::FSCRATCH, (A::SP, context + offset), (A::CTX, offset));
         }
         self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, ret_offset) as i32, -i64::from(VALUE_SIZE));
         self.asm.store(Width::Q, A::CTX, A::SP, context + offset_of!(JitCtx, parent) as i32);

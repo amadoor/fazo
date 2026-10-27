@@ -181,6 +181,35 @@ pub(crate) fn loop_depths(proto: &Proto) -> Vec<u32> {
     depths
 }
 
+/// Per pc of a call inside a loop, the registers below the call's base that the innermost loop around it writes.
+pub(crate) fn written_below(proto: &Proto) -> Box<[u8]> {
+    let top = usize::from(proto.max_stack);
+    let loops: Vec<(usize, usize, super::ssa::flow::RegSet)> = proto
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(end, &instruction)| Some((loop_start(end, instruction)?, end)))
+        .map(|(start, end)| {
+            let mut written = super::ssa::flow::RegSet::default();
+            for &instruction in &proto.code[start..=end] {
+                written.insert_range(super::ssa::flow::written(instruction, top));
+            }
+            (start, end, written)
+        })
+        .collect();
+    let mut counts = vec![0u8; proto.code.len()];
+    for (pc, &instruction) in proto.code.iter().enumerate() {
+        let Instruction::Call { a, .. } = instruction else {
+            continue;
+        };
+        let innermost = loops.iter().filter(|&&(start, end, _)| (start..=end).contains(&pc)).min_by_key(|&&(start, end, _)| end - start);
+        if let Some((_, _, written)) = innermost {
+            counts[pc] = (0..usize::from(a)).filter(|&register| written.contains(register)).count() as u8;
+        }
+    }
+    counts.into_boxed_slice()
+}
+
 pub(crate) fn forward_jumps(proto: &Proto) -> usize {
     proto.code.iter().filter(|&&instruction| matches!(instruction, Instruction::Jmp { sj } if sj >= 0)).count()
 }

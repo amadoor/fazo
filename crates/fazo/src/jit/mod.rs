@@ -314,6 +314,8 @@ pub(crate) struct ProtoJit {
     pub(crate) observed: Vec<(u32, u8)>,
     /// Kept alive while the prototype lives, so compiled code never names a released shape.
     pub(crate) shapes: Vec<crate::arena::Ref<crate::shape::Shape>>,
+    /// Per pc of a call inside a loop, the registers below its base that the innermost loop writes; bytecode never changes.
+    pub(crate) written_below: std::cell::OnceCell<Box<[u8]>>,
 }
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

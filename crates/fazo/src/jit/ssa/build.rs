@@ -102,6 +102,18 @@ pub(crate) fn build<'a>(proto: &'a Proto, facts: &Facts<'a>) -> Func {
     builder.func
 }
 
+/// The last pc of the loop at `header`: its back edges, widened while a later pc jumps back into the range.
+fn loop_end(flow: &Flow, header: usize) -> usize {
+    let mut end = header;
+    loop {
+        let reaches = |from: usize| flow.successors[from].iter().any(|&target| (header..=end).contains(&target));
+        let Some(last) = (end + 1..flow.successors.len()).rev().find(|&from| reaches(from)) else {
+            return end;
+        };
+        end = last;
+    }
+}
+
 /// Follows V8's OSR (src/compiler/osr.cc): a main chunk runs once, so only loop entries can run its code.
 fn osr_only(func: &mut Func) {
     func.entry = None;
@@ -259,6 +271,7 @@ impl<'a> Builder<'a, '_> {
             site: frame.site.unwrap_or(pc as u32),
             lazy: false,
             objects: Vec::new(),
+            mixed: Vec::new(),
         };
         self.func.add_state(state)
     }
@@ -385,7 +398,7 @@ impl<'a> Builder<'a, '_> {
     }
 
     /// Follows V8 Maglev's MergeIntoFrameState (src/maglev/maglev-interpreter-frame-state.cc).
-    fn merge(&mut self, frame: &Frame<'a>, pc: usize, incoming: Vec<Incoming>) -> BlockId {
+    fn merge(&mut self, frame: &Frame<'a>, pc: usize, mut incoming: Vec<Incoming>) -> BlockId {
         let block = self.func.new_block();
         let width = incoming.iter().map(|edge| edge.regs.len()).max().unwrap_or(0).max(self.regs.len());
         let mut merged = vec![Reg::Mem; width];
@@ -404,7 +417,8 @@ impl<'a> Builder<'a, '_> {
             let dirty = states.iter().any(|state| matches!(state, Reg::Val(_, true)));
             let param = self.func.add_param(block, ty, Rep::Boxed);
             for (index, state) in states.iter().enumerate() {
-                let value = self.value_in(incoming[index].from, *state, slot as u32);
+                let from = if *state == Reg::Mem { self.edge_block(&mut incoming[index]) } else { incoming[index].from };
+                let value = self.value_in(from, *state, slot as u32);
                 args[index].push(value);
             }
             *merged_reg = Reg::Val(param, dirty);
@@ -427,6 +441,20 @@ impl<'a> Builder<'a, '_> {
                 self.func.append(edge.from, Op::StoreReg { slot, value }, Type::NONE, Rep::None);
             }
         }
+    }
+
+    /// A reload on an edge leaving a loop goes in a block of its own, so the iterations don't run it.
+    fn edge_block(&mut self, edge: &mut Incoming) -> BlockId {
+        let in_loop = self.func.loops.iter().any(|entry| entry.blocks.contains(&edge.from));
+        if !in_loop || self.func.block(edge.from).term.edges().len() < 2 {
+            return edge.from;
+        }
+        let split = self.func.new_block();
+        self.func.block_mut(split).term = Term::Jump(Edge::to(BlockId(u32::MAX)));
+        self.set_edge(edge.from, edge.edge, split, Vec::new());
+        edge.from = split;
+        edge.edge = 0;
+        split
     }
 
     fn union_type(&self, states: &[Reg]) -> Type {
@@ -454,10 +482,18 @@ impl<'a> Builder<'a, '_> {
         self.current = Some(preheader);
         let entry_state = self.state_at(frame, pc);
         let header = self.func.new_block();
+        let in_memory = self.kept_in_memory(frame, pc);
         let mut params = Vec::new();
         let mut args = Vec::new();
         for slot in 0..self.regs.len() as u32 {
             if !self.live(frame, pc, slot) {
+                continue;
+            }
+            if in_memory.contains(slot as usize) {
+                if let Reg::Val(value, true) = self.regs[slot as usize] {
+                    self.effect(Op::StoreReg { slot, value });
+                }
+                self.regs[slot as usize] = Reg::Mem;
                 continue;
             }
             let (value, dirty) = match self.regs[slot as usize] {
@@ -494,6 +530,42 @@ impl<'a> Builder<'a, '_> {
         };
         let at = at as usize;
         header <= at && frame.flow.successors.iter().skip(at).any(|targets| targets.contains(&header))
+    }
+
+    /// A register no instruction of a root-frame loop writes stays in memory across it when the loop makes calls that
+    /// clobber every value held in a register: storing it once before the loop replaces a store and reload per call.
+    fn kept_in_memory(&self, frame: &Frame<'_>, header: usize) -> RegSet {
+        let mut kept = RegSet::default();
+        if frame.site.is_some() {
+            return kept;
+        }
+        let end = loop_end(&frame.flow, header);
+        if !(header..=end).any(|pc| self.calls_out(frame, pc)) {
+            return kept;
+        }
+        let top = usize::from(frame.proto.max_stack);
+        let mut written = RegSet::default();
+        for &instruction in &frame.proto.code[header..=end] {
+            written.insert_range(flow::written(instruction, top));
+        }
+        for register in (0..top).filter(|&register| !written.contains(register)) {
+            kept.insert(register);
+        }
+        kept
+    }
+
+    fn calls_out(&self, frame: &Frame<'_>, pc: usize) -> bool {
+        match frame.proto.code[pc] {
+            Instruction::Call { a, b, c } => {
+                let inlines = self.speculates(frame, pc)
+                    && (self.inline_candidate(frame, pc, (a, b, c)).is_some()
+                        || self.polymorphic_candidates(frame, pc, (a, b, c)).is_some()
+                        || self.builtin_candidate(frame.proto, pc, (b, c)).is_some());
+                !inlines
+            }
+            Instruction::TForCall { .. } | Instruction::Concat { .. } => true,
+            _ => false,
+        }
     }
 
     fn for_base_slot(&self, frame: &Frame<'_>, header: usize) -> Option<u32> {

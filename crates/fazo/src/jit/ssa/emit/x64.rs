@@ -396,6 +396,12 @@ impl Asm for X64 {
         self.sse(Some(0xf2), 0x11, src, Rm::Mem(base, disp));
     }
 
+    /// `MOVUPS` both ways.
+    fn copy16(&mut self, via: u8, (dst_base, dst): (u8, i32), (src_base, src): (u8, i32)) {
+        self.sse(None, 0x10, via, Rm::Mem(src_base, src));
+        self.sse(None, 0x11, via, Rm::Mem(dst_base, dst));
+    }
+
     fn fmov(&mut self, dst: u8, src: u8) {
         if dst != src {
             self.movaps(dst, src);

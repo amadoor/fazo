@@ -32,6 +32,10 @@ impl RegSet {
         changed
     }
 
+    pub(crate) fn insert_range(&mut self, range: std::ops::Range<usize>) {
+        self.range(range.start, range.end);
+    }
+
     fn range(&mut self, from: usize, to: usize) {
         for register in from..to {
             self.insert(register);
@@ -191,6 +195,68 @@ fn liveness(proto: &Proto, successors: &[Vec<usize>], captured: &RegSet) -> Vec<
         set.union_with(captured);
     }
     live
+}
+
+/// Every register the instruction may write: a superset of its kills, with loop updates, calls' scratch registers, and
+/// concatenation's operands.
+pub(crate) fn written(instruction: Instruction, top: usize) -> std::ops::Range<usize> {
+    use Instruction as I;
+    let at = |a: u8, count: usize| usize::from(a)..usize::from(a) + count;
+    match instruction {
+        I::Move { a, .. }
+        | I::LoadI { a, .. }
+        | I::LoadF { a, .. }
+        | I::LoadK { a, .. }
+        | I::LoadKx { a }
+        | I::LoadFalse { a }
+        | I::LFalseSkip { a }
+        | I::LoadTrue { a }
+        | I::GetUpval { a, .. }
+        | I::GetTabUp { a, .. }
+        | I::GetTable { a, .. }
+        | I::GetI { a, .. }
+        | I::GetField { a, .. }
+        | I::NewTable { a, .. }
+        | I::AddI { a, .. }
+        | I::AddK { a, .. }
+        | I::SubK { a, .. }
+        | I::MulK { a, .. }
+        | I::ModK { a, .. }
+        | I::PowK { a, .. }
+        | I::DivK { a, .. }
+        | I::IDivK { a, .. }
+        | I::BAndK { a, .. }
+        | I::BOrK { a, .. }
+        | I::BXorK { a, .. }
+        | I::ShrI { a, .. }
+        | I::ShlI { a, .. }
+        | I::Add { a, .. }
+        | I::Sub { a, .. }
+        | I::Mul { a, .. }
+        | I::Mod { a, .. }
+        | I::Pow { a, .. }
+        | I::Div { a, .. }
+        | I::IDiv { a, .. }
+        | I::BAnd { a, .. }
+        | I::BOr { a, .. }
+        | I::BXor { a, .. }
+        | I::Shl { a, .. }
+        | I::Shr { a, .. }
+        | I::Unm { a, .. }
+        | I::BNot { a, .. }
+        | I::Not { a, .. }
+        | I::Len { a, .. }
+        | I::TestSet { a, .. }
+        | I::Closure { a, .. }
+        | I::GetVarg { a, .. } => at(a, 1),
+        I::LoadNil { a, b } => at(a, usize::from(b) + 1),
+        I::SelfOp { a, .. } => at(a, 2),
+        I::Concat { a, b } => at(a, usize::from(b)),
+        I::ForLoop { a, .. } | I::ForPrep { a, .. } => at(a, 4),
+        I::TForPrep { a, .. } | I::TForLoop { a, .. } => at(a, 5),
+        I::Call { a, .. } | I::TailCall { a, .. } | I::TForCall { a, .. } | I::Vararg { a, .. } => usize::from(a)..top.max(usize::from(a)),
+        _ => 0..0,
+    }
 }
 
 /// Named locals in scope are visible to `debug.getlocal`, so they stay live while in scope.

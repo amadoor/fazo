@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use super::insert;
 use crate::jit::ssa::{
     check::{binary_operand_rep, unary_operand_rep},
-    ir::{BlockId, Closure, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
+    ir::{BlockId, Closure, Edge, Func, Op, PureFn, Rep, Term, Type, UnOp, Val},
 };
 
 pub(crate) fn run(func: &mut Func) {
@@ -83,8 +83,8 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
 /// A conversion serves every block its block dominates, as V8 keeps a node's converted alternatives in its `NodeInfo`
 /// (src/maglev/maglev-graph-builder.cc, `GetTaggedValue`).
 fn convert(func: &mut Func) {
-    let idom = func.dominators();
     let order = func.reverse_postorder();
+    let idom = func.dominators_in(&order);
     let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
     let mut roots = Vec::new();
     for &block in &order {
@@ -192,8 +192,14 @@ fn convert_edges(func: &mut Func, block: BlockId, cache: &mut Cache) {
         Term::Branch { cond, .. } if func.block(block).insts.last() == Some(&cond) => 1,
         _ => 0,
     };
+    let branches = term.edges().len() > 1;
     for edge in term.edges_mut() {
         let params = func.block(edge.block).params.clone();
+        let converts = edge.args.iter().zip(&params).any(|(&arg, &param)| func.rep(arg) != func.rep(param));
+        if converts && branches && leaves_loop(func, block, edge.block) {
+            *edge = convert_on_exit(func, (block, edge.block), &edge.args);
+            continue;
+        }
         for (arg, param) in edge.args.iter_mut().zip(params) {
             let rep = func.rep(param);
             if func.rep(*arg) == rep {
@@ -205,4 +211,32 @@ fn convert_edges(func: &mut Func, block: BlockId, cache: &mut Cache) {
         }
     }
     func.block_mut(block).term = term;
+}
+
+fn leaves_loop(func: &Func, from: BlockId, to: BlockId) -> bool {
+    func.loops.iter().any(|entry| entry.blocks.contains(&from) && !entry.blocks.contains(&to))
+}
+
+/// A loop exit converts in a block of its own, so the iterations that stay in the loop don't run the conversions.
+fn convert_on_exit(func: &mut Func, (from, to): (BlockId, BlockId), args: &[Val]) -> Edge {
+    let exit = func.new_block();
+    let params = func.block(to).params.clone();
+    let mut converted = Vec::with_capacity(args.len());
+    for (&arg, param) in args.iter().zip(params) {
+        let rep = func.rep(param);
+        if func.rep(arg) == rep {
+            converted.push(arg);
+            continue;
+        }
+        let op = if rep == Rep::Boxed { Op::Unary(UnOp::Box, arg) } else { Op::Unary(UnOp::Unbox, arg) };
+        let ty = func.ty(arg);
+        converted.push(func.append(exit, op, ty, rep));
+    }
+    func.block_mut(exit).term = Term::Jump(Edge { block: to, args: converted });
+    for entry in &mut func.loops {
+        if entry.blocks.contains(&from) && entry.blocks.contains(&to) {
+            entry.blocks.push(exit);
+        }
+    }
+    Edge { block: exit, args: Vec::new() }
 }

@@ -26,10 +26,11 @@ pub(crate) fn run(func: &mut Func) {
     if func.loops.is_empty() {
         return;
     }
+    let order = func.reverse_postorder();
     let mut shape = Shape {
-        idom: func.dominators(),
-        order: func.reverse_postorder(),
-        defined: func.definitions(),
+        idom: func.dominators_in(&order),
+        defined: func.definitions_in(&order),
+        order,
     };
     for index in (0..func.loops.len()).rev() {
         let entry = func.loops[index].clone();

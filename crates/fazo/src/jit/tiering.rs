@@ -41,7 +41,7 @@ const CONCAT_COST: i64 = 180;
 const GENERIC_TABLE_COST: i64 = 20;
 /// Optimizing tests a polymorphic method's entries one after another.
 const POLYMORPHIC_METHOD_COST: i64 = 150;
-/// Optimizing stores and reloads every register below a call's base; Baseline keeps them in the frame.
+/// Optimizing stores and reloads the registers below a call's base that its loop writes; Baseline keeps them in the frame.
 const CALL_REGISTER_COST: i64 = 8;
 /// An unseen shape deoptimizes and recompiles; Baseline's chain does not.
 const POLYMORPHIC_FIELD_COST: i64 = 40;
@@ -165,7 +165,7 @@ pub(crate) fn of_proto(proto: &Proto, calls: &[Vec<CallTarget>], lookup: &Lookup
                 if peak { peak_gain } else { site_gain }
             }
             None if peak => peak_gain(instruction),
-            None => bytecode_gain(proto, calls, pc, instruction),
+            None => bytecode_gain(proto, (calls, depths[pc] > 0), pc, instruction),
         };
         gain = gain.saturating_add(site_gain.saturating_mul(scale));
         weight = weight.saturating_add(scale);
@@ -270,7 +270,7 @@ fn inlined_gain(callee: &crate::vm::ic::Callee, instruction: Instruction, lookup
                 (site_gain, site_over)
             }
             None if calls => return None,
-            None => (bytecode_gain(function, &[], inner, instruction), peak_gain(instruction)),
+            None => (bytecode_gain(function, (&[], false), inner, instruction), peak_gain(instruction)),
         };
         gain = gain.saturating_add(site_gain);
         over_optimizing += site_over;
@@ -291,7 +291,7 @@ fn direct_lua_call(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize) -> Optio
 }
 
 /// A site the interpreter never reached records no feedback and counts for nothing.
-fn bytecode_gain(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize, instruction: Instruction) -> i64 {
+fn bytecode_gain(proto: &Proto, (calls, in_loop): (&[Vec<CallTarget>], bool), pc: usize, instruction: Instruction) -> i64 {
     let reached = !matches!(proto.exec.feedback.get(pc), None | Some(InlineCache::Uninitialized));
     let cached = super::sites::site_is_cached(proto, pc);
     let methods = match proto.exec.feedback.get(pc) {
@@ -303,6 +303,7 @@ fn bytecode_gain(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize, instructio
         Instruction::TailCall { .. } if direct_lua_call(proto, calls, pc) == Some(true) => DIRECT_TAIL_CALL_GAIN,
         Instruction::TailCall { .. } => -TAIL_CALL_COST,
         Instruction::Call { a, .. } => match direct_lua_call(proto, calls, pc) {
+            Some(true) if in_loop => DIRECT_CALL_GAIN - i64::from(proto.jit.written_below.get_or_init(|| super::sites::written_below(proto))[pc]) * CALL_REGISTER_COST,
             Some(true) => DIRECT_CALL_GAIN - i64::from(a) * CALL_REGISTER_COST,
             Some(false) => -HELPER_CALL_COST,
             None => 0,

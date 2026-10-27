@@ -77,7 +77,7 @@ impl Facts {
 
 pub(crate) fn run(func: &mut Func) {
     let order = func.reverse_postorder();
-    let idom = func.dominators();
+    let idom = func.dominators_in(&order);
     let incoming = incoming_edges(func, &order);
     let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
     let mut roots = Vec::new();

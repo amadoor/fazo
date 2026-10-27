@@ -249,6 +249,13 @@ impl Asm for A64 {
         self.asm().str(f(src), mem);
     }
 
+    fn copy16(&mut self, via: u8, (dst_base, dst): (u8, i32), (src_base, src): (u8, i32)) {
+        let from = self.mem(16, src_base, src);
+        self.asm().ldr(q(u32::from(via)), from);
+        let to = self.mem(16, dst_base, dst);
+        self.asm().str(q(u32::from(via)), to);
+    }
+
     fn fmov(&mut self, dst: u8, src: u8) {
         if dst != src {
             self.asm().fmov(f(dst), f(src));
