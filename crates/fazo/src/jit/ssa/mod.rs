@@ -59,6 +59,11 @@ impl PeakUnit {
     }
 }
 
+/// The driver runs VARARGPREP first, so vararg code starts at the next instruction.
+pub(crate) fn entry_pc(vararg: bool) -> u32 {
+    u32::from(vararg)
+}
+
 pub(crate) fn points(func: &ir::Func) -> Box<[DeoptPoint]> {
     func.states
         .iter()

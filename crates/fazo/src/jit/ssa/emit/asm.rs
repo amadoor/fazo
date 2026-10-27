@@ -90,6 +90,8 @@ pub(crate) trait Asm {
     /// Bytes below the frame's own areas that outgoing calls use.
     const OUTGOING: i32;
     const REGISTERS: Registers;
+    /// Without loops, values seldom outlive a call, so a register the prologue need not save is cheapest.
+    const CALLER_SAVED_FIRST: Registers;
     const MAX_FRAME: u32;
 
     fn new() -> Self;
@@ -167,11 +169,13 @@ pub(crate) trait Asm {
     fn trap(&mut self);
 
     /// `floats` are callee-saved float registers, stored at their offsets from the stack pointer.
-    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8) -> super::unwind::Prologue;
+    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8, saved: &[u8]) -> super::unwind::Prologue;
     /// Returns `code` to the caller from any stack depth inside the frame.
-    fn epilogue(&mut self, frame: u32, floats: &[(u8, u32)], code: u8);
+    fn epilogue(&mut self, frame: u32, floats: &[(u8, u32)], code: u8, saved: &[u8]);
+    fn tail_epilogue(&mut self, frame: u32, floats: &[(u8, u32)], saved: &[u8]);
+    fn saved_registers(used: super::regs::RegSet) -> Vec<u8>;
     fn finish(self) -> Option<Vec<u8>>;
-    fn frame_size(needed: u32) -> u32;
+    fn frame_size(needed: u32, saved: usize) -> u32;
     /// An unconditional jump placed right before the code it jumps into, `distance` bytes past the jump's end.
     fn raw_jump(distance: u32) -> Vec<u8>;
 }

@@ -413,7 +413,7 @@ impl Vm {
             inline_caches,
             calls: &calls,
         };
-        let library = self.jit.library.get_or_insert_with(|| Box::new(crate::jit::baseline::Library::new(layout, frames, JIT_CALL_DEPTH)));
+        let library = self.jit.library.get_or_insert_with(|| Box::new(crate::jit::baseline::Library::new(layout, frames)));
         crate::jit::baseline::compile(library, budget, function, &facts)
     }
 
@@ -536,7 +536,6 @@ impl Vm {
             layout,
             frames,
             calls,
-            call_depth_limit: JIT_CALL_DEPTH,
             inline_caches: !facts_stress.inline_caches_off,
             avoid: &avoid,
             insufficient: &insufficient,
@@ -950,12 +949,13 @@ impl Vm {
                     super::InlineCache::Callees(callees) => callees,
                     _ => &[],
                 };
-                callees.iter().filter_map(|&callee| self.jit_call_target(callee)).collect()
+                callees.iter().filter_map(|&callee| self.jit_call_target(proto, callee)).collect()
             })
             .collect()
     }
 
-    fn jit_call_target(&self, callee: super::ic::Callee) -> Option<crate::jit::CallTarget> {
+    /// `caller` is still compiling, so its code is not installed yet.
+    fn jit_call_target(&self, caller: Ref<Proto>, callee: super::ic::Callee) -> Option<crate::jit::CallTarget> {
         let (Value::Closure(closure), Some(proto)) = (callee.value, callee.proto) else {
             return None;
         };
@@ -971,6 +971,18 @@ impl Vm {
             num_params: function.num_params,
             max_stack: function.max_stack,
             has_upvalues: !function.upvalues.is_empty(),
+            pushes_frame: (function.jit.unit.is_none() && proto != caller)
+                || function.code.iter().any(|instruction| {
+                    matches!(
+                        instruction,
+                        Instruction::NewTable { .. }
+                            | Instruction::SetList { .. }
+                            | Instruction::Closure { .. }
+                            | Instruction::Concat { .. }
+                            | Instruction::GetI { .. }
+                            | Instruction::GetTable { .. }
+                    )
+                }),
         })
     }
 
@@ -1055,15 +1067,10 @@ impl Vm {
         registers: *mut Value,
     ) -> Result<bool, LuaError> {
         let address = stack_address();
-        let depth = self.jit.call_depth;
         if self.jit.entries == 0 {
             self.jit.stack_floor = address.saturating_sub(JIT_NATIVE_STACK_BUDGET);
-        } else {
-            let Some(room) = address.checked_sub(self.jit.stack_floor.saturating_add(JIT_INTERPRETER_STACK)) else {
-                return Ok(false);
-            };
-            let levels = u32::try_from(room / JIT_CALL_STACK).unwrap_or(u32::MAX);
-            self.jit.call_depth = depth.max(JIT_CALL_DEPTH.saturating_sub(levels));
+        } else if address < self.jit.stack_floor.saturating_add(JIT_INTERPRETER_STACK) {
+            return Ok(false);
         }
         let mut error = None;
         let direct_results = self.jit_entry_results();
@@ -1083,13 +1090,17 @@ impl Vm {
             ret_offset: -(std::mem::size_of::<Value>() as i64),
             thread: self.jit_thread_object(),
             thread_ref: self.current_thread,
-            call_depth: &raw mut self.jit.call_depth,
+            stack_limit: self.jit_stack_limit(),
             error: &raw mut error,
+            parent: std::ptr::null_mut(),
+            child: std::ptr::null_mut(),
+            pending: 0,
+            saved_pc: 0,
+            frame_index: self.jit_top_index(),
         };
         self.jit.entries += 1;
         let code = crate::jit::enter(entry.code, &mut ctx, pc);
         self.jit.entries -= 1;
-        self.jit.call_depth = depth;
         debug_assert!(matches!(code, EXIT_RELOAD | EXIT_HOOK | EXIT_ERROR | EXIT_RETURNED));
         match code {
             EXIT_ERROR => Err(error.take().expect("compiled code exits with an error only after recording it")),
@@ -1198,7 +1209,7 @@ impl Vm {
         let callee = self.stack_get(function_slot);
         self.record_call(ctx.proto, pc, callee);
         match callee {
-            Value::Closure(closure) if self.jit.call_depth < JIT_CALL_DEPTH => {
+            Value::Closure(closure) if self.jit_stack_room(ctx, JIT_CALL_STACK) => {
                 self.jit_call_compiled(ctx, pc, function_slot, closure, argument_count, c)
             }
             Value::Native(native) if matches!(self.builtin_of(native), Some(Builtin::Resume | Builtin::Wrap)) => {
@@ -1245,9 +1256,7 @@ impl Vm {
         if !self.resume_fast(native, wrapped, function_slot, argument_count, i32::from(c) - 1, pc + 1) {
             return self.jit_call_general(ctx, pc);
         }
-        self.jit.call_depth += 1;
         let ran = self.jit_run_resumed(thread, frames);
-        self.jit.call_depth -= 1;
         match ran {
             Err(error) => {
                 ctx.fail(error);
@@ -1315,9 +1324,7 @@ impl Vm {
         if !self.jit_stack_room(ctx, JIT_INTERPRETER_STACK) {
             return Control::Reload;
         }
-        self.jit.call_depth += 1;
         let ran = self.execute(RunScope { thread, frames, return_on_switch: true });
-        self.jit.call_depth -= 1;
         match ran {
             Err(error) => {
                 ctx.fail(error);
@@ -1394,12 +1401,15 @@ impl Vm {
             ret_offset: -(std::mem::size_of::<Value>() as i64),
             thread: ctx.thread,
             thread_ref: ctx.thread_ref,
-            call_depth: ctx.call_depth,
+            stack_limit: ctx.stack_limit,
             error: ctx.error,
+            parent: std::ptr::null_mut(),
+            child: std::ptr::null_mut(),
+            pending: 0,
+            saved_pc: 0,
+            frame_index: self.jit_top_index(),
         };
-        self.jit.call_depth += 1;
         let code = crate::jit::enter(entry, &mut callee, if vararg { VARARG_BODY } else { 0 });
-        self.jit.call_depth -= 1;
         match code {
             EXIT_RETURNED => {
                 self.thread_mut().frames.pop();
@@ -1448,9 +1458,7 @@ impl Vm {
             unreachable!("a pushed Lua call leaves a Lua frame on top");
         };
         let proto = self.heap.closures.live(closure).proto;
-        self.jit.call_depth += 1;
         let ran = self.jit_enter_callee(closure, base, proto);
-        self.jit.call_depth -= 1;
         match ran {
             Err(error) => {
                 ctx.fail(error);
@@ -1544,9 +1552,7 @@ impl Vm {
         if nested {
             return Control::Reload;
         }
-        self.jit.call_depth += 1;
         let ran = self.jit_enter_callee(closure, base, proto);
-        self.jit.call_depth -= 1;
         match ran {
             Err(error) => {
                 ctx.fail(error);
@@ -1651,12 +1657,15 @@ impl Vm {
             ret_offset: -(std::mem::size_of::<Value>() as i64),
             thread: self.jit_thread_object(),
             thread_ref: ctx.thread_ref,
-            call_depth: ctx.call_depth,
+            stack_limit: ctx.stack_limit,
             error: ctx.error,
+            parent: std::ptr::null_mut(),
+            child: std::ptr::null_mut(),
+            pending: 0,
+            saved_pc: 0,
+            frame_index: self.jit_top_index(),
         };
-        self.jit.call_depth += 1;
         let code = crate::jit::enter(entry, &mut callee, 0);
-        self.jit.call_depth -= 1;
         Some(match code {
             EXIT_RETURNED => {
                 self.jit_refresh(ctx);
@@ -1694,6 +1703,29 @@ impl Vm {
             return Control::Error;
         }
         Control::Reload
+    }
+
+    /// `false` leaves VARARG without a vararg table to the interpreter (`copy_varargs`).
+    pub(crate) fn jit_vararg(&mut self, ctx: &mut JitCtx, a: u8, c: u8) -> bool {
+        if self.tracing {
+            return false;
+        }
+        let Some(available) = self.top_lua_frame().map(crate::object::LuaFrame::nvarargs) else {
+            return false;
+        };
+        let destination = ctx.base + usize::from(a);
+        let wanted = if c == 0 { available } else { usize::from(c) - 1 };
+        let copied = wanted.min(available);
+        let source = ctx.base - 1 - available;
+        self.ensure_stack(destination + wanted);
+        let thread = self.thread_mut();
+        thread.stack.copy_within(source..source + copied, destination);
+        thread.stack[destination + copied..destination + wanted].fill(Value::Nil);
+        if c == 0 {
+            thread.top = destination + available;
+        }
+        self.jit_refresh(ctx);
+        true
     }
 
     pub(crate) fn jit_new_table(&mut self, ctx: &mut JitCtx, pc: usize, a: u8, array: u32, hash_log: u8) -> i64 {
@@ -1882,12 +1914,85 @@ impl Vm {
         self.jit_refresh(ctx);
     }
 
+    #[inline]
     fn jit_refresh(&mut self, ctx: &mut JitCtx) {
-        ctx.registers = self.thread_mut().stack.as_mut_ptr().wrapping_add(ctx.base);
-        ctx.tables = self.heap.tables.objects_ptr();
-        ctx.table_marks = self.heap.tables.marks_ptr();
-        ctx.closures = self.heap.closures.objects_ptr();
-        ctx.thread = self.jit_thread_object();
+        let running = self.thread_mut();
+        let stack = running.stack.as_mut_ptr();
+        let thread = std::ptr::from_mut(running);
+        let registers = stack.wrapping_add(ctx.base);
+        let tables = self.heap.tables.objects_ptr();
+        let table_marks = self.heap.tables.marks_ptr();
+        let closures = self.heap.closures.objects_ptr();
+        let linked = !ctx.parent.is_null() || !ctx.child.is_null();
+        let moved = linked
+            && ((ctx.registers != registers) | (ctx.tables != tables) | (ctx.table_marks != table_marks) | (ctx.closures != closures) | (ctx.thread != thread));
+        ctx.registers = registers;
+        ctx.tables = tables;
+        ctx.table_marks = table_marks;
+        ctx.closures = closures;
+        ctx.thread = thread;
+        if moved {
+            Self::jit_refresh_nest(ctx, stack);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn jit_refresh_nest(ctx: &mut JitCtx, stack: *mut Value) {
+        let (tables, table_marks, closures, thread) = (ctx.tables, ctx.table_marks, ctx.closures, ctx.thread);
+        ctx.refresh_nest(|other| {
+            other.registers = stack.wrapping_add(other.base);
+            other.tables = tables;
+            other.table_marks = table_marks;
+            other.closures = closures;
+            other.thread = thread;
+        });
+    }
+
+    pub(crate) fn jit_stack_limit(&self) -> usize {
+        self.jit.stack_floor.saturating_add(JIT_CALL_STACK)
+    }
+
+    fn jit_top_index(&self) -> u32 {
+        self.thread().frames.len().saturating_sub(1) as u32
+    }
+
+    /// Pushes pending frames outermost first, before VM code reads `thread.frames`.
+    #[inline]
+    pub(crate) fn jit_push_pending(&mut self, ctx: &mut JitCtx) {
+        if ctx.pending != 0 {
+            self.jit_push_pending_frames(ctx);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn jit_push_pending_frames(&mut self, ctx: &mut JitCtx) {
+        self.jit_push_pending_frame(ctx, None);
+    }
+
+    /// Pushes the outer pending frames first; `pc` is `None` for the innermost, whose helper sets its pc.
+    fn jit_push_pending_frame(&mut self, ctx: &mut JitCtx, pc: Option<u32>) {
+        match ctx.pending_caller() {
+            Ok(caller) => {
+                let resumed = caller.saved_pc;
+                self.jit_push_pending_frame(caller, Some(resumed));
+            }
+            Err(resumed) => {
+                if let Some(crate::object::Frame::Lua(frame)) = self.thread_mut().frames.last_mut() {
+                    frame.set_pc(resumed as usize);
+                }
+            }
+        }
+        let called = crate::object::LuaFrame::called(ctx.closure, ctx.base, ctx.direct_results, 0);
+        let mut frame = if ctx.pending & crate::jit::PENDING_TAIL != 0 { crate::object::LuaFrame::with_status(ctx.closure, ctx.base, called.status() | frame_status::TAIL) } else { called };
+        if let Some(pc) = pc {
+            frame.set_pc(pc as usize);
+        }
+        let frames = &mut self.thread_mut().frames;
+        frames.push(crate::object::Frame::Lua(frame));
+        ctx.pending = 0;
+        ctx.frame_index = frames.len() as u32 - 1;
     }
 
     fn jit_thread_object(&mut self) -> *mut crate::object::Thread {
@@ -1956,10 +2061,6 @@ const JIT_NATIVE_STACK_BUDGET: usize = 256 * 1024;
 /// Native stack one nested compiled call level needs before the next check.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const JIT_CALL_STACK: usize = if cfg!(debug_assertions) { 2560 } else { 608 };
-
-/// A compiled call counts levels instead of reading the stack, so a level costs one compare.
-#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-const JIT_CALL_DEPTH: u32 = (JIT_NATIVE_STACK_BUDGET / JIT_CALL_STACK) as u32;
 
 /// Native stack a nested interpreter run needs before it checks again.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

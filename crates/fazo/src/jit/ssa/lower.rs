@@ -16,6 +16,7 @@ use super::{
     ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Func, HelperKind, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
     runtime,
 };
+use super::ir::MULTIPLE_RESULTS;
 use crate::jit::{
     FrameLayout, JitCtx, JitResult, TableLayout,
     layout::{lua_frame, upvalue},
@@ -41,7 +42,6 @@ pub(crate) struct Env<'a> {
     pub(crate) frames: FrameLayout,
     pub(crate) calls: &'a [Vec<CallTarget>],
     pub(crate) unknown_calls: &'a [bool],
-    pub(crate) call_depth_limit: u32,
     pub(crate) vararg: bool,
     pub(crate) points: &'a [DeoptPoint],
     pub(crate) stress_exits: bool,
@@ -236,8 +236,9 @@ impl<'a, 'f> Lowering<'a, 'f> {
     fn dispatch_entry(&mut self, entry: Block) {
         let pc = self.builder.block_params(entry)[1];
         let pc = self.builder.ins().uextend(types::I64, pc);
-        let mut targets: Vec<(u32, BlockId)> = self.ir.entry.map(|block| (0, block)).into_iter().collect();
-        targets.extend(self.ir.osr.iter().copied().filter(|&(at, _)| at != 0));
+        let start = super::entry_pc(self.env.vararg);
+        let mut targets: Vec<(u32, BlockId)> = self.ir.entry.map(|block| (start, block)).into_iter().collect();
+        targets.extend(self.ir.osr.iter().copied().filter(|&(at, _)| at != 0 && at != start));
         for (at, block) in targets {
             let next = self.builder.create_block();
             let here = self.builder.ins().icmp_imm_s(IntCC::Equal, pc, i64::from(at));
@@ -1523,7 +1524,12 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 if *close {
                     self.close_in_place(*pc as usize);
                 }
-                self.lower_return(*pc as usize, *first, *count);
+                if *count == MULTIPLE_RESULTS {
+                    let result = self.call_fast(*pc as usize, sites::FAST_RETURN, [u32::from(*first), *count, 0]);
+                    self.exit_with(result);
+                } else {
+                    self.lower_return(*pc as usize, *first, *count);
+                }
             }
             Term::TailCall { pc, .. } => {
                 let pc_value = self.iconst(types::I32, i64::from(*pc));
@@ -1718,7 +1724,6 @@ impl<'a, 'f> Lowering<'a, 'f> {
     /// Mirrors `Vm::jit_call_compiled`; other exits go to `Vm::jit_after_call`.
     fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, closure: Value, (helper, join): (Block, Block)) {
         let frames = self.env.frames;
-        let depth_limit = self.env.call_depth_limit;
         let signature = self.imports.entry_signature;
         let context = self.callee_context();
         let flags = self.frame_flags;
@@ -1729,9 +1734,11 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let facts = self.callee_facts(callee, closure);
         let entry = self.builder.ins().load(types::I64, flags, facts.cell, 0);
         self.continue_unless(entry, IntCC::Equal, 0, helper);
-        let depth_pointer = self.ctx_load(self.pointer, offset_of!(JitCtx, call_depth));
-        let depth = self.builder.ins().load(types::I32, flags, depth_pointer, 0);
-        self.continue_unless(depth, IntCC::UnsignedGreaterThanOrEqual, i64::from(depth_limit), helper);
+        let pending = self.ctx_load(types::I32, offset_of!(JitCtx, pending));
+        self.continue_unless(pending, IntCC::NotEqual, 0, helper);
+        let stack_pointer = self.builder.ins().get_stack_pointer(self.pointer);
+        let stack_limit = self.ctx_load(self.pointer, offset_of!(JitCtx, stack_limit));
+        self.leave_if(IntCC::UnsignedLessThanOrEqual, stack_pointer, stack_limit, helper);
         let thread = self.ctx_load(self.pointer, offset_of!(JitCtx, thread));
         let stack_len = self.builder.ins().load(types::I64, flags, thread, frames.stack_len);
         let caller_base = self.ctx_load(types::I64, offset_of!(JitCtx, base));
@@ -1778,14 +1785,10 @@ impl<'a, 'f> Lowering<'a, 'f> {
             self.builder.ins().load(types::I64, self.heap_flags, address, frames.closure_upvalues)
         };
         self.fill_callee_context(context, (upvalues, facts.constants, facts.proto), base, (callee_offset, callee_base, closure), wanted);
-        let deeper = self.builder.ins().iadd_imm_s(depth, 1);
-        self.builder.ins().store(flags, deeper, depth_pointer, 0);
         let callee_context = self.builder.ins().stack_addr(self.pointer, context, 0);
         let start = self.iconst(types::I32, 0);
         let call = self.builder.ins().call_indirect(signature, entry, &[callee_context, start]);
         let code = self.builder.inst_results(call)[0];
-        let depth_pointer = self.ctx_load(self.pointer, offset_of!(JitCtx, call_depth));
-        self.builder.ins().store(flags, depth, depth_pointer, 0);
 
         let returned = self.builder.create_block();
         let other = self.builder.create_block();
@@ -1903,7 +1906,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
             offset_of!(JitCtx, vm),
             offset_of!(JitCtx, thread),
             offset_of!(JitCtx, thread_ref),
-            offset_of!(JitCtx, call_depth),
+            offset_of!(JitCtx, stack_limit),
             offset_of!(JitCtx, error),
         ];
         for offset in copied {
@@ -1926,6 +1929,11 @@ impl<'a, 'f> Lowering<'a, 'f> {
         for (offset, value) in set {
             self.builder.ins().stack_store(self.pointer, value, context, offset as i32);
         }
+        let zero = self.iconst(types::I64, 0);
+        let settled = self.iconst(types::I32, 0);
+        self.builder.ins().stack_store(self.pointer, zero, context, offset_of!(JitCtx, parent) as i32);
+        self.builder.ins().stack_store(self.pointer, zero, context, offset_of!(JitCtx, child) as i32);
+        self.builder.ins().stack_store(self.pointer, settled, context, offset_of!(JitCtx, pending) as i32);
     }
 
     /// The callee's helpers refresh its context whenever they move its stack, tables or thread.

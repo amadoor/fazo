@@ -162,6 +162,8 @@ impl Asm for A64 {
         fp: &FP_ORDER,
         callee_saved: callee_saved(),
     };
+    /// The prologue saves every pair anyway, so caller-saved registers would only add saves around calls.
+    const CALLER_SAVED_FIRST: Registers = Self::REGISTERS;
     /// One `sub` sets up the frame, so Windows unwind codes describe it as one `alloc`.
     const MAX_FRAME: u32 = 4080;
 
@@ -491,7 +493,7 @@ impl Asm for A64 {
     }
 
     /// Follows Baseline's AArch64 prologue (`baseline/a64.rs`, `frame::prologue`) with two more pairs.
-    fn prologue(&mut self, frame: u32, _floats: &[(u8, u32)], pc_dst: u8) -> unwind::Prologue {
+    fn prologue(&mut self, frame: u32, _floats: &[(u8, u32)], pc_dst: u8, _saved: &[u8]) -> unwind::Prologue {
         let mut prologue = unwind::Prologue { arch: unwind::Arch::A64, frame, ..unwind::Prologue::default() };
         self.asm().stp(r(FRAME), r(LINK), ptr_pre(r(STACK), -16));
         prologue.save_frame = self.offset();
@@ -510,7 +512,7 @@ impl Asm for A64 {
         prologue
     }
 
-    fn epilogue(&mut self, _frame: u32, _floats: &[(u8, u32)], code: u8) {
+    fn epilogue(&mut self, _frame: u32, _floats: &[(u8, u32)], code: u8, _saved: &[u8]) {
         self.mov(0, code);
         self.asm().sub(r(STACK), r(FRAME), imm(16 * PAIRS.len() as u32));
         for first in PAIRS.iter().rev() {
@@ -520,13 +522,27 @@ impl Asm for A64 {
         self.asm().ret(r(LINK));
     }
 
+    fn tail_epilogue(&mut self, _frame: u32, _floats: &[(u8, u32)], _saved: &[u8]) {
+        self.asm().sub(r(STACK), r(FRAME), imm(16 * PAIRS.len() as u32));
+        for first in PAIRS.iter().rev() {
+            self.asm().ldp(r(*first), r(first + 1), ptr_post(r(STACK), 16));
+        }
+        self.asm().ldp(r(FRAME), r(LINK), ptr_post(r(STACK), 16));
+        self.asm().br(r(SCRATCH));
+    }
+
     fn finish(mut self) -> Option<std::vec::Vec<u8>> {
         let code = self.buffer.finish().ok()?;
         Some(code.data().to_vec())
     }
 
+    /// Every pair is saved, so the prologue keeps one unwind shape.
+    fn saved_registers(_used: RegSet) -> std::vec::Vec<u8> {
+        std::vec::Vec::new()
+    }
+
     /// The pushes are whole pairs, so the frame alone keeps the stack 16-byte aligned.
-    fn frame_size(needed: u32) -> u32 {
+    fn frame_size(needed: u32, _saved: usize) -> u32 {
         needed.next_multiple_of(16)
     }
 

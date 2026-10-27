@@ -88,7 +88,7 @@ fn host_frame() -> Frame {
 }
 
 impl Library {
-    pub(crate) fn new(table: Option<TableLayout>, frames: Option<FrameLayout>, depth_limit: u32) -> Self {
+    pub(crate) fn new(table: Option<TableLayout>, frames: Option<FrameLayout>) -> Self {
         let fast = super::sites::fast_symbols().map(|(_, address)| address as u64);
         let helpers = HelperAddresses {
             step: helpers::step as extern "C" fn(*mut JitCtx, u32) -> i64 as usize as u64,
@@ -98,7 +98,7 @@ impl Library {
             fast,
         };
         Self {
-            env: Env { table, frames, helpers, depth_limit },
+            env: Env { table, frames, helpers },
             frame: host_frame(),
             stencils: vec![None; templates::KEY_COUNT],
         }

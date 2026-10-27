@@ -24,15 +24,16 @@ const SET_UPVAL: &str = "fazo_jit_set_upval";
 const TAIL_CALL: &str = "fazo_jit_tail_call";
 const TABLE_BARRIER: &str = "fazo_jit_table_barrier";
 const AFTER_CALL: &str = "fazo_jit_after_call";
+const VARARG: &str = "fazo_jit_vararg";
 const NEW_TABLE: &str = "fazo_jit_new_table";
 const CLOSURE: &str = "fazo_jit_closure";
 const CLOSE: &str = "fazo_jit_close";
 const SET_LIST: &str = "fazo_jit_set_list";
 
 /// Indexes match the function references in `Helpers::fast`.
-pub(crate) const FAST_NAMES: [&str; 21] = [
+pub(crate) const FAST_NAMES: [&str; 22] = [
     GET_FIELD, GET_TABLE, GET_INT, GET_SELF, SET_FIELD, SET_TABLE, SET_INT, CALL_DIRECT, RETURN, FOR_PREP, GET_TABUP, ARITH, GET_UPVAL,
-    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE, CLOSE, SET_LIST,
+    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE, CLOSE, SET_LIST, VARARG,
 ];
 pub(crate) const FAST_GET_FIELD: usize = 0;
 pub(crate) const FAST_GET_TABLE: usize = 1;
@@ -55,10 +56,11 @@ pub(crate) const FAST_NEW_TABLE: usize = 17;
 pub(crate) const FAST_CLOSURE: usize = 18;
 pub(crate) const FAST_CLOSE: usize = 19;
 pub(crate) const FAST_SET_LIST: usize = 20;
+pub(crate) const FAST_VARARG: usize = 21;
 
 pub(crate) type FastFn = extern "C" fn(*mut JitCtx, u32, u32, u32, u32) -> i64;
 
-pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 21] {
+pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 22] {
     [
         (GET_FIELD, helpers::get_field as FastFn as *const u8),
         (GET_TABLE, helpers::get_table as FastFn as *const u8),
@@ -81,6 +83,7 @@ pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 21] {
         (CLOSURE, helpers::closure as FastFn as *const u8),
         (CLOSE, helpers::close as FastFn as *const u8),
         (SET_LIST, helpers::set_list as FastFn as *const u8),
+        (VARARG, helpers::vararg as FastFn as *const u8),
     ]
 }
 pub(crate) const ENTRY: &str = "fazo_jit_entry";
@@ -317,6 +320,8 @@ pub(crate) struct CallTarget {
     pub(crate) num_params: u8,
     pub(crate) max_stack: u8,
     pub(crate) has_upvalues: bool,
+    /// Such callees push a lazy frame at their first helper anyway.
+    pub(crate) pushes_frame: bool,
 }
 
 pub(crate) fn offset_pc(from: usize, offset: i32) -> usize {

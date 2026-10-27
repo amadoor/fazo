@@ -23,10 +23,21 @@ pub(crate) struct JitCtx {
     pub(crate) ret_offset: i64,
     pub(crate) thread: *mut Thread,
     pub(crate) thread_ref: Ref<Thread>,
-    pub(crate) call_depth: *mut u32,
+    /// Native stack floor that compiled calls check before recursing (V8 `StackCheck`).
+    pub(crate) stack_limit: usize,
     /// Error slot shared by every frame of one nest; `EXIT_ERROR` writes into it.
     pub(crate) error: *mut Option<LuaError>,
+    /// Caller context an optimized direct call filled; such callers skip the refresh after the call.
+    pub(crate) parent: *mut JitCtx,
+    pub(crate) child: *mut JitCtx,
+    /// `PENDING` while the frame lives only on the native stack until a helper pushes it (LuaJIT lj_frame.h).
+    pub(crate) pending: u32,
+    pub(crate) saved_pc: u32,
+    pub(crate) frame_index: u32,
 }
+
+pub(crate) const PENDING: u32 = 1;
+pub(crate) const PENDING_TAIL: u32 = 2;
 
 pub(crate) const NOT_DIRECT: i32 = -2;
 
@@ -36,5 +47,32 @@ impl JitCtx {
         // SAFETY: `error` is the slot of the driver call that entered the outermost compiled frame, which
         // outlives the nest. Compiled code runs on one thread and nothing else touches the slot meanwhile.
         unsafe { *self.error = Some(error) }
+    }
+}
+
+impl JitCtx {
+    pub(crate) fn pending_caller(&mut self) -> Result<&mut JitCtx, u32> {
+        // SAFETY: a pending frame's `parent` is its compiled caller's context, live deeper in the native stack while it
+        // runs and distinct from `self`.
+        let caller = unsafe { self.parent.as_mut() }.expect("a pending frame has a compiled caller");
+        if caller.pending == 0 {
+            return Err(caller.saved_pc);
+        }
+        Ok(caller)
+    }
+
+    pub(crate) fn refresh_nest(&mut self, refresh: impl Fn(&mut JitCtx)) {
+        // SAFETY: `child` is null or the call area in this activation's native frame, and every `parent` is a caller's
+        // context deeper in the native stack, all live while this frame runs and none the same as `self`.
+        unsafe {
+            if let Some(child) = self.child.as_mut() {
+                refresh(child);
+            }
+            let mut parent = self.parent;
+            while let Some(caller) = parent.as_mut() {
+                refresh(caller);
+                parent = caller.parent;
+            }
+        }
     }
 }

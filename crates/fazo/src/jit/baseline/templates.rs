@@ -30,7 +30,7 @@ pub(crate) struct HelperAddresses {
     pub(crate) safe_point: u64,
     pub(crate) misc: u64,
     pub(crate) tier_check: u64,
-    pub(crate) fast: [u64; 21],
+    pub(crate) fast: [u64; crate::jit::sites::FAST_NAMES.len()],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +38,6 @@ pub(crate) struct Env {
     pub(crate) table: Option<TableLayout>,
     pub(crate) frames: Option<FrameLayout>,
     pub(crate) helpers: HelperAddresses,
-    pub(crate) depth_limit: u32,
 }
 
 pub(crate) const CALL_AREA: usize = std::mem::size_of::<JitCtx>() + 32;
@@ -335,7 +334,7 @@ fn closure_address(m: &mut dyn Masm, dst: Reg, scratch: Reg) {
 
 fn call_check(m: &mut dyn Masm, env: &Env) {
     let frames = frames(env);
-    callee_check(m, env);
+    callee_check(m);
     m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, thread)));
     m.load(Width::U64, Reg::T2, Reg::T1, fixed(i64::from(frames.stack_len)));
     m.load(Width::U64, Reg::T3, Reg::Ctx, context(offset_of!(JitCtx, base)));
@@ -375,19 +374,11 @@ fn call_enter(m: &mut dyn Masm, env: &Env, callee: Callee) {
     m.store(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
     push_frame(m, frames, at(SPILL_COUNT));
     fill_context(m, frames, callee, area);
-    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T0, Reg::T2, fixed(0));
-    m.alu_imm(Alu::Add, Reg::T0, 1);
-    m.store(Width::U32, Reg::T0, Reg::T2, fixed(0));
     m.load(Width::U64, Reg::T0, Reg::T5, at(SPILL_ENTRY));
     m.stack_address(Reg::T5, area);
     m.arg_reg(0, Reg::T5);
     m.arg_imm(1, fixed(0));
     m.call_reg(Reg::T0);
-    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T1, Reg::T2, fixed(0));
-    m.alu_imm(Alu::Sub, Reg::T1, 1);
-    m.store(Width::U32, Reg::T1, Reg::T2, fixed(0));
     m.cmp_imm(Reg::Ret, crate::jit::EXIT_RETURNED as i32);
     m.branch(Cond::Ne, other);
 
@@ -458,6 +449,7 @@ fn fill_context(m: &mut dyn Masm, frames: FrameLayout, callee: Callee, area: i32
         m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset));
         m.store(Width::U64, Reg::T2, Reg::T5, at(offset));
     }
+    nest_links(m, Reg::T5, area);
     m.mov_imm(Reg::T2, reg(slot::V));
     m.alu(Alu::Add, Reg::T2, Reg::Base);
     m.store(Width::U64, Reg::T2, Reg::T5, at(offset_of!(JitCtx, registers)));
@@ -509,10 +501,13 @@ fn call_any_check(m: &mut dyn Masm, env: &Env) {
     m.load(Width::U64, Reg::T4, Reg::T4, fixed(0));
     m.cmp_imm(Reg::T4, 0);
     m.branch(Cond::Eq, slow());
-    m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T1, Reg::T1, fixed(0));
-    m.cmp_imm(Reg::T1, env.depth_limit as i32);
-    m.branch(Cond::AboveEq, slow());
+    m.load(Width::U32, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, pending)));
+    m.cmp_imm(Reg::T1, 0);
+    m.branch(Cond::Ne, slow());
+    m.stack_address(Reg::T1, 0);
+    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, stack_limit)));
+    m.cmp(Reg::T1, Reg::T2);
+    m.branch(Cond::BelowEq, slow());
     m.stack_address(Reg::T5, 0);
     m.store(Width::U64, Reg::T0, Reg::T5, at(SPILL_EXEC));
     m.store(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
@@ -556,7 +551,7 @@ fn call_any_check(m: &mut dyn Masm, env: &Env) {
     m.load(Width::U64, Reg::T4, Reg::T5, at(SPILL_ENTRY));
 }
 
-fn callee_check(m: &mut dyn Masm, env: &Env) {
+fn callee_check(m: &mut dyn Masm) {
     m.load(Width::U8, Reg::T0, Reg::Base, reg(slot::A));
     m.cmp_imm(Reg::T0, CLOSURE);
     m.branch(Cond::Ne, slow());
@@ -569,17 +564,20 @@ fn callee_check(m: &mut dyn Masm, env: &Env) {
     m.load(Width::U64, Reg::T4, Reg::T4, fixed(0));
     m.cmp_imm(Reg::T4, 0);
     m.branch(Cond::Eq, slow());
-    m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T1, Reg::T1, fixed(0));
-    m.cmp_imm(Reg::T1, env.depth_limit as i32);
-    m.branch(Cond::AboveEq, slow());
+    m.load(Width::U32, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, pending)));
+    m.cmp_imm(Reg::T1, 0);
+    m.branch(Cond::Ne, slow());
+    m.stack_address(Reg::T1, 0);
+    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, stack_limit)));
+    m.cmp(Reg::T1, Reg::T2);
+    m.branch(Cond::BelowEq, slow());
 }
 
 fn tail_check(m: &mut dyn Masm, env: &Env) {
     let frames = frames(env);
     let area = m.callee_context();
     let at = |offset: usize| fixed(i64::from(area) + offset as i64);
-    callee_check(m, env);
+    callee_check(m);
     m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, thread)));
     m.load(Width::U64, Reg::T2, Reg::T1, fixed(i64::from(frames.frames_len)));
     m.load(Width::U64, Reg::T0, Reg::T1, fixed(i64::from(frames.frames_data)));
@@ -642,6 +640,7 @@ fn tail_enter(m: &mut dyn Masm, env: &Env, upvalues: bool) {
         m.load(Width::U64, Reg::T1, Reg::Ctx, context(offset));
         m.store(Width::U64, Reg::T1, Reg::T5, at(offset));
     }
+    nest_links(m, Reg::T5, area);
     m.mov(Reg::T1, Reg::T2);
     m.alu_imm(Alu::Add, Reg::T1, std::mem::size_of::<crate::value::Value>() as i32);
     m.store(Width::U64, Reg::T1, Reg::T5, at(offset_of!(JitCtx, registers)));
@@ -662,20 +661,12 @@ fn tail_enter(m: &mut dyn Masm, env: &Env, upvalues: bool) {
     m.load(Width::U32, Reg::T1, Reg::Ctx, context(offset_of!(JitCtx, direct_results)));
     m.store(Width::U32, Reg::T1, Reg::T5, at(offset_of!(JitCtx, direct_results)));
     m.store_imm(Width::U64, Reg::T5, at(offset_of!(JitCtx, ret_offset)), -(std::mem::size_of::<crate::value::Value>() as i32));
-    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T0, Reg::T2, fixed(0));
-    m.alu_imm(Alu::Add, Reg::T0, 1);
-    m.store(Width::U32, Reg::T0, Reg::T2, fixed(0));
 
     m.load(Width::U64, Reg::T0, Reg::T5, at(SPILL_ENTRY));
     m.stack_address(Reg::T5, area);
     m.arg_reg(0, Reg::T5);
     m.arg_imm(1, fixed(0));
     m.call_reg(Reg::T0);
-    m.load(Width::U64, Reg::T2, Reg::Ctx, context(offset_of!(JitCtx, call_depth)));
-    m.load(Width::U32, Reg::T1, Reg::T2, fixed(0));
-    m.alu_imm(Alu::Sub, Reg::T1, 1);
-    m.store(Width::U32, Reg::T1, Reg::T2, fixed(0));
     m.cmp_imm(Reg::Ret, crate::jit::EXIT_RETURNED as i32);
     m.branch(Cond::Ne, Target::Ext(ext::EXIT));
 
@@ -705,7 +696,7 @@ const COPIED: [usize; 9] = [
     offset_of!(JitCtx, vm),
     offset_of!(JitCtx, thread),
     offset_of!(JitCtx, thread_ref),
-    offset_of!(JitCtx, call_depth),
+    offset_of!(JitCtx, stack_limit),
     offset_of!(JitCtx, error),
 ];
 
@@ -714,6 +705,13 @@ const REFRESHED: [usize; 3] = [
     offset_of!(JitCtx, table_marks),
     offset_of!(JitCtx, closures),
 ];
+
+fn nest_links(m: &mut dyn Masm, area_base: Reg, area: i32) {
+    let at = |offset: usize| fixed(i64::from(area) + offset as i64);
+    m.store_imm(Width::U64, area_base, at(offset_of!(JitCtx, parent)), 0);
+    m.store_imm(Width::U64, area_base, at(offset_of!(JitCtx, child)), 0);
+    m.store_imm(Width::U32, area_base, at(offset_of!(JitCtx, pending)), 0);
+}
 
 fn copy(m: &mut dyn Masm, from: Reg, source: Imm, to: Reg, destination: Imm) {
     assert!(from != Reg::T1 && to != Reg::T0 && to != Reg::T1, "a copy keeps its addresses");

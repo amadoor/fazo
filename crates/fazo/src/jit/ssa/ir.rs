@@ -512,6 +512,9 @@ impl Edge {
     }
 }
 
+/// Runs to the stack top, as Lua `RETURN` with B = 0.
+pub(crate) const MULTIPLE_RESULTS: u32 = u32::MAX;
+
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum Term {
     Open,

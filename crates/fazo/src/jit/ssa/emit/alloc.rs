@@ -281,8 +281,15 @@ impl Alloc {
         Some(reg)
     }
 
+    /// A temporary dies within its node, so a free caller-saved register costs no prologue save.
     pub(crate) fn temp(&mut self, class: Class, moves: &mut impl Moves) -> PReg {
-        let reg = self.pick(class, moves);
+        let busy = self.pinned.union(self.temps);
+        let callee_saved = self.regs.callee_saved;
+        let scratch = self.regs.order(class).find(|&reg| self.owner[reg.index()].is_none() && !busy.contains(reg) && !callee_saved.contains(reg));
+        let reg = match scratch {
+            Some(reg) => reg,
+            None => self.pick(class, moves),
+        };
         self.temps.insert(reg);
         self.used.insert(reg);
         reg

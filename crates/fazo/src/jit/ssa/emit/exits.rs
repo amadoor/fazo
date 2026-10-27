@@ -88,6 +88,9 @@ fn with_vm<T>(ctx: *mut JitCtx, body: impl FnOnce(&mut JitCtx, &mut crate::Vm) -
     let ctx = unsafe { &mut *ctx };
     // SAFETY: as above; nothing else holds the VM while compiled code runs.
     let vm = unsafe { &mut *ctx.vm };
+    if ctx.pending != 0 {
+        vm.jit_push_pending(ctx);
+    }
     body(ctx, vm)
 }
 

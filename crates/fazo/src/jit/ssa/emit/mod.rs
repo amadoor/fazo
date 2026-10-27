@@ -111,7 +111,9 @@ pub(crate) fn compile(func: &Func, env: &Env<'_>, points: Box<[DeoptPoint]>, bud
 
 /// Charges the entry to the budget as Baseline does at a return, before any value lives in a register.
 fn charge_entry<A: Asm>(asm: &mut A, cell: i64, (body, exit_with): (asm::Label, asm::Label), tier_check: u64) {
-    let temp = A::REGISTERS.gp[0];
+    let asm::ArgLoc::Reg(temp) = A::arg(2) else {
+        unreachable!("the third argument goes in a register");
+    };
     let asm::ArgLoc::Reg(context) = A::arg(0) else {
         unreachable!("the first argument goes in a register");
     };
@@ -128,6 +130,17 @@ fn charge_entry<A: Asm>(asm: &mut A, cell: i64, (body, exit_with): (asm::Label, 
     asm.cmp_imm(A::SCRATCH, 0);
     asm.branch(asm::Cond::Eq, body);
     asm.jump(exit_with);
+}
+
+fn place_entry_arguments<A: Asm>(asm: &mut A) {
+    let asm::ArgLoc::Reg(context) = A::arg(0) else {
+        unreachable!("the first argument goes in a register");
+    };
+    let asm::ArgLoc::Reg(pc) = A::arg(1) else {
+        unreachable!("the second argument goes in a register");
+    };
+    asm.mov(context, A::CTX);
+    asm.mov_imm(pc, 0);
 }
 
 type Assembled = ((Vec<u8>, Box<ExitTable>), Option<crate::jit::unwind::Trailer>);
@@ -147,22 +160,31 @@ fn assemble<A: Asm>(func: &Func, env: &Env<'_>, points: Box<[DeoptPoint]>) -> Op
     let callee_saved_floats: Vec<u8> = generated.used.iter().filter(|reg| reg.class == regs::Class::Fp && A::REGISTERS.callee_saved.contains(*reg)).map(|reg| reg.hw).collect();
     let float_at = (spill_at as u32 + 8 * generated.slots).next_multiple_of(16);
     let floats: Vec<(u8, u32)> = callee_saved_floats.iter().enumerate().map(|(index, &reg)| (reg, float_at + 16 * index as u32)).collect();
-    let frame = A::frame_size(float_at + 16 * floats.len() as u32);
+    let saved = A::saved_registers(generated.used);
+    let frame = A::frame_size(float_at + 16 * floats.len() as u32, saved.len());
     if frame > A::MAX_FRAME {
         return None;
     }
 
     let asm = &mut generated.asm;
     asm.bind(generated.epilogue);
-    asm.epilogue(frame, &floats, A::SCRATCH);
+    asm.epilogue(frame, &floats, A::SCRATCH, &saved);
+    asm.bind(generated.tail_exit);
+    place_entry_arguments(asm);
+    asm.tail_epilogue(frame, &floats, &saved);
     let dispatch = asm.offset();
     if ctx_size != 0 {
+        let asm::ArgLoc::Reg(temp) = A::arg(1) else {
+            unreachable!("the second argument goes in a register");
+        };
         asm.store_imm(asm::Width::Q, A::SP, ctx_at + std::mem::offset_of!(JitCtx, requests) as i32, 0);
+        asm.lea(temp, A::SP, ctx_at);
+        asm.store(asm::Width::Q, temp, A::CTX, std::mem::offset_of!(JitCtx, child) as i32);
     }
     for &(pc, label) in &generated.roots {
         asm.cmp_imm(A::SCRATCH, pc as i32);
         match env.tier_budget {
-            Some(cell) if pc == 0 => {
+            Some(cell) if pc == super::entry_pc(env.vararg) => {
                 let skip = asm.new_label();
                 asm.branch(asm::Cond::Ne, skip);
                 charge_entry(asm, cell as i64, (label, generated.exit_with), addresses.tier_check);
@@ -175,7 +197,7 @@ fn assemble<A: Asm>(func: &Func, env: &Env<'_>, points: Box<[DeoptPoint]>) -> Op
     let body = generated.asm.finish()?;
 
     let mut head = A::new();
-    let prologue = head.prologue(frame, &floats, A::SCRATCH);
+    let prologue = head.prologue(frame, &floats, A::SCRATCH, &saved);
     let mut code = head.finish()?;
     code.extend(A::raw_jump(dispatch));
     code.extend_from_slice(&body);

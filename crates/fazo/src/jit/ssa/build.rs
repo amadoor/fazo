@@ -603,6 +603,7 @@ impl<'a> Builder<'a, '_> {
         let instruction = frame.proto.code[pc];
         let next = pc + flow::width(frame.proto, pc);
         match instruction {
+            Instruction::VarargPrep { .. } if frame.site.is_none() => {}
             Instruction::Move { a, b } => {
                 let value = self.read(frame, b);
                 self.write(frame, a, value);
@@ -774,6 +775,8 @@ impl<'a> Builder<'a, '_> {
                 return next;
             }
             Instruction::Return { a, b, k, .. } if b != 0 => return self.ret(frame, pc, a, u32::from(b) - 1, k),
+            Instruction::Return { a, k, .. } if frame.caller.is_none() => return self.ret(frame, pc, a, super::ir::MULTIPLE_RESULTS, k),
+            Instruction::Vararg { a, c, k: false, .. } => return self.helper(frame, pc, HelperKind::Fast(sites::FAST_VARARG), [u32::from(a), u32::from(c), 0]),
             Instruction::Return0 { .. } => return self.ret(frame, pc, 0, 0, false),
             Instruction::Return1 { a } => return self.ret(frame, pc, a, 1, false),
             Instruction::ForPrep { a, bx } => return self.for_prep(frame, pc, a, bx),

@@ -10,7 +10,6 @@ fn env() -> Env {
     Env {
         table: crate::jit::TableLayout::probe(),
         frames: crate::jit::FrameLayout::probe(),
-        depth_limit: 400,
         helpers: HelperAddresses {
             step: 0x1111_2222_3333_4444,
             safe_point: 0x1111_2222_3333_5555,

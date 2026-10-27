@@ -11,7 +11,7 @@ use crate::jit::{
     JitCtx,
     layout::lua_frame,
     sites::{self, CallTarget},
-    ssa::ir::Val,
+    ssa::ir::{MULTIPLE_RESULTS, Val},
 };
 
 /// A callee known from feedback, or one whose facts the call reads from its closure's `Exec`, as Baseline's `CallAny` does.
@@ -54,6 +54,10 @@ impl<A: Asm> Gen<'_, A> {
         let saves = self.saves(&[]);
         let helper = self.asm.new_label();
         let join = self.asm.new_label();
+        let settled = (saves.is_empty() && self.switched == Some(value)).then(|| self.asm.new_label());
+        if let Some(label) = settled {
+            self.settled = Some((pc as u32 + 1, label));
+        }
         self.save(&saves);
         let unknown = targets.is_empty() && self.env.unknown_calls.get(pc).copied().unwrap_or(false);
         if b != 0 && (unknown || !targets.is_empty()) {
@@ -61,11 +65,11 @@ impl<A: Asm> Gen<'_, A> {
             let matched = self.match_callee(a, &targets, temps, (helper, any));
             for (target, label) in targets.iter().zip(matched) {
                 self.asm.bind(label);
-                self.direct_call(pc, (a, b, c), Callee::Known(target), temps, (helper, join, out));
+                self.direct_call(pc, (a, b, c), Callee::Known(target), temps, (helper, join, out), settled);
             }
             if unknown {
                 self.asm.bind(any);
-                self.direct_call(pc, (a, b, c), Callee::Any, temps, (helper, join, out));
+                self.direct_call(pc, (a, b, c), Callee::Any, temps, (helper, join, out), settled);
             }
         }
         self.asm.bind(helper);
@@ -102,67 +106,46 @@ impl<A: Asm> Gen<'_, A> {
         matched
     }
 
-    /// Mirrors `Vm::jit_call_compiled`; other exits go to `Vm::jit_after_call`. The depth and frame count are stashed in the scratch area across the call.
-    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, t: Temps, (helper, join, out): (Label, Label, u8)) {
-        let frames = self.env.frames;
+    /// Leaves the callee's heap frame pending, as V8's optimized frames stay on the native stack (maglev-ir.cc `CallKnownJSFunction`).
+    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, t: Temps, (helper, join, out): (Label, Label, u8), settled: Option<Label>) {
         let arguments = u32::from(b) - 1;
         let wanted = i64::from(c) - 1;
         let callee_offset = (i32::from(a) + 1) * VALUE_SIZE;
-        let stash = self.scratch_at;
+        let slot = self.ctx_at;
+        let popped = self.asm.new_label();
+        let other = self.asm.new_label();
 
         self.load_entry(callee, t, helper);
-        self.ctx_load(t.depth_pointer, offset_of!(JitCtx, call_depth));
-        self.asm.load(Width::W, t.depth, t.depth_pointer, 0);
-        self.asm.cmp_imm64(t.depth, i64::from(self.env.call_depth_limit));
-        self.asm.branch(Cond::AboveEq, helper);
-        self.ctx_load(t.thread, offset_of!(JitCtx, thread));
+        self.stack_check(t, helper);
         self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
         self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, i32::from(a) + 1);
         self.check_stack_room(callee, arguments, t, helper);
         self.clear_missing_parameters(callee, arguments, callee_offset, t);
-        self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
-        self.asm.load(Width::Q, A::SCRATCH, t.thread, frames.frames_capacity);
-        self.asm.cmp(t.count, A::SCRATCH);
-        self.asm.branch(Cond::AboveEq, helper);
-
-        self.asm.alu_imm(Alu::Mul, t.frame, t.count, frames.frame_size as i32);
-        self.asm.load(Width::Q, A::SCRATCH, t.thread, frames.frames_data);
-        self.asm.alu(Alu::Add, t.frame, t.frame, A::SCRATCH);
-        let caller_pc = frames.field(lua_frame::PC) - frames.frame_size as i32;
-        self.asm.store_imm(Width::W, t.frame, caller_pc, pc as i64 + 1);
-        self.push_lua_frame(t, wanted);
-        self.asm.alu_imm(Alu::Add, A::SCRATCH, t.count, 1);
-        self.asm.store(Width::Q, A::SCRATCH, t.thread, frames.frames_len);
-        self.fill_callee_context(callee, t, (callee_offset, Some(wanted)));
-        self.asm.alu_imm(Alu::Add, A::SCRATCH, t.depth, 1);
-        self.asm.store(Width::W, A::SCRATCH, t.depth_pointer, 0);
-        self.asm.store(Width::Q, t.depth, A::SP, stash);
-        self.asm.store(Width::Q, t.count, A::SP, stash + 8);
+        self.asm.store_imm(Width::W, A::CTX, offset_of!(JitCtx, saved_pc) as i32, pc as i64 + 1);
+        self.fill_callee_context(callee, t, (callee_offset, wanted));
+        if matches!(callee, Callee::Known(target) if target.pushes_frame) {
+            self.push_callee_frame(pc, t, wanted);
+        }
 
         self.asm.mov(A::SCRATCH, t.entry);
-        self.arg_address(0, self.ctx_at);
+        self.arg_address(0, slot);
         self.place_arg(1, Src::I(0));
         self.asm.call_reg(A::SCRATCH);
         self.asm.mov(A::SCRATCH, A::result());
-        self.ctx_load(t.depth_pointer, offset_of!(JitCtx, call_depth));
-        self.asm.load(Width::Q, t.depth, A::SP, stash);
-        self.asm.store(Width::W, t.depth, t.depth_pointer, 0);
-
-        let other = self.asm.new_label();
         self.asm.cmp_imm(A::SCRATCH, crate::jit::EXIT_RETURNED as i32);
         self.asm.branch(Cond::Ne, other);
-        self.asm.load(Width::Q, t.thread, A::SP, self.ctx_at + offset_of!(JitCtx, thread) as i32);
-        self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
-        self.asm.alu_imm(Alu::Sub, t.count, t.count, 1);
-        self.asm.store(Width::Q, t.count, t.thread, frames.frames_len);
-        self.refresh_from_callee(t.thread, callee_offset);
-        self.asm.mov_imm(out, pc as i64 + 1);
-        self.asm.jump(join);
+        self.asm.cmp_mem_byte(A::SP, slot + offset_of!(JitCtx, pending) as i32, 0);
+        self.asm.branch(Cond::Eq, popped);
+        self.continue_after_call(pc, (join, out), settled);
+
+        self.asm.bind(popped);
+        self.pop_callee_frame(t);
+        self.continue_after_call(pc, (join, out), settled);
 
         self.asm.bind(other);
         self.place_arg(2, Src::R(A::SCRATCH));
         match A::arg(3) {
-            super::asm::ArgLoc::Reg(reg) => self.asm.load(Width::Q, reg, A::SP, stash + 8),
+            super::asm::ArgLoc::Reg(reg) => self.asm.load(Width::W, reg, A::SP, slot + offset_of!(JitCtx, frame_index) as i32),
             super::asm::ArgLoc::Stack(_) => unreachable!("four integer arguments go in registers"),
         }
         self.place_arg(4, Src::I(0));
@@ -171,6 +154,64 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.call(self.addresses.fast[sites::FAST_AFTER_CALL]);
         self.asm.mov(out, A::result());
         self.asm.jump(join);
+    }
+
+    /// Pushes the heap frame now, as the callee's first helper would; a pending caller or full frame vector stays lazy.
+    fn push_callee_frame(&mut self, pc: usize, t: Temps, wanted: i64) {
+        let frames = self.env.frames;
+        let slot = self.ctx_at;
+        let lazy = self.asm.new_label();
+        let status = i64::from(crate::object::LuaFrame::call_status(wanted as i32, 0)) << lua_frame::STATUS_SHIFT;
+
+        self.asm.cmp_mem_byte(A::CTX, offset_of!(JitCtx, pending) as i32, 0);
+        self.asm.branch(Cond::Ne, lazy);
+        self.ctx_load(t.thread, offset_of!(JitCtx, thread));
+        self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
+        self.asm.load(Width::Q, A::SCRATCH, t.thread, frames.frames_capacity);
+        self.asm.cmp(t.count, A::SCRATCH);
+        self.asm.branch(Cond::AboveEq, lazy);
+        self.asm.alu_imm(Alu::Mul, t.frame, t.count, frames.frame_size as i32);
+        self.asm.add_mem(t.frame, t.thread, frames.frames_data);
+        self.asm.store_imm(Width::W, t.frame, frames.field(lua_frame::PC) - frames.frame_size as i32, pc as i64 + 1);
+        self.asm.store_imm(Width::B, t.frame, 0, 0);
+        self.asm.store(Width::Q, t.closure, t.frame, frames.field(lua_frame::CLOSURE));
+        self.asm.store(Width::Q, t.callee_base, t.frame, frames.field(lua_frame::BASE));
+        for word in 0..lua_frame::CACHE_WORDS {
+            self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::CACHE + word * std::mem::size_of::<usize>()), 0);
+        }
+        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::PC), status);
+        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::NVARARGS), 0);
+        self.asm.store(Width::W, t.count, A::SP, slot + offset_of!(JitCtx, frame_index) as i32);
+        self.asm.alu_imm(Alu::Add, t.count, t.count, 1);
+        self.asm.store(Width::Q, t.count, t.thread, frames.frames_len);
+        self.asm.store_imm(Width::W, A::SP, slot + offset_of!(JitCtx, pending) as i32, 0);
+        self.asm.bind(lazy);
+    }
+
+    fn continue_after_call(&mut self, pc: usize, (join, out): (Label, u8), settled: Option<Label>) {
+        if let Some(label) = settled {
+            self.asm.jump(label);
+            return;
+        }
+        self.asm.mov_imm(out, pc as i64 + 1);
+        self.asm.jump(join);
+    }
+
+    /// The caller pops the callee's heap frame, left on top, as the driver does for `EXIT_RETURNED`.
+    fn pop_callee_frame(&mut self, t: Temps) {
+        let frames = self.env.frames;
+        self.ctx_load(t.thread, offset_of!(JitCtx, thread));
+        self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
+        self.asm.alu_imm(Alu::Sub, t.count, t.count, 1);
+        self.asm.store(Width::Q, t.count, t.thread, frames.frames_len);
+    }
+
+    /// One compare against the context limit covers every native frame below (V8 `StackCheck`, maglev-assembler-x64.cc).
+    fn stack_check(&mut self, t: Temps, helper: Label) {
+        self.asm.lea(t.depth, A::SP, 0);
+        self.ctx_load(t.depth_pointer, offset_of!(JitCtx, stack_limit));
+        self.asm.cmp(t.depth, t.depth_pointer);
+        self.asm.branch(Cond::BelowEq, helper);
     }
 
     /// A vararg prototype's entry cell stays zero, so its calls take the helper.
@@ -191,6 +232,7 @@ impl<A: Asm> Gen<'_, A> {
     /// Follows `luaD_precall` (ldo.c); the call limit covers `REGISTER_SPAN` slots past the base.
     fn check_stack_room(&mut self, callee: Callee<'_>, arguments: u32, t: Temps, helper: Label) {
         let frames = self.env.frames;
+        self.ctx_load(t.thread, offset_of!(JitCtx, thread));
         self.asm.load(Width::Q, t.count, t.thread, frames.call_limit);
         self.asm.cmp(t.callee_base, t.count);
         self.asm.branch(Cond::Above, helper);
@@ -233,22 +275,8 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(done);
     }
 
-    fn push_lua_frame(&mut self, t: Temps, wanted: i64) {
-        let frames = self.env.frames;
-        let status = (crate::object::LuaFrame::call_status(wanted as i32, 0) as i64) << lua_frame::STATUS_SHIFT;
-        self.asm.store_imm(Width::B, t.frame, 0, 0);
-        self.asm.store(Width::Q, t.closure, t.frame, frames.field(lua_frame::CLOSURE));
-        self.asm.store(Width::Q, t.callee_base, t.frame, frames.field(lua_frame::BASE));
-        for word in 0..lua_frame::CACHE_WORDS {
-            self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::CACHE + word * std::mem::size_of::<usize>()), 0);
-        }
-        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::PC), status);
-        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::NVARARGS), 0);
-    }
-
     /// Written at the activation's first call; the dispatch clears `requests` on every entry.
-    /// `wanted` is `None` for a tail call, which returns to this frame's caller.
-    fn fill_callee_context(&mut self, callee: Callee<'_>, t: Temps, (callee_offset, wanted): (i32, Option<i64>)) {
+    fn fill_callee_context(&mut self, callee: Callee<'_>, t: Temps, (callee_offset, wanted): (i32, i64)) {
         let context = self.ctx_at;
         let filled = self.asm.new_label();
         self.asm.load(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, requests) as i32);
@@ -258,78 +286,63 @@ impl<A: Asm> Gen<'_, A> {
             offset_of!(JitCtx, requests),
             offset_of!(JitCtx, vm),
             offset_of!(JitCtx, thread_ref),
-            offset_of!(JitCtx, call_depth),
+            offset_of!(JitCtx, stack_limit),
             offset_of!(JitCtx, error),
+            offset_of!(JitCtx, tables),
+            offset_of!(JitCtx, table_marks),
+            offset_of!(JitCtx, closures),
+            offset_of!(JitCtx, thread),
         ] {
             self.ctx_load(A::SCRATCH, offset);
             self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset as i32);
         }
         self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, ret_offset) as i32, -i64::from(VALUE_SIZE));
+        self.asm.store(Width::Q, A::CTX, A::SP, context + offset_of!(JitCtx, parent) as i32);
         self.asm.bind(filled);
-        for offset in [offset_of!(JitCtx, tables), offset_of!(JitCtx, table_marks), offset_of!(JitCtx, closures)] {
-            self.ctx_load(A::SCRATCH, offset);
-            self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset as i32);
-        }
-        self.asm.store(Width::Q, t.thread, A::SP, context + offset_of!(JitCtx, thread) as i32);
         self.registers(A::SCRATCH);
         self.asm.alu_imm(Alu::Add, A::SCRATCH, A::SCRATCH, callee_offset);
         self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, registers) as i32);
+        self.callee_code_fields(callee, t, (A::SP, context));
+        self.asm.store(Width::Q, t.closure, A::SP, context + offset_of!(JitCtx, closure) as i32);
+        self.asm.store(Width::Q, t.callee_base, A::SP, context + offset_of!(JitCtx, base) as i32);
+        self.asm.store_imm(Width::W, A::SP, context + offset_of!(JitCtx, direct_results) as i32, wanted);
+        self.asm.store_imm(Width::W, A::SP, context + offset_of!(JitCtx, pending) as i32, i64::from(crate::jit::PENDING));
+        self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, child) as i32, 0);
+    }
+
+    fn callee_code_fields(&mut self, callee: Callee<'_>, t: Temps, (base, context): (u8, i32)) {
         if matches!(callee, Callee::Known(target) if !target.has_upvalues) {
-            self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, upvalues) as i32, 0);
+            self.asm.store_imm(Width::Q, base, context + offset_of!(JitCtx, upvalues) as i32, 0);
         } else {
             self.closure_address(t.frame, t.closure);
             self.asm.load(Width::Q, t.frame, t.frame, self.env.frames.closure_upvalues);
-            self.asm.store(Width::Q, t.frame, A::SP, context + offset_of!(JitCtx, upvalues) as i32);
+            self.asm.store(Width::Q, t.frame, base, context + offset_of!(JitCtx, upvalues) as i32);
         }
         match callee {
             Callee::Known(target) => {
-                self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, constants) as i32, target.constants as i64);
-                self.asm.store_imm(Width::Q, A::SP, context + offset_of!(JitCtx, proto) as i32, target.proto as i64);
+                self.asm.store_imm(Width::Q, base, context + offset_of!(JitCtx, constants) as i32, target.constants as i64);
+                self.asm.store_imm(Width::Q, base, context + offset_of!(JitCtx, proto) as i32, target.proto as i64);
             }
             Callee::Any => {
                 self.asm.load(Width::Q, A::SCRATCH, t.exec, exec_layout::CONSTANTS as i32);
-                self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, constants) as i32);
+                self.asm.store(Width::Q, A::SCRATCH, base, context + offset_of!(JitCtx, constants) as i32);
                 self.asm.load(Width::Q, A::SCRATCH, t.exec, exec_layout::PROTO as i32);
-                self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, proto) as i32);
-            }
-        }
-        self.asm.store(Width::Q, t.closure, A::SP, context + offset_of!(JitCtx, closure) as i32);
-        self.asm.store(Width::Q, t.callee_base, A::SP, context + offset_of!(JitCtx, base) as i32);
-        let results = context + offset_of!(JitCtx, direct_results) as i32;
-        match wanted {
-            Some(wanted) => self.asm.store_imm(Width::W, A::SP, results, wanted),
-            None => {
-                self.asm.load_i32(A::SCRATCH, A::CTX, offset_of!(JitCtx, direct_results) as i32);
-                self.asm.store(Width::W, A::SCRATCH, A::SP, results);
+                self.asm.store(Width::Q, A::SCRATCH, base, context + offset_of!(JitCtx, proto) as i32);
             }
         }
     }
 
-    /// The callee's helpers refresh its context whenever they move its stack, tables or thread.
-    fn refresh_from_callee(&mut self, thread: u8, callee_offset: i32) {
-        let context = self.ctx_at;
-        self.asm.load(Width::Q, A::SCRATCH, A::SP, context + offset_of!(JitCtx, registers) as i32);
-        self.asm.alu_imm(Alu::Sub, A::SCRATCH, A::SCRATCH, callee_offset);
-        self.asm.store(Width::Q, A::SCRATCH, A::CTX, offset_of!(JitCtx, registers) as i32);
-        for offset in [offset_of!(JitCtx, tables), offset_of!(JitCtx, table_marks), offset_of!(JitCtx, closures)] {
-            self.asm.load(Width::Q, A::SCRATCH, A::SP, context + offset as i32);
-            self.asm.store(Width::Q, A::SCRATCH, A::CTX, offset as i32);
-        }
-        self.asm.store(Width::Q, thread, A::CTX, offset_of!(JitCtx, thread) as i32);
-    }
-
+    /// The stack check finishes before `count` and `frame` take values, so it borrows them.
     fn temps(&mut self) -> Temps {
-        Temps {
-            exec: self.temp(),
-            closure: self.temp(),
-            entry: self.temp(),
-            depth_pointer: self.temp(),
-            depth: self.temp(),
-            thread: self.temp(),
-            callee_base: self.temp(),
-            count: self.temp(),
-            frame: self.temp(),
-        }
+        let exec = self.temp();
+        let closure = self.temp();
+        let entry = self.temp();
+        let thread = self.temp();
+        let callee_base = self.temp();
+        let count = self.temp();
+        let frame = self.temp();
+
+        Temps { exec, closure, entry, depth_pointer: count, depth: frame, thread, callee_base, count, frame }
     }
 
     pub(super) fn tail_call(&mut self, pc: u32, (a, b, k): (u8, u8, bool)) {
@@ -356,50 +369,36 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.jump(self.exit_with);
     }
 
-    /// Follows `luaD_pretailcall` (ldo.c).
+    /// Follows `luaD_pretailcall` (ldo.c); the jump keeps the caller's return address, as LuaJIT's `BC_CALLT` (lj_frame.h).
     fn direct_tail_call(&mut self, (a, b): (u8, u8), callee: Callee<'_>, t: Temps, helper: Label) {
         let frames = self.env.frames;
         let arguments = u32::from(b) - 1;
-        let stash = self.scratch_at;
+        let lazy = self.asm.new_label();
+        let moved = self.asm.new_label();
 
         self.load_entry(callee, t, helper);
-        self.ctx_load(t.depth_pointer, offset_of!(JitCtx, call_depth));
-        self.asm.load(Width::W, t.depth, t.depth_pointer, 0);
-        self.asm.cmp_imm64(t.depth, i64::from(self.env.call_depth_limit));
-        self.asm.branch(Cond::AboveEq, helper);
-        self.ctx_load(t.thread, offset_of!(JitCtx, thread));
+        self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
+        self.check_stack_room(callee, arguments, t, helper);
+        self.asm.load(Width::W, A::SCRATCH, A::CTX, offset_of!(JitCtx, pending) as i32);
+        self.asm.cmp_imm(A::SCRATCH, 0);
+        self.asm.branch(Cond::Ne, lazy);
         self.top_frame(t);
         self.asm.load(Width::W, A::SCRATCH, t.frame, frames.field(lua_frame::STATUS));
         self.asm.test_imm(A::SCRATCH, lua_frame::OWN_CALLER as i32);
         self.asm.branch(Cond::Ne, helper);
-        self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
-        self.check_stack_room(callee, arguments, t, helper);
+        self.replace_frame(t);
+        self.asm.jump(moved);
+        self.asm.bind(lazy);
+        self.asm.store_imm(Width::W, A::CTX, offset_of!(JitCtx, pending) as i32, i64::from(crate::jit::PENDING | crate::jit::PENDING_TAIL));
+        self.asm.bind(moved);
 
         self.move_down(a, arguments, t.count);
-        self.replace_frame(t);
         self.clear_missing_parameters(callee, arguments, 0, t);
-        self.fill_callee_context(callee, t, (0, None));
-        self.asm.alu_imm(Alu::Add, A::SCRATCH, t.depth, 1);
-        self.asm.store(Width::W, A::SCRATCH, t.depth_pointer, 0);
-        self.asm.store(Width::Q, t.depth, A::SP, stash);
-
+        self.callee_code_fields(callee, t, (A::CTX, 0));
+        self.asm.store(Width::Q, t.closure, A::CTX, offset_of!(JitCtx, closure) as i32);
+        self.asm.store_imm(Width::Q, A::CTX, offset_of!(JitCtx, child) as i32, 0);
         self.asm.mov(A::SCRATCH, t.entry);
-        self.arg_address(0, self.ctx_at);
-        self.place_arg(1, Src::I(0));
-        self.asm.call_reg(A::SCRATCH);
-        self.asm.mov(A::SCRATCH, A::result());
-        self.ctx_load(t.depth_pointer, offset_of!(JitCtx, call_depth));
-        self.asm.load(Width::Q, t.depth, A::SP, stash);
-        self.asm.store(Width::W, t.depth, t.depth_pointer, 0);
-
-        let leave = self.asm.new_label();
-        self.asm.cmp_imm(A::SCRATCH, crate::jit::EXIT_RETURNED as i32);
-        self.asm.branch(Cond::Ne, leave);
-        self.asm.load(Width::Q, t.thread, A::SP, self.ctx_at + offset_of!(JitCtx, thread) as i32);
-        self.refresh_from_callee(t.thread, 0);
-        self.asm.mov_imm(A::SCRATCH, crate::jit::EXIT_RETURNED);
-        self.asm.bind(leave);
-        self.asm.jump(self.epilogue);
+        self.asm.jump(self.tail_exit);
     }
 
     fn top_frame(&mut self, t: Temps) {
@@ -443,7 +442,63 @@ impl<A: Asm> Gen<'_, A> {
         if close {
             self.close_in_place(pc);
         }
+        if count == MULTIPLE_RESULTS {
+            self.lower_multiple_return(pc, first);
+            return;
+        }
         self.lower_return(pc, first, count);
+    }
+
+    /// Follows `moveresults` (ldo.c) for results that run to the stack top.
+    fn lower_multiple_return(&mut self, pc: u32, first: u8) {
+        let results = self.temp();
+        let count = self.temp();
+        let index = self.temp();
+        let source = self.temp();
+        let destination = self.temp();
+        let word = self.temp();
+        let helper = self.asm.new_label();
+        let next = self.asm.new_label();
+        let fill = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.load_i32(results, A::CTX, offset_of!(JitCtx, direct_results) as i32);
+        self.asm.cmp_imm(results, 0);
+        self.asm.branch(Cond::Lt, helper);
+        self.ctx_load(word, offset_of!(JitCtx, thread));
+        self.asm.load(Width::Q, count, word, self.env.frames.top);
+        self.ctx_load(word, offset_of!(JitCtx, base));
+        self.asm.alu(Alu::Sub, count, count, word);
+        self.asm.alu_imm(Alu::Sub, count, count, i32::from(first));
+        self.registers(source);
+        self.asm.lea(destination, source, -VALUE_SIZE);
+        self.asm.alu_imm(Alu::Add, source, source, i32::from(first) * VALUE_SIZE);
+        self.asm.mov_imm(index, 0);
+        self.asm.bind(next);
+        self.asm.cmp(index, results);
+        self.asm.branch(Cond::Ge, done);
+        self.asm.cmp(index, count);
+        self.asm.branch(Cond::Ge, fill);
+        for half in [0, PAYLOAD] {
+            self.asm.load(Width::Q, word, source, half);
+            self.asm.store(Width::Q, word, destination, half);
+        }
+        self.asm.alu_imm(Alu::Add, source, source, VALUE_SIZE);
+        self.asm.alu_imm(Alu::Add, destination, destination, VALUE_SIZE);
+        self.asm.alu_imm(Alu::Add, index, index, 1);
+        self.asm.jump(next);
+        self.asm.bind(fill);
+        self.asm.store_imm(Width::B, destination, 0, 0);
+        self.asm.alu_imm(Alu::Add, destination, destination, VALUE_SIZE);
+        self.asm.alu_imm(Alu::Add, index, index, 1);
+        self.asm.jump(next);
+        self.asm.bind(done);
+        self.asm.mov_imm(A::SCRATCH, crate::jit::EXIT_RETURNED);
+        self.asm.jump(self.epilogue);
+        self.asm.bind(helper);
+        self.fast_args(pc, [u32::from(first), MULTIPLE_RESULTS, 0]);
+        self.asm.call(self.addresses.fast[sites::FAST_RETURN]);
+        self.asm.mov(A::SCRATCH, A::result());
+        self.asm.jump(self.exit_with);
     }
 
     fn close_in_place(&mut self, pc: u32) {
@@ -471,7 +526,9 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.load_i32(results, A::CTX, offset_of!(JitCtx, direct_results) as i32);
         self.asm.cmp_imm(results, count as i32);
         self.asm.branch(Cond::Ne, other);
-        self.copy_results(first, count, (base, destination, word));
+        if count > 0 {
+            self.copy_results(first, count, (base, destination, word));
+        }
         self.asm.bind(done);
         self.asm.mov_imm(A::SCRATCH, crate::jit::EXIT_RETURNED);
         self.asm.jump(self.epilogue);
@@ -495,8 +552,7 @@ impl<A: Asm> Gen<'_, A> {
 
     fn copy_results(&mut self, first: u8, count: u32, (base, destination, word): (u8, u8, u8)) {
         self.registers(base);
-        self.ctx_load(destination, offset_of!(JitCtx, ret_offset));
-        self.asm.alu(Alu::Add, destination, destination, base);
+        self.asm.lea(destination, base, -VALUE_SIZE);
         for index in 0..count as i32 {
             let from = (i32::from(first) + index) * VALUE_SIZE;
             for half in [0, PAYLOAD] {

@@ -18,7 +18,6 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) layout: Option<TableLayout>,
     pub(crate) frames: Option<FrameLayout>,
     pub(crate) calls: Vec<Vec<CallTarget>>,
-    pub(crate) call_depth_limit: u32,
     pub(crate) inline_caches: bool,
     pub(crate) avoid: &'a [u32],
     pub(crate) insufficient: &'a [u32],
@@ -52,7 +51,6 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         frames,
         calls: &facts.calls,
         unknown_calls: &unknown_calls,
-        call_depth_limit: facts.call_depth_limit,
         vararg: proto.is_vararg,
         points: &points,
         stress_exits: facts.stress_exits,
@@ -62,7 +60,7 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     let unit = JitUnit::compile(compiler, budget, &symbols, |module, function, context| lower::define(module, function, context, &func, &env))?;
     let mut entries: Vec<u32> = func.osr.iter().map(|&(pc, _)| pc).collect();
     if func.entry.is_some() {
-        entries.push(0);
+        entries.push(ssa::entry_pc(proto.is_vararg));
     }
     let shapes = func.shapes.clone();
     Ok((PeakUnit { code: ssa::Code::Cranelift { unit: Box::new(unit), _points: points }, entries, shapes }, text))
@@ -85,7 +83,6 @@ pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, 
         frames,
         calls: &facts.calls,
         unknown_calls: &unknown_calls,
-        call_depth_limit: facts.call_depth_limit,
         vararg: proto.is_vararg,
         points: &[],
         stress_exits: facts.stress_exits,
@@ -95,7 +92,7 @@ pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, 
     let text = text.map(|text| format!("{text}code {}\n", native.listing.as_deref().unwrap_or_default()));
     let mut entries: Vec<u32> = func.osr.iter().map(|&(pc, _)| pc).collect();
     if func.entry.is_some() {
-        entries.push(0);
+        entries.push(ssa::entry_pc(proto.is_vararg));
     }
     let shapes = func.shapes.clone();
     Ok((PeakUnit { code: ssa::Code::Native(native), entries, shapes }, text))

@@ -2,7 +2,7 @@
 
 use super::{
     asm::{Alu, ArgLoc, Asm, Cond, DUMP, Division, FAlu, FCond, Label, Width},
-    regs::{RegSet, Registers},
+    regs::{PReg, RegSet, Registers},
     unwind,
 };
 
@@ -24,6 +24,10 @@ const ARGS: [u8; 4] = [1, 2, 8, 9];
 const ARGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
 
 const GP_ORDER: [u8; 11] = [12, 13, 14, 15, 6, 7, 8, 9, 10, 1, 2];
+#[cfg(windows)]
+const CALLER_GP_ORDER: [u8; 11] = [8, 9, 10, 1, 2, 12, 13, 14, 15, 6, 7];
+#[cfg(not(windows))]
+const CALLER_GP_ORDER: [u8; 11] = [6, 7, 8, 9, 10, 1, 2, 12, 13, 14, 15];
 
 #[cfg(windows)]
 const FP_ORDER: [u8; 15] = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -286,6 +290,11 @@ impl Asm for X64 {
     const OUTGOING: i32 = if cfg!(windows) { 48 } else { 0 };
     const REGISTERS: Registers = Registers {
         gp: &GP_ORDER,
+        fp: &FP_ORDER,
+        callee_saved: callee_saved(),
+    };
+    const CALLER_SAVED_FIRST: Registers = Registers {
+        gp: &CALLER_GP_ORDER,
         fp: &FP_ORDER,
         callee_saved: callee_saved(),
     };
@@ -753,13 +762,13 @@ impl Asm for X64 {
         self.bytes(&[0x0f, 0x0b]);
     }
 
-    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8) -> unwind::Prologue {
+    fn prologue(&mut self, frame: u32, floats: &[(u8, u32)], pc_dst: u8, saved: &[u8]) -> unwind::Prologue {
         let mut prologue = unwind::Prologue { arch: unwind::Arch::X64, frame, ..unwind::Prologue::default() };
         self.push(RBP);
         prologue.save_frame = self.offset();
         self.mov_rr(RBP, RSP);
         prologue.set_frame = self.offset();
-        for reg in SAVED {
+        for &reg in saved {
             self.push(reg);
             prologue.saves.push((self.offset(), reg));
         }
@@ -775,8 +784,8 @@ impl Asm for X64 {
         prologue
     }
 
-    fn epilogue(&mut self, frame: u32, floats: &[(u8, u32)], code: u8) {
-        let pushed = 8 * SAVED.len() as i32;
+    fn epilogue(&mut self, frame: u32, floats: &[(u8, u32)], code: u8, saved: &[u8]) {
+        let pushed = 8 * saved.len() as i32;
         self.mov(RAX, code);
         if !floats.is_empty() {
             self.lea(RSP, RBP, -pushed - frame as i32);
@@ -785,11 +794,27 @@ impl Asm for X64 {
             }
         }
         self.lea(RSP, RBP, -pushed);
-        for &reg in SAVED.iter().rev() {
+        for &reg in saved.iter().rev() {
             self.pop(reg);
         }
         self.pop(RBP);
         self.byte(0xc3);
+    }
+
+    fn tail_epilogue(&mut self, frame: u32, floats: &[(u8, u32)], saved: &[u8]) {
+        let pushed = 8 * saved.len() as i32;
+        if !floats.is_empty() {
+            self.lea(RSP, RBP, -pushed - frame as i32);
+            for &(reg, at) in floats {
+                self.op(None, Size::Dword, &[0x0f, 0x28], reg, Rm::Mem(RSP, at as i32));
+            }
+        }
+        self.lea(RSP, RBP, -pushed);
+        for &reg in saved.iter().rev() {
+            self.pop(reg);
+        }
+        self.pop(RBP);
+        self.op(None, Size::Dword, &[0xff], 4, Rm::Reg(RAX));
     }
 
     fn finish(mut self) -> Option<Vec<u8>> {
@@ -816,8 +841,12 @@ impl Asm for X64 {
     }
 
     /// A multiple of 16 once the return address and the pushes are counted.
-    fn frame_size(needed: u32) -> u32 {
-        let pushes = 2 + SAVED.len() as u32;
+    fn saved_registers(used: RegSet) -> Vec<u8> {
+        SAVED.iter().copied().filter(|&reg| reg == RBX || used.contains(PReg::gp(reg))).collect()
+    }
+
+    fn frame_size(needed: u32, saved: usize) -> u32 {
+        let pushes = 2 + saved as u32;
         let total = (needed + 8 * pushes).next_multiple_of(16);
         total - 8 * pushes
     }

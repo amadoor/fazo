@@ -52,7 +52,7 @@ pub(crate) mod unwind;
 mod tests;
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use ctx::{JitCtx, NOT_DIRECT};
+pub(crate) use ctx::{JitCtx, NOT_DIRECT, PENDING, PENDING_TAIL};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use helpers::{Control, enter};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -256,7 +256,6 @@ pub(crate) struct JitState {
     pub(crate) compiler: Option<Box<Compiler>>,
     pub(crate) layout: Option<Option<TableLayout>>,
     pub(crate) frames: Option<Option<FrameLayout>>,
-    pub(crate) call_depth: u32,
     pub(crate) entries: u32,
     pub(crate) stack_floor: usize,
     pub(crate) switches: u64,

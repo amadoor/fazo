@@ -136,6 +136,7 @@ pub(super) struct Gen<'a, A: Asm> {
     pub(super) table: Box<ExitTable>,
     pub(super) epilogue: Label,
     pub(super) exit_with: Label,
+    pub(super) tail_exit: Label,
     exit_tail: Label,
     pub(super) dying: Vec<Vec<Val>>,
     pub(super) position: usize,
@@ -144,6 +145,9 @@ pub(super) struct Gen<'a, A: Asm> {
     pub(super) scratch_at: i32,
     pub(super) ctx_at: i32,
     next_block: Option<BlockId>,
+    pub(super) switched: Option<Val>,
+    /// Lets a call's settled path jump straight to this pc's case.
+    pub(super) settled: Option<(u32, Label)>,
     pub(super) failed: bool,
 }
 
@@ -154,6 +158,7 @@ pub(super) struct Generated<A> {
     pub(super) used: super::regs::RegSet,
     pub(super) epilogue: Label,
     pub(super) exit_with: Label,
+    pub(super) tail_exit: Label,
     pub(super) roots: Vec<(u32, Label)>,
 }
 
@@ -180,13 +185,14 @@ impl<'a, A: Asm> Gen<'a, A> {
         let epilogue = asm.new_label();
         let exit_with = asm.new_label();
         let exit_tail = asm.new_label();
+        let tail_exit = asm.new_label();
         Self {
             func,
             env,
             addresses,
             live: Liveness::new(func),
             asm,
-            alloc: Alloc::new(A::REGISTERS, classes(func)),
+            alloc: Alloc::new(if has_loop(func) { A::REGISTERS } else { A::CALLER_SAVED_FIRST }, classes(func)),
             labels: vec![None; func.blocks.len()],
             snapshots: vec![None; func.blocks.len()],
             stubs: Vec::new(),
@@ -194,6 +200,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             table,
             epilogue,
             exit_with,
+            tail_exit,
             exit_tail,
             dying: Vec::new(),
             position: 0,
@@ -202,6 +209,8 @@ impl<'a, A: Asm> Gen<'a, A> {
             scratch_at,
             ctx_at,
             next_block: None,
+            switched: None,
+            settled: None,
             failed: false,
         }
     }
@@ -224,13 +233,15 @@ impl<'a, A: Asm> Gen<'a, A> {
             used: self.alloc.used,
             epilogue: self.epilogue,
             exit_with: self.exit_with,
+            tail_exit: self.tail_exit,
             roots,
         })
     }
 
     fn roots(&mut self) -> Vec<(u32, Label)> {
-        let mut roots: Vec<(u32, BlockId)> = self.func.entry.map(|block| (0, block)).into_iter().collect();
-        roots.extend(self.func.osr.iter().copied().filter(|&(at, _)| at != 0));
+        let start = super::super::entry_pc(self.env.vararg);
+        let mut roots: Vec<(u32, BlockId)> = self.func.entry.map(|block| (start, block)).into_iter().collect();
+        roots.extend(self.func.osr.iter().copied().filter(|&(at, _)| at != 0 && at != start));
         roots.into_iter().map(|(pc, block)| {
             self.snapshots[block.0 as usize] = Some(Vec::new());
             (pc, self.label(block))
@@ -263,6 +274,10 @@ impl<'a, A: Asm> Gen<'a, A> {
         self.alloc.enter(&entries);
         self.dying = self.live.deaths(self.func, block, &mut self.alloc.last);
         let data = self.func.block(block);
+        self.switched = match data.term {
+            Term::Switch { code, .. } if data.insts.last() == Some(&code) => Some(code),
+            _ => None,
+        };
         for (position, &value) in data.insts.iter().enumerate() {
             self.position = position;
             self.current = value;
@@ -812,8 +827,12 @@ impl<'a, A: Asm> Gen<'a, A> {
         }
         self.asm.mov(A::SCRATCH, result);
         self.asm.jump(self.exit_with);
-        for ((_, edge), stub) in cases.iter().zip(stubs) {
+        let settled = self.settled.take();
+        for ((pc, edge), stub) in cases.iter().zip(stubs) {
             self.asm.bind(stub);
+            if let Some((_, label)) = settled.filter(|&(at, _)| at == *pc) {
+                self.asm.bind(label);
+            }
             self.edge_moves(edge);
             let label = self.label(edge.block);
             self.asm.jump(label);
@@ -915,4 +934,8 @@ impl<'a, A: Asm> Gen<'a, A> {
 
 pub(super) fn parts_of(func: &Func, value: Val) -> impl Iterator<Item = Part> + '_ {
     parts(func, value).iter().map(move |&half| part(value, half))
+}
+
+fn has_loop(func: &Func) -> bool {
+    func.blocks.iter().enumerate().any(|(index, block)| block.term.successors().iter().any(|target| target.0 as usize <= index))
 }

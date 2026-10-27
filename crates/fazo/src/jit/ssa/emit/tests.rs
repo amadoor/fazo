@@ -593,6 +593,15 @@ mod x64_encoding {
         let instruction = decoder.decode();
         assert_eq!(instruction.near_branch_target(), 0x45);
     }
+
+    #[test]
+    fn prologue_and_tail_epilogue_save_only_the_given_registers() {
+        let head = listing(|a| {
+            a.prologue(32, &[], 0, &[3, 13]);
+        });
+        assert_eq!(head[..4], ["push rbp", "mov rbp,rsp", "push rbx", "push r13"], "{head:?}");
+        assert_eq!(listing(|a| a.tail_epilogue(32, &[], &[3, 13])), ["lea rsp,[rbp-10h]", "pop r13", "pop rbx", "pop rbp", "jmp rax"]);
+    }
 }
 
 mod a64_encoding {
@@ -634,6 +643,12 @@ mod a64_encoding {
         assert_eq!(listing(|a| a.sub_mem(20, 0, 300)), ["ldr x17, [x20]", "subs x17, x17, #0x12c", "str x17, [x20]"]);
         assert_eq!(listing(|a| a.sub_mem(20, 0, 5000))[2], "subs x17, x17, x30");
         assert_eq!(listing(|a| a.add_mem(20, 19, 24)), ["ldr x17, [x19, #0x18]", "add x20, x20, x17"]);
+    }
+
+    #[test]
+    fn tail_epilogue_jumps_through_the_scratch_register() {
+        let lines = listing(|a| a.tail_epilogue(32, &[], &[]));
+        assert_eq!(lines.last().map(String::as_str), Some("br x16"), "{lines:?}");
     }
 
     #[test]
@@ -694,8 +709,8 @@ mod a64_encoding {
     #[test]
     fn the_prologue_and_epilogue_mirror_each_other() {
         let mut asm = A64::new();
-        let prologue = asm.prologue(64, &[], 16);
-        asm.epilogue(64, &[], 3);
+        let prologue = asm.prologue(64, &[], 16, &[]);
+        asm.epilogue(64, &[], 3, &[]);
         let lines = words(&asm.finish().expect("the code assembles"));
         assert_eq!(lines[0], "stp x29, x30, [sp, #-0x10]!");
         assert_eq!(lines[1], "mov x29, sp");

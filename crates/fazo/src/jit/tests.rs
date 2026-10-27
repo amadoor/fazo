@@ -507,7 +507,6 @@ fn compiled_ir_size(statements: usize) -> usize {
         layout: crate::jit::TableLayout::probe(),
         frames: crate::jit::FrameLayout::probe(),
         calls: Vec::new(),
-        call_depth_limit: 0,
         inline_caches: true,
         avoid: &[],
         insufficient: &[],
