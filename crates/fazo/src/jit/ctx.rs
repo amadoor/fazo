@@ -34,10 +34,15 @@ pub(crate) struct JitCtx {
     pub(crate) pending: u32,
     pub(crate) saved_pc: u32,
     pub(crate) frame_index: u32,
+    pub(crate) moves: u64,
+    /// Valid only while `saved_pc` is `INLINED_CALL`.
+    pub(crate) inline_point: *const crate::jit::ssa::DeoptPoint,
 }
 
 pub(crate) const PENDING: u32 = 1;
 pub(crate) const PENDING_TAIL: u32 = 2;
+
+pub(crate) const INLINED_CALL: u32 = u32::MAX;
 
 pub(crate) const NOT_DIRECT: i32 = -2;
 
@@ -51,14 +56,18 @@ impl JitCtx {
 }
 
 impl JitCtx {
-    pub(crate) fn pending_caller(&mut self) -> Result<&mut JitCtx, u32> {
+    pub(crate) fn pending_caller(&mut self) -> &mut JitCtx {
         // SAFETY: a pending frame's `parent` is its compiled caller's context, live deeper in the native stack while it
         // runs and distinct from `self`.
-        let caller = unsafe { self.parent.as_mut() }.expect("a pending frame has a compiled caller");
-        if caller.pending == 0 {
-            return Err(caller.saved_pc);
+        unsafe { self.parent.as_mut() }.expect("a pending frame has a compiled caller")
+    }
+
+    pub(crate) fn inline_point(&self) -> Option<&crate::jit::ssa::DeoptPoint> {
+        if self.saved_pc != INLINED_CALL {
+            return None;
         }
-        Ok(caller)
+        // SAFETY: the call wrote the point, which belongs to the unit running this frame and stays mapped with its points.
+        unsafe { self.inline_point.as_ref() }
     }
 
     pub(crate) fn refresh_nest(&mut self, refresh: impl Fn(&mut JitCtx)) {

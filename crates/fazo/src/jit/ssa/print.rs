@@ -215,7 +215,8 @@ pub(crate) fn describe(op: &Op) -> String {
         }
         Op::Materialize { object } => format!("materialize {}", virtual_text(object)),
         Op::GuardAbsent { table, bit, state } => format!("guard.absent {} bit{bit} s{}", v(table), state.0),
-        Op::CallLua { pc, a, b, c } => format!("call @{pc} r{a} b{b} c{c}"),
+        Op::CallLua { pc, a, b, c, inlined: None } => format!("call @{pc} r{a} b{b} c{c}"),
+        Op::CallLua { pc, b, c, inlined: Some(call), .. } => format!("call inlined{call} @{pc} b{b} c{c}"),
         Op::Safepoint { pc, weight, requests, state } => format!("safepoint @{pc} x{weight} {} s{}", v(requests), state.0),
         Op::Requests => "requests".to_string(),
     }

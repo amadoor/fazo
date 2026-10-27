@@ -35,6 +35,7 @@ pub(crate) struct CompileFacts<'a> {
     pub(crate) running_floats: &'a [bool],
     /// The cell Optimizing code charges its work to, when it may tier up to Peak.
     pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
+    pub(crate) call_targets: &'a dyn Fn(Ref<Proto>, usize) -> Vec<CallTarget>,
 }
 
 /// The compiled unit, and the optimized graph's text when `dump` asks for it.
@@ -42,7 +43,7 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     let (Some(layout), Some(frames)) = (facts.layout, facts.frames) else {
         return Err(unsupported("the table and frame layouts are unknown"));
     };
-    let func = optimized(proto, facts, passes::PEAK)?;
+    let func = optimized(proto, facts, (passes::PEAK, false))?;
     let unknown_calls = unknown_calls(proto, facts.forced);
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
@@ -51,6 +52,7 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
         frames,
         calls: &facts.calls,
         unknown_calls: &unknown_calls,
+        inlined_targets: &[],
         vararg: proto.is_vararg,
         points: &points,
         stress_exits: facts.stress_exits,
@@ -66,6 +68,17 @@ pub(crate) fn compile<'a>(compiler: &mut Compiler, budget: Arc<CodeBudget>, prot
     Ok((PeakUnit { code: ssa::Code::Cranelift { unit: Box::new(unit), _points: points }, entries, shapes }, text))
 }
 
+fn inlined_targets(func: &ssa::ir::Func, facts: &CompileFacts<'_>) -> Vec<(Vec<CallTarget>, bool)> {
+    func.inlined_calls
+        .iter()
+        .map(|call| {
+            let reference = Ref::new(call.proto as u32, (call.proto >> 32) as u32);
+            let unknown = (facts.proto_of)(reference).is_some_and(|proto| super::sites::calls_unknown_lua(proto, call.pc as usize, facts.forced));
+            ((facts.call_targets)(reference, call.pc as usize), unknown)
+        })
+        .collect()
+}
+
 fn unknown_calls(proto: &Proto, forced: bool) -> Vec<bool> {
     (0..proto.code.len()).map(|pc| super::sites::calls_unknown_lua(proto, pc, forced)).collect()
 }
@@ -74,8 +87,9 @@ pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, 
     let (Some(layout), Some(frames)) = (facts.layout, facts.frames) else {
         return Err(unsupported("the table and frame layouts are unknown"));
     };
-    let func = optimized(proto, facts, passes::OPTIMIZING)?;
+    let func = optimized(proto, facts, (passes::OPTIMIZING, true))?;
     let unknown_calls = unknown_calls(proto, facts.forced);
+    let inlined_targets = inlined_targets(&func, facts);
     let text = dump.then(|| func.to_string());
     let points = ssa::points(&func);
     let env = lower::Env {
@@ -83,6 +97,7 @@ pub(crate) fn compile_optimizing<'a>(budget: Arc<CodeBudget>, proto: &'a Proto, 
         frames,
         calls: &facts.calls,
         unknown_calls: &unknown_calls,
+        inlined_targets: &inlined_targets,
         vararg: proto.is_vararg,
         points: &[],
         stress_exits: facts.stress_exits,
@@ -108,7 +123,8 @@ fn native(_func: &ssa::ir::Func, _env: &lower::Env<'_>, _points: Box<[ssa::Deopt
     None
 }
 
-pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, pipeline: &[passes::Pass]) -> JitResult<ssa::ir::Func> {
+/// `inlined_calls` lets inlined frames make Lua calls, which only the Optimizing backend emits.
+pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, (pipeline, inlined_calls): (&[passes::Pass], bool)) -> JitResult<ssa::ir::Func> {
     let builder_facts = build::Facts {
         inline_caches: facts.inline_caches,
         avoid: facts.avoid,
@@ -120,6 +136,7 @@ pub(crate) fn optimized<'a>(proto: &'a Proto, facts: &CompileFacts<'a>, pipeline
         node_hint: facts.node_hint,
         builtin_of: facts.builtin_of,
         running_floats: facts.running_floats,
+        inlined_calls,
     };
     let mut func = build::build(proto, &builder_facts);
     func.float_guess = facts.float_guess;

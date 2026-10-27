@@ -3,7 +3,7 @@
 
 use super::{
     flow::{self, Flow, RegSet},
-    ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Counted, Edge, FrameState, Func, Helper, HelperKind, InlineFrame, Loop, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
+    ir::{BinOp, BlockId, BuiltinFn, Cc, Closure, Const, Counted, Edge, FrameState, Func, Helper, HelperKind, InlineFrame, InlinedCall, Loop, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val},
     passes::inline::{self, Candidate},
 };
 use crate::{
@@ -34,6 +34,7 @@ pub(crate) struct Facts<'a> {
     pub(crate) builtin_of: &'a dyn Fn(Ref<Native>) -> Option<Builtin>,
     /// An accumulator that changed kind inside the loop is entered as a number, so the guard checks only that.
     pub(crate) running_floats: &'a [bool],
+    pub(crate) inlined_calls: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1330,10 +1331,29 @@ impl<'a> Builder<'a, '_> {
             return self.builtin_call(frame, pc, (a, b, c), function);
         }
         if frame.site.is_some() {
+            return self.inlined_call(frame, pc, (a, b, c));
+        }
+        self.flush();
+        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined: None }, Type::NONE, Rep::Word);
+        self.forget();
+        self.switch(frame, pc, code)
+    }
+
+    /// Lazy deopt frames chain to inlined parents (V8 Maglev `GetDeoptFrameForLazyDeopt`, src/maglev/maglev-graph-builder.cc).
+    fn inlined_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8)) -> usize {
+        let Some(proto) = frame.chain.last().map(|inlined| inlined.proto) else {
+            return self.deopt(frame, pc);
+        };
+        if !self.facts.inlined_calls || b == 0 || c == 0 || !self.speculates(frame, pc) {
             return self.deopt(frame, pc);
         }
         self.flush();
-        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c }, Type::NONE, Rep::Word);
+        let eager = self.state_at(frame, pc);
+        let resume = self.lazy_state_at(frame, pc + 1);
+        let call = InlinedCall { proto, pc: pc as u32, slot: Self::slot(frame, a), b, c, eager, resume };
+        self.func.inlined_calls.push(call);
+        let inlined = Some(self.func.inlined_calls.len() as u32 - 1);
+        let code = self.emit(Op::CallLua { pc: pc as u32, a, b, c, inlined }, Type::NONE, Rep::Word);
         self.forget();
         self.switch(frame, pc, code)
     }
@@ -1361,11 +1381,12 @@ impl<'a> Builder<'a, '_> {
         self.calls_inline(function, base, depth).then_some(candidate)
     }
 
-    /// An inlined frame has no helper to call out through, so its calls must inline too.
+    /// An inlined frame has no helper to call through, so its Lua calls inline or call directly.
     fn calls_inline(&self, proto: &Proto, base: u32, depth: usize) -> bool {
         proto.code.iter().enumerate().all(|(pc, &instruction)| match instruction {
             Instruction::Call { a, b, c } => {
-                self.builtin_candidate(proto, pc, (b, c)).is_some()
+                (self.facts.inlined_calls && b != 0 && c != 0 && crate::jit::sites::calls_frameless_lua(proto, pc, self.facts.proto_of))
+                    || self.builtin_candidate(proto, pc, (b, c)).is_some()
                     || (depth < self.facts.policy.depth && self.lua_candidate(proto, pc, base + u32::from(a) + 1, depth + 1).is_some())
             }
             Instruction::TailCall { b, .. } => self.builtin_candidate(proto, pc, (b, 1)).is_some() || self.lua_candidate(proto, pc, base, depth + 1).is_some(),

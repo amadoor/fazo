@@ -88,10 +88,13 @@ pub(crate) fn symbols() -> [(&'static str, *const u8); 10] {
 }
 
 extern "C" fn materialize(ctx: *mut JitCtx, shape: u64, hash_log: u32, values: *const Value, count: u32) -> i64 {
+    if pending(ctx) {
+        return settle_then(ctx, move || materialize(ctx, shape, hash_log, values, count));
+    }
     // SAFETY: compiled code passes a stack buffer it filled with `count` values.
     let values = unsafe { std::slice::from_raw_parts(values, count as usize) };
     let shape = crate::arena::Ref::new(shape as u32, (shape >> 32) as u32);
-    with_vm(ctx, |ctx, vm| {
+    settled_vm(ctx, |ctx, vm| {
         let table = vm.jit_materialize(shape, hash_log as u8, values[0], &values[1..]);
         vm.jit_refresh_context(ctx);
         table.packed() as i64
@@ -99,7 +102,10 @@ extern "C" fn materialize(ctx: *mut JitCtx, shape: u64, hash_log: u32, values: *
 }
 
 extern "C" fn new_table(ctx: *mut JitCtx, pc: u32, hash_log: u32, top: u32) -> i64 {
-    with_vm(ctx, |ctx, vm| {
+    if pending(ctx) {
+        return settle_then(ctx, move || new_table(ctx, pc, hash_log, top));
+    }
+    settled_vm(ctx, |ctx, vm| {
         let Some((table, ran)) = vm.jit_alloc_table(ctx.base, (pc as usize, top as usize), hash_log as u8) else {
             return -1;
         };
@@ -109,15 +115,35 @@ extern "C" fn new_table(ctx: *mut JitCtx, pc: u32, hash_log: u32, top: u32) -> i
     })
 }
 
+#[inline(always)]
+fn pending(ctx: *mut JitCtx) -> bool {
+    // SAFETY: compiled code passes the live context of the frame calling the helper.
+    unsafe { (*ctx).pending != 0 }
+}
+
+/// Out of line so the common path keeps no arguments across a call.
+#[cold]
+#[inline(never)]
+fn settle_then(ctx: *mut JitCtx, then: impl FnOnce() -> i64) -> i64 {
+    with_vm(ctx, |_, _| ());
+    then()
+}
+
 fn with_vm<T>(ctx: *mut JitCtx, body: impl FnOnce(&mut JitCtx, &mut crate::Vm) -> T) -> T {
+    settled_vm(ctx, |ctx, vm| {
+        vm.jit_push_pending(ctx);
+        body(ctx, vm)
+    })
+}
+
+/// For a frame whose pending heap frame the caller already pushed.
+#[inline(always)]
+fn settled_vm<T>(ctx: *mut JitCtx, body: impl FnOnce(&mut JitCtx, &mut crate::Vm) -> T) -> T {
     // SAFETY: compiled code passes the context the driver built for this frame, which outlives the call, and its VM
     // pointer names the VM running the code on this thread.
     let ctx = unsafe { &mut *ctx };
     // SAFETY: as above; nothing else holds the VM while compiled code runs.
     let vm = unsafe { &mut *ctx.vm };
-    if ctx.pending != 0 {
-        vm.jit_push_pending(ctx);
-    }
     body(ctx, vm)
 }
 
@@ -150,9 +176,12 @@ extern "C" fn resume(ctx: *mut JitCtx, pc: i64) -> i64 {
 }
 
 extern "C" fn value(ctx: *mut JitCtx, kind: u32, operands: *mut Value, extra: u32) -> i64 {
+    if pending(ctx) {
+        return settle_then(ctx, move || value(ctx, kind, operands, extra));
+    }
     // SAFETY: compiled code passes its scratch slot of three values, every one it reads written before the call.
     let operands = unsafe { std::slice::from_raw_parts_mut(operands, 3) };
-    with_vm(ctx, |ctx, vm| match kind {
+    settled_vm(ctx, |ctx, vm| match kind {
         KIND_ARITH => store(operands, arith(extra, operands[0], operands[1])),
         KIND_COMPARE => match compare(extra, operands[0], operands[1]) {
             Some(true) => 2,

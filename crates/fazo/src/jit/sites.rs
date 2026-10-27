@@ -116,6 +116,35 @@ pub(crate) fn payoff(proto: &Proto, policy: crate::TierPolicy) -> i64 {
     total
 }
 
+/// Instructions whose helpers need the callee's heap frame, so a direct call pushes it up front.
+pub(crate) fn needs_frame(function: &Proto) -> bool {
+    function.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::NewTable { .. }
+                | Instruction::SetList { .. }
+                | Instruction::Closure { .. }
+                | Instruction::Concat { .. }
+                | Instruction::GetI { .. }
+                | Instruction::GetTable { .. }
+        )
+    })
+}
+
+/// Only frameless callees keep a call from an inlined frame cheap; any other callee pushes the inlined frames on every call.
+pub(crate) fn calls_frameless_lua<'a>(proto: &Proto, pc: usize, proto_of: &dyn Fn(crate::Ref<Proto>) -> Option<&'a Proto>) -> bool {
+    let callees: &[crate::vm::ic::Callee] = match proto.exec.feedback.get(pc) {
+        Some(InlineCache::Callee(callee)) => std::slice::from_ref(callee),
+        Some(InlineCache::Callees(callees)) => callees,
+        _ => return false,
+    };
+    !callees.is_empty()
+        && callees.iter().all(|callee| {
+            let function = callee.proto.and_then(proto_of);
+            matches!(callee.value, LuaValue::Closure(_)) && function.is_some_and(|function| !function.is_vararg && !needs_frame(function))
+        })
+}
+
 pub(crate) fn calls_lua(proto: &Proto, pc: usize) -> bool {
     match proto.exec.feedback.get(pc) {
         Some(InlineCache::Callee(callee)) => matches!(callee.value, LuaValue::Closure(_)),

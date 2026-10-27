@@ -116,6 +116,34 @@ fn built_with(source: &str, insufficient: &[u32]) -> Func {
         node_hint: &node_hint,
         builtin_of: &builtin_of,
         running_floats: &[],
+        inlined_calls: true,
+    };
+    build::build(heap.protos.live(reference), &facts)
+}
+
+/// The graph of the chunk's first function after the chunk ran, so its call sites carry feedback.
+fn built_after_running(source: &str, inlined_calls: bool) -> Func {
+    let mut vm = crate::Vm::new(crate::Options::default());
+    let chunk = vm.load(b"=test", source.as_bytes()).expect("the chunk loads");
+    vm.call(chunk, &[]).expect("the chunk runs");
+    let reference = child_proto(&vm, chunk, 0);
+    let heap = &vm.heap;
+    let interned = |_: crate::Value| false;
+    let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
+    let node_hint = |_: &Proto, _: usize, _: bool| None;
+    let builtin_of = |_: Ref<crate::object::Native>| None;
+    let facts = build::Facts {
+        inline_caches: true,
+        avoid: &[],
+        insufficient: &[],
+        interned: &interned,
+        proto_of: &proto_of,
+        policy: inline::Policy::default(),
+        osr_at: None,
+        node_hint: &node_hint,
+        builtin_of: &builtin_of,
+        running_floats: &[],
+        inlined_calls,
     };
     build::build(heap.protos.live(reference), &facts)
 }
@@ -379,7 +407,7 @@ fn hoisting_leaves_memory_guards_in_loops_that_call_out() {
     let shape = fixture.func.add_inst(Op::GuardShape { table: fixture.guard, shape: 3, state: s }, Type::NONE, Rep::None);
     let header = fixture.header;
     fixture.func.block_mut(header).insts.insert(1, shape);
-    let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1 }, Type::NONE, Rep::Word);
+    let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }, Type::NONE, Rep::Word);
     fixture.func.block_mut(header).insts.insert(2, call);
     hoist::run(&mut fixture.func);
     assert!(fixture.func.block(fixture.preheader).insts.contains(&fixture.guard), "a type guard reads no memory");
@@ -442,7 +470,7 @@ fn hoisting_moves_the_request_flags_out_of_a_loop_without_calls_only() {
         let poll = fixture.func.add_inst(Op::Safepoint { pc: 3, weight: 2, requests, state: s }, Type::NONE, Rep::None);
         fixture.func.block_mut(header).insts.insert(1, poll);
         if calls {
-            let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1 }, Type::NONE, Rep::Word);
+            let call = fixture.func.add_inst(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }, Type::NONE, Rep::Word);
             fixture.func.block_mut(header).insts.insert(2, call);
         }
         hoist::run(&mut fixture.func);
@@ -539,7 +567,7 @@ fn load_forwarding_forgets_fields_across_calls() {
     let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
     let table = func.append(block, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
     let first = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
-    func.append(block, Op::CallLua { pc: 1, a: 2, b: 1, c: 1 }, Type::NONE, Rep::None);
+    func.append(block, Op::CallLua { pc: 1, a: 2, b: 1, c: 1, inlined: None }, Type::NONE, Rep::None);
     let second = func.append(block, Op::LoadSlot { table, slot: 0 }, Type::ANY, Rep::Boxed);
     func.append(block, Op::StoreReg { slot: 1, value: first }, Type::NONE, Rep::None);
     func.append(block, Op::StoreReg { slot: 2, value: second }, Type::NONE, Rep::None);
@@ -615,4 +643,22 @@ fn escape_analysis_turns_a_carried_table_into_field_parameters() {
     let preheader_shape = func.block(fixture.preheader).insts.iter().any(|&value| matches!(func.op(value), Op::GuardShape { shape: 9, .. }));
     assert!(preheader_shape, "the entering table's shape is checked before the loop");
     check::check(func, false).expect("the carried graph stays valid");
+}
+
+#[test]
+fn an_inlined_callee_keeps_its_calls_with_the_inlined_frames_as_their_deopt_frames() {
+    let source = "local function fib(n) if n < 2 then return n end return fib(n - 1) + fib(n - 2) end return fib(12)";
+    let func = built_after_running(source, true);
+    check::check(&func, false).expect("the built graph is valid");
+    assert!(!func.inlined_calls.is_empty(), "the inlined callee's own calls stay calls:
+{func}");
+    for call in &func.inlined_calls {
+        assert_eq!(func.state(call.resume).frames.len(), 1, "the call resumes inside one inlined frame");
+        assert!(func.state(call.resume).lazy, "the resume state is a lazy deopt frame");
+        assert_eq!(func.state(call.resume).pc, call.pc + 1, "the callee returns past the call");
+        assert_eq!(func.state(call.eager).pc, call.pc, "the slow path reruns the call");
+        assert!(func.state(call.eager).slots.is_empty(), "the call stores every register first");
+    }
+    let without = built_after_running(source, false);
+    assert!(without.inlined_calls.is_empty(), "a backend without calls from inlined frames inlines no caller of them");
 }

@@ -280,7 +280,7 @@ pub(crate) enum Op {
     NewTable { hash_log: u8, top: u32, shape: Option<u64>, fields: Box<[Val]>, state: StateId, after: StateId },
     Materialize { object: Box<Virtual> },
     GuardAbsent { table: Val, bit: u8, state: StateId },
-    CallLua { pc: u32, a: u8, b: u8, c: u8 },
+    CallLua { pc: u32, a: u8, b: u8, c: u8, inlined: Option<u32> },
     /// `weight` is the loop's length in bytecodes, the work one iteration stands for.
     Safepoint { pc: u32, weight: u32, requests: Val, state: StateId },
     /// Fixed for the whole run, so a loop's poll can keep it in a register.
@@ -712,6 +712,21 @@ pub(crate) struct Func {
     pub(crate) shapes: Vec<crate::arena::Ref<crate::shape::Shape>>,
     /// Allocations may be removed: no memory limit makes an allocation able to fail.
     pub(crate) sink_allocations: bool,
+    pub(crate) inlined_calls: Vec<InlinedCall>,
+}
+
+/// A Lua call from an inlined frame; its lazy deopt info chains the inlined frames to their parents (V8 Maglev `LazyDeoptInfo`, maglev-ir.h).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct InlinedCall {
+    pub(crate) proto: u64,
+    pub(crate) pc: u32,
+    pub(crate) slot: u32,
+    pub(crate) b: u8,
+    pub(crate) c: u8,
+    /// At the call, so a callee the code cannot call resumes it in the interpreter.
+    pub(crate) eager: StateId,
+    /// After the call, so the callee's first helper pushes the inlined frames under it.
+    pub(crate) resume: StateId,
 }
 
 pub(crate) const KIND_INT: u8 = 1;

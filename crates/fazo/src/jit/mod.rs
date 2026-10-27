@@ -52,7 +52,7 @@ pub(crate) mod unwind;
 mod tests;
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use ctx::{JitCtx, NOT_DIRECT, PENDING, PENDING_TAIL};
+pub(crate) use ctx::{INLINED_CALL, JitCtx, NOT_DIRECT, PENDING, PENDING_TAIL};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use helpers::{Control, enter};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -21,6 +21,15 @@ enum Callee<'t> {
     Any,
 }
 
+#[derive(Clone, Copy)]
+struct Site {
+    pc: usize,
+    slot: u32,
+    b: u8,
+    c: u8,
+    inlined: Option<u32>,
+}
+
 /// Registers a direct call works in, all clobbered by the call.
 #[derive(Clone, Copy)]
 struct Temps {
@@ -61,16 +70,8 @@ impl<A: Asm> Gen<'_, A> {
         self.save(&saves);
         let unknown = targets.is_empty() && self.env.unknown_calls.get(pc).copied().unwrap_or(false);
         if b != 0 && (unknown || !targets.is_empty()) {
-            let any = if unknown { self.asm.new_label() } else { helper };
-            let matched = self.match_callee(a, &targets, temps, (helper, any));
-            for (target, label) in targets.iter().zip(matched) {
-                self.asm.bind(label);
-                self.direct_call(pc, (a, b, c), Callee::Known(target), temps, (helper, join, out), settled);
-            }
-            if unknown {
-                self.asm.bind(any);
-                self.direct_call(pc, (a, b, c), Callee::Any, temps, (helper, join, out), settled);
-            }
+            let site = Site { pc, slot: u32::from(a), b, c, inlined: None };
+            self.direct_calls(site, (&targets, unknown), temps, (helper, join, out), settled);
         }
         self.asm.bind(helper);
         self.fast_args(pc as u32, [u32::from(a), u32::from(b), u32::from(c)]);
@@ -80,8 +81,50 @@ impl<A: Asm> Gen<'_, A> {
         self.restore(&saves);
     }
 
-    fn match_callee(&mut self, a: u8, targets: &[CallTarget], temps: Temps, (helper, any): (Label, Label)) -> Vec<Label> {
-        let at = i32::from(a) * VALUE_SIZE;
+    /// A call from an inlined frame takes no helper: its slow path resumes the call in the interpreter.
+    pub(super) fn call_inlined(&mut self, value: Val, index: usize) {
+        let call = self.func.inlined_calls[index];
+        let (targets, unknown) = self.env.inlined_targets.get(index).cloned().unwrap_or_default();
+        let frames = self.func.state(call.resume).frames.len() as u32;
+        let out = self.out(value);
+        let temps = self.temps();
+        let saves = self.saves(&[]);
+        let interpret = self.asm.new_label();
+        let join = self.asm.new_label();
+        let settled = (saves.is_empty() && self.switched == Some(value)).then(|| self.asm.new_label());
+        if let Some(label) = settled {
+            self.settled = Some((call.pc + 1, label));
+        }
+        self.save(&saves);
+        if unknown || !targets.is_empty() {
+            let point = std::ptr::from_ref(&self.table.points[call.resume.0 as usize]) as i64;
+            self.asm.mov_imm(A::SCRATCH, point);
+            self.asm.store(Width::Q, A::SCRATCH, A::CTX, offset_of!(JitCtx, inline_point) as i32);
+            let site = Site { pc: call.pc as usize, slot: call.slot, b: call.b, c: call.c, inlined: Some(frames) };
+            self.direct_calls(site, (&targets, unknown), temps, (interpret, join, out), settled);
+        }
+        self.asm.bind(interpret);
+        let exit = self.exit(call.eager);
+        self.asm.jump(exit);
+        self.asm.bind(join);
+        self.restore(&saves);
+    }
+
+    fn direct_calls(&mut self, site: Site, (targets, unknown): (&[CallTarget], bool), temps: Temps, (helper, join, out): (Label, Label, u8), settled: Option<Label>) {
+        let any = if unknown { self.asm.new_label() } else { helper };
+        let matched = self.match_callee(site.slot, targets, temps, (helper, any));
+        for (target, label) in targets.iter().zip(matched) {
+            self.asm.bind(label);
+            self.direct_call(site, Callee::Known(target), temps, (helper, join, out), settled);
+        }
+        if unknown {
+            self.asm.bind(any);
+            self.direct_call(site, Callee::Any, temps, (helper, join, out), settled);
+        }
+    }
+
+    fn match_callee(&mut self, slot: u32, targets: &[CallTarget], temps: Temps, (helper, any): (Label, Label)) -> Vec<Label> {
+        let at = slot as i32 * VALUE_SIZE;
         let matched: Vec<Label> = targets.iter().map(|_| self.asm.new_label()).collect();
         self.registers(temps.entry);
         self.asm.load(Width::B, A::SCRATCH, temps.entry, at);
@@ -107,10 +150,11 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// Leaves the callee's heap frame pending, as V8's optimized frames stay on the native stack (maglev-ir.cc `CallKnownJSFunction`).
-    fn direct_call(&mut self, pc: usize, (a, b, c): (u8, u8, u8), callee: Callee<'_>, t: Temps, (helper, join, out): (Label, Label, u8), settled: Option<Label>) {
+    fn direct_call(&mut self, site: Site, callee: Callee<'_>, t: Temps, (helper, join, out): (Label, Label, u8), settled: Option<Label>) {
+        let Site { pc, slot: function, b, c, inlined } = site;
         let arguments = u32::from(b) - 1;
         let wanted = i64::from(c) - 1;
-        let callee_offset = (i32::from(a) + 1) * VALUE_SIZE;
+        let callee_offset = (function as i32 + 1) * VALUE_SIZE;
         let slot = self.ctx_at;
         let popped = self.asm.new_label();
         let other = self.asm.new_label();
@@ -118,12 +162,13 @@ impl<A: Asm> Gen<'_, A> {
         self.load_entry(callee, t, helper);
         self.stack_check(t, helper);
         self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
-        self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, i32::from(a) + 1);
+        self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, function as i32 + 1);
         self.check_stack_room(callee, arguments, t, helper);
         self.clear_missing_parameters(callee, arguments, callee_offset, t);
-        self.asm.store_imm(Width::W, A::CTX, offset_of!(JitCtx, saved_pc) as i32, pc as i64 + 1);
+        let saved = if inlined.is_some() { i64::from(crate::jit::INLINED_CALL) } else { pc as i64 + 1 };
+        self.asm.store_imm(Width::W, A::CTX, offset_of!(JitCtx, saved_pc) as i32, saved);
         self.fill_callee_context(callee, t, (callee_offset, wanted));
-        if matches!(callee, Callee::Known(target) if target.pushes_frame) {
+        if inlined.is_none() && matches!(callee, Callee::Known(target) if target.pushes_frame) {
             self.push_callee_frame(pc, t, wanted);
         }
 
@@ -139,10 +184,14 @@ impl<A: Asm> Gen<'_, A> {
         self.continue_after_call(pc, (join, out), settled);
 
         self.asm.bind(popped);
-        self.pop_callee_frame(t);
+        self.pop_callee_frame(t, 1 + inlined.unwrap_or(0));
         self.continue_after_call(pc, (join, out), settled);
 
         self.asm.bind(other);
+        if inlined.is_some() {
+            self.leave_after_inlined_call();
+            return;
+        }
         self.place_arg(2, Src::R(A::SCRATCH));
         match A::arg(3) {
             super::asm::ArgLoc::Reg(reg) => self.asm.load(Width::W, reg, A::SP, slot + offset_of!(JitCtx, frame_index) as i32),
@@ -188,6 +237,18 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(lazy);
     }
 
+    /// A callee that did not return in place was pushed with the inlined frames under it, so the interpreter resumes them.
+    fn leave_after_inlined_call(&mut self) {
+        let failed = self.asm.new_label();
+        self.asm.cmp_imm(A::SCRATCH, crate::jit::EXIT_ERROR as i32);
+        self.asm.branch(Cond::Eq, failed);
+        self.asm.mov_imm(A::SCRATCH, -crate::jit::EXIT_RELOAD);
+        self.asm.jump(self.exit_with);
+        self.asm.bind(failed);
+        self.asm.mov_imm(A::SCRATCH, -crate::jit::EXIT_ERROR);
+        self.asm.jump(self.exit_with);
+    }
+
     fn continue_after_call(&mut self, pc: usize, (join, out): (Label, u8), settled: Option<Label>) {
         if let Some(label) = settled {
             self.asm.jump(label);
@@ -198,11 +259,12 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// The caller pops the callee's heap frame, left on top, as the driver does for `EXIT_RETURNED`.
-    fn pop_callee_frame(&mut self, t: Temps) {
+    /// The callee's first helper pushed the inlined frames of a call from one under its own, so those go too.
+    fn pop_callee_frame(&mut self, t: Temps, count: u32) {
         let frames = self.env.frames;
         self.ctx_load(t.thread, offset_of!(JitCtx, thread));
         self.asm.load(Width::Q, t.count, t.thread, frames.frames_len);
-        self.asm.alu_imm(Alu::Sub, t.count, t.count, 1);
+        self.asm.alu_imm(Alu::Sub, t.count, t.count, count as i32);
         self.asm.store(Width::Q, t.count, t.thread, frames.frames_len);
     }
 
@@ -292,6 +354,7 @@ impl<A: Asm> Gen<'_, A> {
             offset_of!(JitCtx, table_marks),
             offset_of!(JitCtx, closures),
             offset_of!(JitCtx, thread),
+            offset_of!(JitCtx, moves),
         ] {
             self.ctx_load(A::SCRATCH, offset);
             self.asm.store(Width::Q, A::SCRATCH, A::SP, context + offset as i32);
@@ -352,7 +415,7 @@ impl<A: Asm> Gen<'_, A> {
         if (unknown || !targets.is_empty()) && b != 0 && !k && !self.env.vararg {
             let temps = self.temps();
             let any = if unknown { self.asm.new_label() } else { helper };
-            let matched = self.match_callee(a, &targets, temps, (helper, any));
+            let matched = self.match_callee(u32::from(a), &targets, temps, (helper, any));
             for (target, label) in targets.iter().zip(matched) {
                 self.asm.bind(label);
                 self.direct_tail_call((a, b), Callee::Known(target), temps, helper);

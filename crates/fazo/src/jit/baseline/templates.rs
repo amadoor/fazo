@@ -688,8 +688,9 @@ fn tail_enter(m: &mut dyn Masm, env: &Env, upvalues: bool) {
     m.jump(Target::Ext(ext::EXIT));
 }
 
-const COPIED: [usize; 9] = [
+const COPIED: [usize; 10] = [
     offset_of!(JitCtx, requests),
+    offset_of!(JitCtx, moves),
     offset_of!(JitCtx, tables),
     offset_of!(JitCtx, table_marks),
     offset_of!(JitCtx, closures),

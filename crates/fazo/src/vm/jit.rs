@@ -526,6 +526,7 @@ impl Vm {
         let proto_of = |reference: Ref<Proto>| heap.protos.try_get(reference);
         let builtin_of = |native: Ref<crate::object::Native>| heap.natives.try_get(native).and_then(|native| native.builtin);
         let type_names = self.type_name_refs();
+        let call_targets = |inlined: Ref<Proto>, pc: usize| inlined_call_targets(heap, proto, inlined, pc);
         let node_hint = |function: &Proto, pc: usize, root: bool| {
             if root {
                 return nodes.get(pc).copied().flatten();
@@ -552,6 +553,7 @@ impl Vm {
             sink_allocations: self.options.memory_limit.is_none(),
             running_floats: &running_floats,
             tier_budget: charges.then(|| std::ptr::from_ref(heap.protos.live(proto).jit.tier_budget())),
+            call_targets: &call_targets,
         };
         let compiled = if tier == Tier::Optimizing {
             Some(crate::jit::compile_optimizing(budget, heap.protos.live(proto), &facts, dump))
@@ -949,41 +951,9 @@ impl Vm {
                     super::InlineCache::Callees(callees) => callees,
                     _ => &[],
                 };
-                callees.iter().filter_map(|&callee| self.jit_call_target(proto, callee)).collect()
+                callees.iter().filter_map(|&callee| call_target(&self.heap, proto, callee)).collect()
             })
             .collect()
-    }
-
-    /// `caller` is still compiling, so its code is not installed yet.
-    fn jit_call_target(&self, caller: Ref<Proto>, callee: super::ic::Callee) -> Option<crate::jit::CallTarget> {
-        let (Value::Closure(closure), Some(proto)) = (callee.value, callee.proto) else {
-            return None;
-        };
-        let function = self.heap.protos.try_get(proto)?;
-        if function.is_vararg {
-            return None;
-        }
-        Some(crate::jit::CallTarget {
-            closure: closure.packed(),
-            proto: proto.packed(),
-            entry: std::ptr::from_ref(function.jit.entry()),
-            constants: function.constants.as_ptr(),
-            num_params: function.num_params,
-            max_stack: function.max_stack,
-            has_upvalues: !function.upvalues.is_empty(),
-            pushes_frame: (function.jit.unit.is_none() && proto != caller)
-                || function.code.iter().any(|instruction| {
-                    matches!(
-                        instruction,
-                        Instruction::NewTable { .. }
-                            | Instruction::SetList { .. }
-                            | Instruction::Closure { .. }
-                            | Instruction::Concat { .. }
-                            | Instruction::GetI { .. }
-                            | Instruction::GetTable { .. }
-                    )
-                }),
-        })
     }
 
     fn jit_interned(&self, constant: Value) -> bool {
@@ -1097,6 +1067,8 @@ impl Vm {
             pending: 0,
             saved_pc: 0,
             frame_index: self.jit_top_index(),
+            moves: self.heap.moves,
+            inline_point: std::ptr::null(),
         };
         self.jit.entries += 1;
         let code = crate::jit::enter(entry.code, &mut ctx, pc);
@@ -1408,6 +1380,8 @@ impl Vm {
             pending: 0,
             saved_pc: 0,
             frame_index: self.jit_top_index(),
+            moves: self.heap.moves,
+            inline_point: std::ptr::null(),
         };
         let code = crate::jit::enter(entry, &mut callee, if vararg { VARARG_BODY } else { 0 });
         match code {
@@ -1664,6 +1638,8 @@ impl Vm {
             pending: 0,
             saved_pc: 0,
             frame_index: self.jit_top_index(),
+            moves: self.heap.moves,
+            inline_point: std::ptr::null(),
         };
         let code = crate::jit::enter(entry, &mut callee, 0);
         Some(match code {
@@ -1910,42 +1886,36 @@ impl Vm {
     }
 
     /// The constants belong to the same prototype, so they do not change.
+    #[inline]
     pub(crate) fn jit_refresh_context(&mut self, ctx: &mut JitCtx) {
         self.jit_refresh(ctx);
     }
 
     #[inline]
     fn jit_refresh(&mut self, ctx: &mut JitCtx) {
-        let running = self.thread_mut();
-        let stack = running.stack.as_mut_ptr();
-        let thread = std::ptr::from_mut(running);
-        let registers = stack.wrapping_add(ctx.base);
-        let tables = self.heap.tables.objects_ptr();
-        let table_marks = self.heap.tables.marks_ptr();
-        let closures = self.heap.closures.objects_ptr();
-        let linked = !ctx.parent.is_null() || !ctx.child.is_null();
-        let moved = linked
-            && ((ctx.registers != registers) | (ctx.tables != tables) | (ctx.table_marks != table_marks) | (ctx.closures != closures) | (ctx.thread != thread));
-        ctx.registers = registers;
-        ctx.tables = tables;
-        ctx.table_marks = table_marks;
-        ctx.closures = closures;
-        ctx.thread = thread;
-        if moved {
-            Self::jit_refresh_nest(ctx, stack);
+        if ctx.moves != self.heap.moves {
+            self.jit_refresh_moved(ctx);
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn jit_refresh_nest(ctx: &mut JitCtx, stack: *mut Value) {
-        let (tables, table_marks, closures, thread) = (ctx.tables, ctx.table_marks, ctx.closures, ctx.thread);
+    fn jit_refresh_moved(&mut self, ctx: &mut JitCtx) {
+        let stack = self.thread_mut().stack.as_mut_ptr();
+        ctx.registers = stack.wrapping_add(ctx.base);
+        ctx.tables = self.heap.tables.objects_ptr();
+        ctx.table_marks = self.heap.tables.marks_ptr();
+        ctx.closures = self.heap.closures.objects_ptr();
+        ctx.thread = self.jit_thread_object();
+        ctx.moves = self.heap.moves;
+        let (tables, table_marks, closures, thread, moves) = (ctx.tables, ctx.table_marks, ctx.closures, ctx.thread, ctx.moves);
         ctx.refresh_nest(|other| {
             other.registers = stack.wrapping_add(other.base);
             other.tables = tables;
             other.table_marks = table_marks;
             other.closures = closures;
             other.thread = thread;
+            other.moves = moves;
         });
     }
 
@@ -1972,17 +1942,17 @@ impl Vm {
     }
 
     /// Pushes the outer pending frames first; `pc` is `None` for the innermost, whose helper sets its pc.
+    /// A caller inside a call from an inlined frame pushes the inlined frames as a deopt would.
     fn jit_push_pending_frame(&mut self, ctx: &mut JitCtx, pc: Option<u32>) {
-        match ctx.pending_caller() {
-            Ok(caller) => {
-                let resumed = caller.saved_pc;
-                self.jit_push_pending_frame(caller, Some(resumed));
-            }
-            Err(resumed) => {
-                if let Some(crate::object::Frame::Lua(frame)) = self.thread_mut().frames.last_mut() {
-                    frame.set_pc(resumed as usize);
-                }
-            }
+        let caller = ctx.pending_caller();
+        let resumed = caller.saved_pc;
+        if caller.pending != 0 {
+            self.jit_push_pending_frame(caller, Some(resumed));
+        } else if let Some(crate::object::Frame::Lua(frame)) = self.thread_mut().frames.last_mut() {
+            frame.set_pc(resumed as usize);
+        }
+        if let Some(point) = caller.inline_point() {
+            self.jit_push_inlined_frames(caller, point);
         }
         let called = crate::object::LuaFrame::called(ctx.closure, ctx.base, ctx.direct_results, 0);
         let mut frame = if ctx.pending & crate::jit::PENDING_TAIL != 0 { crate::object::LuaFrame::with_status(ctx.closure, ctx.base, called.status() | frame_status::TAIL) } else { called };
@@ -2146,5 +2116,37 @@ fn numeric_registers(instruction: crate::instruction::Instruction) -> Option<(u8
         I::Eq { a, b, .. } | I::Lt { a, b, .. } | I::Le { a, b, .. } => (a, Some(b)),
         I::LtI { a, .. } | I::LeI { a, .. } | I::GtI { a, .. } | I::GeI { a, .. } => (a, None),
         _ => return None,
+    })
+}
+
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn inlined_call_targets(heap: &crate::heap::Heap, caller: Ref<Proto>, proto: Ref<Proto>, pc: usize) -> Vec<crate::jit::CallTarget> {
+    let callees: &[super::ic::Callee] = match heap.protos.try_get(proto).and_then(|function| function.exec.feedback.get(pc)) {
+        Some(super::InlineCache::Callee(callee)) => std::slice::from_ref(callee),
+        Some(super::InlineCache::Callees(callees)) => callees,
+        _ => &[],
+    };
+    callees.iter().filter_map(|&callee| call_target(heap, caller, callee)).collect()
+}
+
+/// `caller` is still compiling, so its code is not installed yet.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn call_target(heap: &crate::heap::Heap, caller: Ref<Proto>, callee: super::ic::Callee) -> Option<crate::jit::CallTarget> {
+    let (Value::Closure(closure), Some(proto)) = (callee.value, callee.proto) else {
+        return None;
+    };
+    let function = heap.protos.try_get(proto)?;
+    if function.is_vararg {
+        return None;
+    }
+    Some(crate::jit::CallTarget {
+        closure: closure.packed(),
+        proto: proto.packed(),
+        entry: std::ptr::from_ref(function.jit.entry()),
+        constants: function.constants.as_ptr(),
+        num_params: function.num_params,
+        max_stack: function.max_stack,
+        has_upvalues: !function.upvalues.is_empty(),
+        pushes_frame: (function.jit.unit.is_none() && proto != caller) || crate::jit::sites::needs_frame(function),
     })
 }

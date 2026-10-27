@@ -213,7 +213,8 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.test_imm(A::SCRATCH, i32::from(*bit));
                 self.asm.branch(Cond::Eq, exit);
             }
-            Op::CallLua { pc, a, b, c } => self.call_lua(value, *pc as usize, (*a, *b, *c)),
+            Op::CallLua { pc, a, b, c, inlined: None } => self.call_lua(value, *pc as usize, (*a, *b, *c)),
+            Op::CallLua { inlined: Some(call), .. } => self.call_inlined(value, *call as usize),
             Op::Safepoint { pc, weight, requests, state } => self.safepoint(*pc, *weight, *requests, *state),
         }
     }

@@ -523,6 +523,7 @@ fn compiled_ir_size(statements: usize) -> usize {
         sink_allocations: true,
         running_floats: &[],
         tier_budget: None,
+        call_targets: &|_, _| Vec::new(),
     };
     let (unit, _) = crate::jit::compile(&mut compiler(), budget, heap.protos.live(proto), &facts, false).expect("the chunk compiles");
     unit.size()
@@ -663,5 +664,66 @@ fn inline_field_access_matches_the_interpreter() {
         let warm = run_source_with(options, FIELD_PROGRAM);
         assert!(warm.1, "the warm run compiles the loops");
         assert_eq!(String::from_utf8_lossy(&warm.0), String::from_utf8_lossy(&interpreted.0), "{ceiling}");
+    }
+}
+
+const INLINED_CALLS: &[u8] = b"
+local function leaf(x)
+  if x == 7 then
+    local info = debug.getinfo(2, 'Sl')
+    io.write('caller line ', info.currentline, ' ', debug.getinfo(3, 'l').currentline, '\\n')
+    debug.setlocal(2, 1, 100)
+  end
+  if x == 13 and FAIL then error('boom at 13') end
+  if x == 21 then io.write((debug.traceback('tb', 1):gsub('0x%x+', '')), '\\n') end
+  return x + 1
+end
+local function middle(x)
+  local y = leaf(x)
+  return x + y
+end
+local function outer(n)
+  local total = 0
+  for i = 1, n do total = total + middle(i) end
+  return total
+end
+for round = 1, 120 do
+  FAIL = round % 40 == 0
+  local ok, r = pcall(outer, 25)
+  if round % 20 == 0 then print('outer', ok, r) end
+end
+local function rec(n)
+  if n < 2 then return n end
+  return rec(n - 1) + rec(n - 2)
+end
+for i = 1, 3 do print('rec', rec(10 + i)) end
+local co = coroutine.wrap(function()
+  local function step(v) coroutine.yield(v) return v * 2 end
+  local function twice(v) return step(v) + step(v + 1) end
+  for i = 1, 100 do
+    local r = twice(i)
+    if i % 50 == 0 then coroutine.yield(-r) end
+  end
+  return 'done'
+end)
+local acc = 0
+for _ = 1, 1000 do
+  local v = co()
+  if v == 'done' then break end
+  acc = acc + v
+end
+print('co', acc)
+";
+
+#[test]
+fn calls_from_inlined_frames_show_the_interpreter_frames() {
+    let interpreted = run_source_with(options_for(INTERPRETER), INLINED_CALLS);
+    let mut warm = options_for(&[]);
+    warm.jit_policy = WARM;
+    let runs = MODES.iter().map(|mode| (format!("{mode:?}"), options_for(mode))).chain([("warm".to_owned(), warm)]);
+    for (name, options) in runs {
+        let compiled = run_source_with(options, INLINED_CALLS);
+        assert!(compiled.1, "the {name} run compiles");
+        assert_eq!(String::from_utf8_lossy(&compiled.0), String::from_utf8_lossy(&interpreted.0), "mode {name}");
     }
 }

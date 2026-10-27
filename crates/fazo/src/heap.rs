@@ -107,11 +107,15 @@ pub struct Heap {
     pub(crate) white: Vec<Gc>,
     #[serde(skip)]
     pub(crate) compiler: crate::compiler::Scratch,
+    /// Counts moves of thread stacks and object arenas, so compiled frames refresh their cached pointers only after one.
+    #[serde(skip)]
+    pub(crate) moves: u64,
 }
 
 pub(crate) trait Collectable: Sized + Default {
     type Slots: Slots<Self>;
     fn arena(heap: &mut Heap) -> &mut Arena<Self, Self::Slots>;
+    fn arena_and_moves(heap: &mut Heap) -> (&mut Arena<Self, Self::Slots>, &mut u64);
     fn wrap(reference: Ref<Self>) -> Gc;
     fn size(&self) -> usize;
 }
@@ -126,6 +130,10 @@ macro_rules! collectable {
 
             fn arena(heap: &mut Heap) -> &mut Arena<Self, Self::Slots> {
                 &mut heap.$field
+            }
+
+            fn arena_and_moves(heap: &mut Heap) -> (&mut Arena<Self, Self::Slots>, &mut u64) {
+                (&mut heap.$field, &mut heap.moves)
             }
 
             fn wrap(reference: Ref<Self>) -> Gc {
@@ -155,7 +163,8 @@ impl Heap {
     pub(crate) fn alloc<T: Collectable>(&mut self, object: T) -> Ref<T> {
         let size = object.size();
         let white = self.gc.current_white;
-        let reference = T::arena(self).insert_marked(object, white);
+        let (arena, moves) = T::arena_and_moves(self);
+        let reference = arena.insert_marked(object, white, moves);
         self.gc.grow(size as i64);
         if self.gc.is_generational() {
             self.gc.young.push(T::wrap(reference));
@@ -696,6 +705,7 @@ impl Heap {
 
     /// Follows `correctstack` in ldo.c.
     pub(crate) fn stack_resized(&mut self, thread: Ref<Thread>) {
+        self.moves += 1;
         let state = self.threads.live_mut(thread);
         state.stack_resized();
         let stack = state.stack.as_mut_ptr();

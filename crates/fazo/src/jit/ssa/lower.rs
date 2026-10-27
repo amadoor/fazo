@@ -42,6 +42,7 @@ pub(crate) struct Env<'a> {
     pub(crate) frames: FrameLayout,
     pub(crate) calls: &'a [Vec<CallTarget>],
     pub(crate) unknown_calls: &'a [bool],
+    pub(crate) inlined_targets: &'a [(Vec<CallTarget>, bool)],
     pub(crate) vararg: bool,
     pub(crate) points: &'a [DeoptPoint],
     pub(crate) stress_exits: bool,
@@ -709,7 +710,8 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 self.guard(flagged, state);
                 Word::None
             }
-            Op::CallLua { pc, a, b, c } => Word::One(self.call_lua(pc as usize, (a, b, c))),
+            Op::CallLua { pc, a, b, c, inlined: None } => Word::One(self.call_lua(pc as usize, (a, b, c))),
+            Op::CallLua { inlined: Some(_), .. } => unreachable!("Peak graphs make no calls from inlined frames"),
             Op::Safepoint { pc, state, .. } => {
                 self.safepoint(pc, state);
                 Word::None
@@ -1900,6 +1902,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
     fn fill_callee_context(&mut self, context: StackSlot, (upvalues, constants, proto): (Value, Value, Value), base: Value, (callee_offset, callee_base, closure): (i32, Value, Value), wanted: i64) {
         let copied = [
             offset_of!(JitCtx, requests),
+            offset_of!(JitCtx, moves),
             offset_of!(JitCtx, tables),
             offset_of!(JitCtx, table_marks),
             offset_of!(JitCtx, closures),
@@ -1943,7 +1946,9 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let tables = self.builder.ins().stack_load(self.pointer, types::I64, context, offset_of!(JitCtx, tables) as i32);
         let marks = self.builder.ins().stack_load(self.pointer, types::I64, context, offset_of!(JitCtx, table_marks) as i32);
         let closures = self.builder.ins().stack_load(self.pointer, types::I64, context, offset_of!(JitCtx, closures) as i32);
+        let moves = self.builder.ins().stack_load(self.pointer, types::I64, context, offset_of!(JitCtx, moves) as i32);
         for (offset, value) in [
+            (offset_of!(JitCtx, moves), moves),
             (offset_of!(JitCtx, registers), registers),
             (offset_of!(JitCtx, tables), tables),
             (offset_of!(JitCtx, table_marks), marks),

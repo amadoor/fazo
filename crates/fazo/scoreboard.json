@@ -225,270 +225,270 @@
   "perf": {
     "fib": {
       "puc": 161182880,
-      "fazo": 80710684,
-      "baseline": 128277514,
-      "optimizing": 82592288,
-      "peak": 122537067,
-      "interpreter": 153857122,
+      "fazo": 54985366,
+      "baseline": 129554267,
+      "optimizing": 83234717,
+      "peak": 125846247,
+      "interpreter": 153857095,
       "split": {
-        "compile": 1380304,
-        "before_optimized": 3332529,
-        "steady": 75997851
+        "compile": 2139919,
+        "before_optimized": 3360295,
+        "steady": 49485152
       },
-      "luajit": 20850763,
-      "luajit_interpreter": 77252696
+      "luajit": 21132906,
+      "luajit_interpreter": 77252504
     },
     "integer loop": {
       "puc": 480031101,
-      "fazo": 71615279,
-      "baseline": 187540345,
-      "optimizing": 69603522,
-      "peak": 91074541,
-      "interpreter": 408028375,
+      "fazo": 71616836,
+      "baseline": 187541246,
+      "optimizing": 69604316,
+      "peak": 91142621,
+      "interpreter": 408028347,
       "split": {
-        "compile": 1390014,
-        "before_optimized": 2438613,
-        "steady": 67786652
+        "compile": 1391372,
+        "before_optimized": 2439255,
+        "steady": 67786209
       },
-      "luajit": 36060671,
-      "luajit_interpreter": 273019248
+      "luajit": 36059759,
+      "luajit_interpreter": 273019151
     },
     "float loop": {
       "puc": 470060466,
-      "fazo": 33240912,
-      "baseline": 193608219,
-      "optimizing": 30641182,
-      "peak": 36169606,
-      "interpreter": 402051829,
+      "fazo": 33241547,
+      "baseline": 193608859,
+      "optimizing": 30641417,
+      "peak": 36169396,
+      "interpreter": 402051801,
       "split": {
-        "compile": 1574617,
-        "before_optimized": 2747678,
-        "steady": 28918617
+        "compile": 1574927,
+        "before_optimized": 2748023,
+        "steady": 28918597
       },
-      "luajit": 22074698,
-      "luajit_interpreter": 202031009
+      "luajit": 22073239,
+      "luajit_interpreter": 202031176
     },
     "table array": {
       "puc": 187926306,
-      "fazo": 37323759,
-      "baseline": 102045950,
-      "optimizing": 34009472,
-      "peak": 52220351,
-      "interpreter": 167699203,
+      "fazo": 37325666,
+      "baseline": 102046657,
+      "optimizing": 34010229,
+      "peak": 52318831,
+      "interpreter": 167699215,
       "split": {
-        "compile": 2861235,
-        "before_optimized": 5085078,
-        "steady": 29377446
+        "compile": 2862906,
+        "before_optimized": 5086131,
+        "steady": 29376629
       },
-      "luajit": 18492391,
-      "luajit_interpreter": 113805333
+      "luajit": 18491589,
+      "luajit_interpreter": 113805144
     },
     "table hash": {
       "puc": 150726025,
-      "fazo": 91037701,
-      "baseline": 102497654,
-      "optimizing": 91810908,
-      "peak": 145225595,
-      "interpreter": 137981130,
+      "fazo": 90015079,
+      "baseline": 101740091,
+      "optimizing": 90383501,
+      "peak": 143552357,
+      "interpreter": 137981896,
       "split": {
-        "compile": 3543681,
-        "before_optimized": 50093475,
-        "steady": 37400545
+        "compile": 3538837,
+        "before_optimized": 49718270,
+        "steady": 36757972
       },
-      "luajit": 29494700,
-      "luajit_interpreter": 73226155
+      "luajit": 29464941,
+      "luajit_interpreter": 72875563
     },
     "closures": {
       "puc": 189542451,
-      "fazo": 130669681,
-      "baseline": 168558028,
-      "optimizing": 140669103,
-      "peak": 159601049,
-      "interpreter": 174942492,
+      "fazo": 127440134,
+      "baseline": 167371368,
+      "optimizing": 137454004,
+      "peak": 159568382,
+      "interpreter": 174741596,
       "split": {
-        "compile": 2547165,
-        "before_optimized": 6551794,
-        "steady": 121570722
+        "compile": 2563929,
+        "before_optimized": 6621169,
+        "steady": 118255036
       },
-      "luajit": 116158448,
-      "luajit_interpreter": 120586646
+      "luajit": 116133347,
+      "luajit_interpreter": 120593963
     },
     "method calls through __index": {
       "puc": 510224213,
-      "fazo": 27249017,
-      "baseline": 400281856,
-      "optimizing": 450378794,
-      "peak": 515909980,
-      "interpreter": 494034267,
+      "fazo": 27153467,
+      "baseline": 395356298,
+      "optimizing": 436288375,
+      "peak": 502866040,
+      "interpreter": 494184161,
       "split": {
-        "compile": 4672256,
-        "before_optimized": 13378950,
-        "steady": 9197811
+        "compile": 4691411,
+        "before_optimized": 13281144,
+        "steady": 9180912
       },
-      "luajit": 4102932,
-      "luajit_interpreter": 301463878
+      "luajit": 4101843,
+      "luajit_interpreter": 304009936
     },
     "absent metamethods": {
       "puc": 476179139,
-      "fazo": 9264558,
-      "baseline": 385010923,
-      "optimizing": 328852546,
-      "peak": 329848641,
-      "interpreter": 363674469,
+      "fazo": 9150161,
+      "baseline": 370011652,
+      "optimizing": 305452944,
+      "peak": 315022982,
+      "interpreter": 363674319,
       "split": {
-        "compile": 2163064,
-        "before_optimized": 3995198,
-        "steady": 3106296
+        "compile": 2163884,
+        "before_optimized": 3880304,
+        "steady": 3105973
       },
-      "luajit": 2247445,
-      "luajit_interpreter": 135957564
+      "luajit": 2244683,
+      "luajit_interpreter": 135957999
     },
     "coroutine switching": {
       "puc": 498568374,
-      "fazo": 427097091,
-      "baseline": 427097662,
-      "optimizing": 650480165,
-      "peak": 652186308,
-      "interpreter": 416063593,
+      "fazo": 427097149,
+      "baseline": 427097696,
+      "optimizing": 633974220,
+      "peak": 641884990,
+      "interpreter": 416063627,
       "split": {
         "compile": 0,
-        "before_optimized": 427097091,
+        "before_optimized": 427097149,
         "steady": 0
       },
-      "luajit": 198086370,
-      "luajit_interpreter": 156537522
+      "luajit": 198084899,
+      "luajit_interpreter": 156536348
     },
     "strings": {
       "puc": 71362238,
-      "fazo": 67243359,
-      "baseline": 67309572,
-      "optimizing": 65143734,
-      "peak": 74829992,
-      "interpreter": 62613275,
+      "fazo": 66796406,
+      "baseline": 66865785,
+      "optimizing": 64321616,
+      "peak": 74151528,
+      "interpreter": 62611930,
       "split": {
-        "compile": 1463206,
-        "before_optimized": 67243359,
-        "steady": -1463206
+        "compile": 1463599,
+        "before_optimized": 66796406,
+        "steady": -1463599
       },
-      "luajit": 32883201,
-      "luajit_interpreter": 41942209
+      "luajit": 32894464,
+      "luajit_interpreter": 41928128
     },
     "binary-trees": {
       "puc": 452087637,
-      "fazo": 369365329,
-      "baseline": 382352422,
-      "optimizing": 406171937,
-      "peak": 449155555,
-      "interpreter": 379877435,
+      "fazo": 354563714,
+      "baseline": 375198080,
+      "optimizing": 403730699,
+      "peak": 442412713,
+      "interpreter": 380259788,
       "split": {
-        "compile": 2796524,
-        "before_optimized": 7181654,
-        "steady": 359387151
+        "compile": 2804996,
+        "before_optimized": 7078626,
+        "steady": 344680092
       },
-      "luajit": 138081748,
-      "luajit_interpreter": 199712703
+      "luajit": 134601353,
+      "luajit_interpreter": 199636611
     },
     "n-body": {
       "puc": 470903890,
-      "fazo": 74188471,
-      "baseline": 243407999,
-      "optimizing": 83145075,
-      "peak": 282231036,
-      "interpreter": 385557804,
+      "fazo": 73986056,
+      "baseline": 240441292,
+      "optimizing": 82956057,
+      "peak": 282699202,
+      "interpreter": 385557733,
       "split": {
-        "compile": 6341519,
-        "before_optimized": 9662914,
-        "steady": 58184038
+        "compile": 6345203,
+        "before_optimized": 9602665,
+        "steady": 58038188
       },
-      "luajit": 26827200,
-      "luajit_interpreter": 213458089
+      "luajit": 26825856,
+      "luajit_interpreter": 213457343
     },
     "spectral-norm": {
       "puc": 263371091,
-      "fazo": 27923716,
-      "baseline": 146823883,
-      "optimizing": 33189936,
-      "peak": 125280472,
-      "interpreter": 229996725,
+      "fazo": 27940731,
+      "baseline": 147632682,
+      "optimizing": 33127664,
+      "peak": 125599218,
+      "interpreter": 229996848,
       "split": {
-        "compile": 5406114,
-        "before_optimized": 3970178,
-        "steady": 18547424
+        "compile": 5406802,
+        "before_optimized": 3985253,
+        "steady": 18548676
       },
-      "luajit": 8284752,
-      "luajit_interpreter": 115883289
+      "luajit": 8283851,
+      "luajit_interpreter": 115883721
     },
     "fannkuch": {
       "puc": 310512921,
-      "fazo": 119115129,
-      "baseline": 247523608,
-      "optimizing": 110339675,
-      "peak": 244933651,
-      "interpreter": 287311999,
+      "fazo": 119117749,
+      "baseline": 247525006,
+      "optimizing": 110341959,
+      "peak": 243332693,
+      "interpreter": 287311990,
       "split": {
-        "compile": 6775217,
-        "before_optimized": 13655159,
-        "steady": 98684753
+        "compile": 6777260,
+        "before_optimized": 13656647,
+        "steady": 98683842
       },
-      "luajit": 29103442,
-      "luajit_interpreter": 171250164
+      "luajit": 29838975,
+      "luajit_interpreter": 171247752
     },
     "class dispatch": {
       "puc": 301377471,
-      "fazo": 156294017,
-      "baseline": 174120015,
-      "optimizing": 366005644,
-      "peak": 390168123,
-      "interpreter": 247569475,
+      "fazo": 157095664,
+      "baseline": 174923362,
+      "optimizing": 359608980,
+      "peak": 384023616,
+      "interpreter": 247571308,
       "split": {
-        "compile": 3571249,
-        "before_optimized": 14058646,
-        "steady": 138664122
+        "compile": 3582063,
+        "before_optimized": 14105754,
+        "steady": 139407847
       },
-      "luajit": 40824488,
-      "luajit_interpreter": 210080956
+      "luajit": 40822259,
+      "luajit_interpreter": 210080325
     },
     "deltablue": {
       "puc": 513410560,
-      "fazo": 406090640,
-      "baseline": 403374040,
-      "optimizing": 983338210,
-      "peak": 1842735922,
-      "interpreter": 464473729,
+      "fazo": 404086280,
+      "baseline": 401894116,
+      "optimizing": 993608059,
+      "peak": 1849525644,
+      "interpreter": 464461325,
       "split": {
-        "compile": 22506430,
-        "before_optimized": 64394173,
-        "steady": 319190037
+        "compile": 23006562,
+        "before_optimized": 64085856,
+        "steady": 316993862
       },
-      "luajit": 223671439,
-      "luajit_interpreter": 287002090
+      "luajit": 223312059,
+      "luajit_interpreter": 289037997
     },
     "havlak": {
       "puc": 169081516,
-      "fazo": 165736071,
-      "baseline": 165511234,
-      "optimizing": 366991764,
-      "peak": 1359841041,
-      "interpreter": 168011356,
+      "fazo": 164636342,
+      "baseline": 164368699,
+      "optimizing": 371718524,
+      "peak": 1385464364,
+      "interpreter": 167978368,
       "split": {
-        "compile": 11020367,
-        "before_optimized": 96640327,
-        "steady": 58075377
+        "compile": 10981615,
+        "before_optimized": 96049967,
+        "steady": 57604760
       },
-      "luajit": 130082991,
-      "luajit_interpreter": 91712805
+      "luajit": 118593412,
+      "luajit_interpreter": 90450581
     },
     "garbage collector (generational)": {
       "puc": 1792963000,
-      "fazo": 1235735265,
-      "baseline": 1608249978,
-      "optimizing": 1219502247,
-      "peak": 1312203672,
-      "interpreter": 1466774715,
+      "fazo": 1214677402,
+      "baseline": 1598982096,
+      "optimizing": 1195937324,
+      "peak": 1296614471,
+      "interpreter": 1467015283,
       "split": {
-        "compile": 11393975,
-        "before_optimized": 54812542,
-        "steady": 1169528748
+        "compile": 11390471,
+        "before_optimized": 54061436,
+        "steady": 1149225495
       },
       "luajit": null,
       "luajit_interpreter": null,
@@ -496,63 +496,63 @@
     },
     "stats": {
       "puc": 517068523,
-      "fazo": 81112417,
-      "baseline": 296932097,
-      "optimizing": 235514670,
-      "peak": 141216077,
-      "interpreter": 439606262,
+      "fazo": 81146034,
+      "baseline": 298501178,
+      "optimizing": 235289819,
+      "peak": 141192148,
+      "interpreter": 439608677,
       "split": {
-        "compile": 12431361,
-        "before_optimized": 8363233,
-        "steady": 60317823
+        "compile": 12439748,
+        "before_optimized": 8383970,
+        "steady": 60322316
       },
-      "luajit": 34361717,
-      "luajit_interpreter": 287705974
+      "luajit": 34361987,
+      "luajit_interpreter": 287711009
     },
     "dialogue (interpreted)": {
       "puc": 467260922,
-      "fazo": 272775233,
-      "baseline": 327818653,
-      "optimizing": 303044015,
-      "peak": 408317360,
-      "interpreter": 399374700,
+      "fazo": 269021571,
+      "baseline": 325552323,
+      "optimizing": 297842862,
+      "peak": 404011074,
+      "interpreter": 399392908,
       "split": {
-        "compile": 6078493,
-        "before_optimized": 11104252,
-        "steady": 255592488
+        "compile": 6089330,
+        "before_optimized": 11079169,
+        "steady": 251853072
       },
-      "luajit": 135084537,
-      "luajit_interpreter": 264277577
+      "luajit": 135082698,
+      "luajit_interpreter": 264276889
     },
     "dialogue (compiled with load)": {
       "puc": 1752306868,
-      "fazo": 1562437132,
-      "baseline": 1617537072,
-      "optimizing": 2755690093,
-      "peak": 10838050300,
-      "interpreter": 1623034444,
+      "fazo": 1551501862,
+      "baseline": 1608192340,
+      "optimizing": 2741381019,
+      "peak": 10821757045,
+      "interpreter": 1623384607,
       "split": {
-        "compile": 5665170,
-        "before_optimized": 11104188,
-        "steady": 1545667774
+        "compile": 5669630,
+        "before_optimized": 11079182,
+        "steady": 1534753050
       },
-      "luajit": 931551278,
-      "luajit_interpreter": 1023794978
+      "luajit": 932691335,
+      "luajit_interpreter": 1024194787
     },
     "frame": {
       "puc": 2038314512,
-      "fazo": 534189547,
-      "baseline": 940573286,
-      "optimizing": 2255917575,
-      "peak": 2286686314,
-      "interpreter": 1608398556,
+      "fazo": 535635708,
+      "baseline": 944148355,
+      "optimizing": 2237352973,
+      "peak": 2266749537,
+      "interpreter": 1608398662,
       "split": {
-        "compile": 15450201,
-        "before_optimized": 9164132,
-        "steady": 509575214
+        "compile": 15447576,
+        "before_optimized": 9177659,
+        "steady": 511010473
       },
-      "luajit": 170938846,
-      "luajit_interpreter": 1226369160
+      "luajit": 170939420,
+      "luajit_interpreter": 1226370950
     }
   },
   "operations": {
@@ -579,61 +579,61 @@
       "fazo": 34.0,
       "baseline": 12.6,
       "optimizing": -1.3,
-      "peak": 1.8,
+      "peak": 1.9,
       "luajit": 1.0,
       "budget": 41.0
     },
     "call0": {
       "puc": 157.0,
       "fazo": 153.0,
-      "baseline": 166.1,
-      "optimizing": 74.7,
-      "peak": 135.7,
+      "baseline": 168.1,
+      "optimizing": 74.6,
+      "peak": 140.3,
       "luajit": 0.0,
       "budget": 157.0
     },
     "call1": {
       "puc": 215.0,
       "fazo": 196.0,
-      "baseline": 178.8,
-      "optimizing": 85.3,
-      "peak": 147.4,
+      "baseline": 180.8,
+      "optimizing": 85.1,
+      "peak": 149.9,
       "luajit": 0.1,
       "budget": 215.0
     },
     "call2": {
       "puc": 273.0,
       "fazo": 240.0,
-      "baseline": 191.3,
-      "optimizing": 107.2,
-      "peak": 160.6,
+      "baseline": 193.3,
+      "optimizing": 107.0,
+      "peak": 164.7,
       "luajit": 1.1,
       "budget": 273.0
     },
     "callnative": {
       "puc": 262.0,
       "fazo": 213.0,
-      "baseline": 311.7,
-      "optimizing": 335.7,
-      "peak": 331.2,
+      "baseline": 286.7,
+      "optimizing": 296.7,
+      "peak": 306.6,
       "luajit": 0.1,
       "budget": 262.0
     },
     "callplain": {
       "puc": 405.0,
       "fazo": 289.0,
-      "baseline": 387.7,
-      "optimizing": 415.8,
-      "peak": 409.9,
+      "baseline": 362.7,
+      "optimizing": 376.8,
+      "peak": 385.5,
       "luajit": 0.1,
       "budget": 405.0
     },
     "closure": {
       "puc": 429.7,
       "fazo": 255.3,
-      "baseline": 329.3,
-      "optimizing": 345.3,
-      "peak": 334.0,
+      "baseline": 310.3,
+      "optimizing": 313.3,
+      "peak": 315.0,
       "luajit": 356.9,
       "budget": 429.7
     },
@@ -641,8 +641,8 @@
       "puc": 402.0,
       "fazo": 346.0,
       "baseline": 349.0,
-      "optimizing": 551.7,
-      "peak": 544.8,
+      "optimizing": 519.7,
+      "peak": 516.8,
       "luajit": 0.1,
       "budget": 402.0
     },
@@ -651,7 +651,7 @@
       "fazo": 29.0,
       "baseline": 7.6,
       "optimizing": 4.1,
-      "peak": 3.4,
+      "peak": 3.5,
       "luajit": 0.0,
       "budget": 36.0
     },
@@ -660,7 +660,7 @@
       "fazo": 48.0,
       "baseline": 24.9,
       "optimizing": 19.5,
-      "peak": 31.3,
+      "peak": 31.4,
       "luajit": 10.2,
       "budget": 61.0
     },
@@ -704,8 +704,8 @@
       "puc": 91.0,
       "fazo": 77.0,
       "baseline": 193.5,
-      "optimizing": 105.0,
-      "peak": 103.2,
+      "optimizing": 103.0,
+      "peak": 101.2,
       "luajit": 0.0,
       "budget": 91.0
     },
@@ -739,9 +739,9 @@
     "method": {
       "puc": 257.0,
       "fazo": 238.0,
-      "baseline": 204.0,
-      "optimizing": 5.7,
-      "peak": 7.4,
+      "baseline": 206.1,
+      "optimizing": 5.6,
+      "peak": 7.2,
       "luajit": 0.1,
       "budget": 257.0
     },
@@ -750,7 +750,7 @@
       "fazo": 45.0,
       "baseline": 16.6,
       "optimizing": 10.7,
-      "peak": 20.4,
+      "peak": 20.5,
       "luajit": 5.1,
       "budget": 52.0
     },
@@ -774,10 +774,10 @@
     },
     "newtable": {
       "puc": 440.3,
-      "fazo": 355.7,
-      "baseline": 408.1,
-      "optimizing": 87.2,
-      "peak": 167.5,
+      "fazo": 357.7,
+      "baseline": 391.1,
+      "optimizing": 79.6,
+      "peak": 155.1,
       "luajit": 0.1,
       "budget": 440.3
     },
@@ -829,18 +829,18 @@
     "tailcall": {
       "puc": 399.0,
       "fazo": 362.0,
-      "baseline": 362.5,
-      "optimizing": 190.8,
-      "peak": 734.1,
+      "baseline": 366.5,
+      "optimizing": 190.7,
+      "peak": 723.4,
       "luajit": 0.1,
       "budget": 399.0
     },
     "vararg": {
       "puc": 456.0,
       "fazo": 422.0,
-      "baseline": 1056.6,
-      "optimizing": 973.5,
-      "peak": 973.2,
+      "baseline": 1013.7,
+      "optimizing": 910.6,
+      "peak": 922.5,
       "luajit": 0.1,
       "budget": 456.0
     },
@@ -856,10 +856,10 @@
   },
   "compile_cost": {
     "statements": 500,
-    "peak_per_bytecode": 102836.4,
-    "optimizing_per_bytecode": 10127.5,
-    "luajit_per_bytecode": 8382.3,
-    "peak_per_statement": 411345.8,
-    "luajit_per_statement": 25147.0
+    "peak_per_bytecode": 102940.8,
+    "optimizing_per_bytecode": 10125.9,
+    "luajit_per_bytecode": 7719.2,
+    "peak_per_statement": 411763.3,
+    "luajit_per_statement": 23157.7
   }
 }

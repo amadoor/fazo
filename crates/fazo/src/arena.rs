@@ -257,7 +257,7 @@ impl<T: Default> Arena<T, Pinned<T>> {
 
 impl<T, S: Slots<T>> Arena<T, S> {
     #[inline(always)]
-    pub(crate) fn insert_marked(&mut self, object: T, marks: u8) -> Ref<T> {
+    pub(crate) fn insert_marked(&mut self, object: T, marks: u8, moves: &mut u64) -> Ref<T> {
         match self.free.pop() {
             Some(index) => {
                 let slot = index as usize;
@@ -265,29 +265,38 @@ impl<T, S: Slots<T>> Arena<T, S> {
                 self.marks[slot] = marks;
                 Ref::new(index, self.generations[slot])
             }
-            None => self.push_marked(object, marks),
+            None => self.push_marked(object, marks, moves),
         }
     }
 
     #[inline(always)]
-    fn push_marked(&mut self, object: T, marks: u8) -> Ref<T> {
+    fn push_marked(&mut self, object: T, marks: u8, moves: &mut u64) -> Ref<T> {
         let index = u32::try_from(self.objects.len()).expect("arena index overflow");
         self.objects.push(object);
         self.generations.push(0);
         self.marks.push(marks);
-        self.reserve_free_list();
+        self.reserve_free_list(moves);
         Ref::new(index, 0)
     }
 
     /// Keeps room in the free list for every slot, so a sweep never grows it.
     #[inline(always)]
-    fn reserve_free_list(&mut self) {
-        let slots = self.objects.capacity();
-        if self.free.capacity() >= slots {
+    fn reserve_free_list(&mut self, moves: &mut u64) {
+        if self.free.capacity() >= self.objects.capacity() {
             return;
         }
+        self.grown(moves);
+    }
+
+    /// The marks keep the objects' capacity, so both move only here.
+    #[cold]
+    #[inline(never)]
+    fn grown(&mut self, moves: &mut u64) {
+        let slots = self.objects.capacity();
         debug_assert!(self.free.is_empty(), "an arena grows only when no slot is free");
         self.free = Vec::with_capacity(slots);
+        self.marks.reserve_exact(slots - self.marks.len());
+        *moves += 1;
     }
 
     pub fn get(&self, reference: Ref<T>) -> &T {
@@ -463,18 +472,18 @@ mod tests {
     #[test]
     fn a_slot_whose_next_generation_would_be_the_retired_one_is_never_reused() {
         let mut arena: Arena<u8> = Arena::default();
-        arena.insert_marked(1, 0);
+        arena.insert_marked(1, 0, &mut 0);
         arena.generations[0] = u32::MAX - 2;
         let stale = Ref::new(0, u32::MAX - 2);
         assert_eq!(arena.release_with(stale, |value| *value), Some(1));
 
-        let last = arena.insert_marked(2, 0);
+        let last = arena.insert_marked(2, 0, &mut 0);
         assert_eq!(last, Ref::new(0, u32::MAX - 1));
         assert_eq!(arena.release_with(last, |value| *value), Some(2));
 
         assert!(arena.try_get(last).is_none());
         assert!(arena.try_get(stale).is_none());
-        let fresh = arena.insert_marked(3, 0);
+        let fresh = arena.insert_marked(3, 0, &mut 0);
         assert_ne!(fresh.index(), 0);
         assert_eq!(arena.try_get(fresh), Some(&3));
         assert!(arena.try_get(last).is_none());
