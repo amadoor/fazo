@@ -117,6 +117,7 @@ fn keys() -> Vec<Key> {
         keys.push(Key::HashSet { constant_value: constant });
     }
     keys.push(Key::HashGet);
+    keys.push(Key::ConstantKeyGet);
     keys
 }
 

@@ -1939,7 +1939,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         }
         let zero = self.iconst(types::I64, 0);
         let settled = self.iconst(types::I32, 0);
-        self.builder.ins().stack_store(self.pointer, zero, context, offset_of!(JitCtx, parent) as i32);
+        self.builder.ins().stack_store(self.pointer, self.ctx, context, offset_of!(JitCtx, parent) as i32);
         self.builder.ins().stack_store(self.pointer, zero, context, offset_of!(JitCtx, child) as i32);
         self.builder.ins().stack_store(self.pointer, settled, context, offset_of!(JitCtx, pending) as i32);
     }

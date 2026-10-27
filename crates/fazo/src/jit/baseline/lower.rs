@@ -650,6 +650,9 @@ impl<'a> Emitter<'a> {
         let which = if upvalue { FAST_GET_TABUP } else { FAST_GET_FIELD };
         let args = [i64::from(a), i64::from(b), i64::from(c)];
         let entries: Vec<_> = field_entries(self.proto, pc).into_iter().filter(|entry| entry.slot == ABSENT || entry.slot <= MAX_SLOT).collect();
+        if upvalue && entries.is_empty() && self.library.has_tables() && self.facts.inline_caches && self.string_constant(usize::from(c)) {
+            return self.constant_key_get(pc, (a, b, c), which);
+        }
         if !self.library.has_tables() || !self.facts.inline_caches || entries.is_empty() {
             return self.fast(pc, which, args, Some(pc + 1));
         }
@@ -663,6 +666,18 @@ impl<'a> Emitter<'a> {
             self.put(false, Key::FieldGet { absent, method: false }, &vals, &labels);
         }
         self.put(false, Key::Jump, &values(&[]), &labels);
+    }
+
+    /// An `_ENV` that holds more keys than a shape takes is probed by hash, as the interpreter's `luaH_getshortstr`.
+    fn constant_key_get(&mut self, pc: usize, (a, b, c): (u8, u8, u8), which: usize) {
+        let slow = self.cold_fast(pc, which, [i64::from(a), i64::from(b), i64::from(c)], Some(pc + 1));
+        let labels = self.with(pc, &[(ext::SLOW, slow)]);
+        self.put(false, Key::UpvalueTable, &values(&[(slot::B, crate::jit::layout::upvalue::cell(b))]), &labels);
+        self.put(false, Key::ConstantKeyGet, &values(&[(slot::A, offset(a)), (slot::K, i64::from(c) * VALUE)]), &labels);
+    }
+
+    fn string_constant(&self, index: usize) -> bool {
+        self.constant_ok(index) && matches!(self.proto.constants[index], crate::value::Value::String(_))
     }
 
     fn get_method(&mut self, pc: usize, a: u8, b: u8, c: u8) {

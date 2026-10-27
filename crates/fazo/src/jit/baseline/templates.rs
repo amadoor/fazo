@@ -128,6 +128,7 @@ pub(crate) enum Key {
     FieldSet { constant: bool },
     FieldAdd { constant: bool },
     HashGet,
+    ConstantKeyGet,
     HashSet { constant_value: bool },
     MethodStart,
     MethodHop,
@@ -150,7 +151,7 @@ pub(crate) enum Key {
     TailEnter { upvalues: bool },
 }
 
-pub(crate) const KEY_COUNT: usize = 284;
+pub(crate) const KEY_COUNT: usize = 285;
 const HELPER_SLOTS: u8 = 19;
 
 impl Key {
@@ -197,6 +198,7 @@ impl Key {
             Key::CallAnyCheck => 280,
             Key::CallAnyEnter => 281,
             Key::ReturnWide => 282,
+            Key::ConstantKeyGet => 284,
             Key::EqTag(tag) => 28 + tag as usize,
             Key::ArrayGet { constant_key } => 31 + usize::from(constant_key),
             Key::ArraySet { constant_key, constant_value } => 33 + 2 * usize::from(constant_key) + usize::from(constant_value),
@@ -282,6 +284,7 @@ pub(crate) fn build(key: Key, m: &mut dyn Masm, env: &Env) {
         Key::FieldSet { constant } => field_set(m, env, constant),
         Key::FieldAdd { constant } => field_add(m, env, constant),
         Key::HashGet => hash_get(m, env),
+        Key::ConstantKeyGet => constant_key_get(m, env),
         Key::HashSet { constant_value } => hash_set(m, env, constant_value),
         Key::GetUpval => get_upval(m),
         Key::SetUpval => set_upval(m),
@@ -708,9 +711,10 @@ const REFRESHED: [usize; 3] = [
     offset_of!(JitCtx, closures),
 ];
 
+/// The callee's context names this frame as `parent`, so a refresh deeper in the nest reaches the compiled callers above it.
 fn nest_links(m: &mut dyn Masm, area_base: Reg, area: i32) {
     let at = |offset: usize| fixed(i64::from(area) + offset as i64);
-    m.store_imm(Width::U64, area_base, at(offset_of!(JitCtx, parent)), 0);
+    m.store(Width::U64, Reg::Ctx, area_base, at(offset_of!(JitCtx, parent)));
     m.store_imm(Width::U64, area_base, at(offset_of!(JitCtx, child)), 0);
     m.store_imm(Width::U32, area_base, at(offset_of!(JitCtx, pending)), 0);
 }
@@ -1462,18 +1466,23 @@ fn field_add(m: &mut dyn Masm, env: &Env, constant: bool) {
 }
 
 fn find_string_node(m: &mut dyn Masm, env: &Env, (table, key): (u8, u8), missing: Target) {
-    let layout = layout(env);
-    let walk = m.new_label();
-    let follow = m.new_label();
-    let found = m.new_label();
     m.load(Width::U8, Reg::T1, Reg::Base, reg(key));
     m.cmp_imm(Reg::T1, STRING);
     m.branch(Cond::Ne, slow());
     table_in_register(m, env, table);
+    probe_string_key(m, env, (Reg::Base, key), missing);
+}
+
+/// Walks the hash chain of the table in `T0` for the string key held at `key` from `source`; leaves the node in `T5`.
+fn probe_string_key(m: &mut dyn Masm, env: &Env, (source, key): (Reg, u8), missing: Target) {
+    let layout = layout(env);
+    let walk = m.new_label();
+    let follow = m.new_label();
+    let found = m.new_label();
     m.load(Width::U8, Reg::T1, Reg::T0, fixed(i64::from(layout.shaped)));
     m.cmp_imm(Reg::T1, 0);
     m.branch(Cond::Ne, slow());
-    m.load(Width::U32, Reg::T4, Reg::Base, payload(key));
+    m.load(Width::U32, Reg::T4, source, payload(key));
     m.shl_imm(Reg::T4, 4);
     m.load(Width::U64, Reg::T5, Reg::Ctx, context(offset_of!(JitCtx, vm)));
     m.load(Width::U64, Reg::T5, Reg::T5, fixed(i64::from(layout.string_keys)));
@@ -1485,7 +1494,7 @@ fn find_string_node(m: &mut dyn Masm, env: &Env, (table, key): (u8, u8), missing
     m.alu_imm(Alu::Sub, Reg::T2, 1);
     m.load(Width::U64, Reg::T1, Reg::T5, fixed(STRING_KEY_HASH));
     m.alu(Alu::And, Reg::T1, Reg::T2);
-    m.load(Width::U64, Reg::T3, Reg::Base, payload(key));
+    m.load(Width::U64, Reg::T3, source, payload(key));
     m.load(Width::U64, Reg::T2, Reg::T0, fixed(i64::from(layout.nodes)));
     m.bind(walk);
     node_address(m);
@@ -1516,9 +1525,20 @@ fn node_address(m: &mut dyn Masm) {
 }
 
 fn hash_get(m: &mut dyn Masm, env: &Env) {
-    let layout = layout(env);
     let missing = m.new_label();
     find_string_node(m, env, (slot::B, slot::C), missing);
+    node_value_or_nil(m, env, missing);
+}
+
+/// After `UpvalueTable`: a constant string key read from an unshaped table, such as a global from `_ENV`.
+fn constant_key_get(m: &mut dyn Masm, env: &Env) {
+    let missing = m.new_label();
+    probe_string_key(m, env, (Reg::Konst, slot::K), missing);
+    node_value_or_nil(m, env, missing);
+}
+
+fn node_value_or_nil(m: &mut dyn Masm, env: &Env, missing: Target) {
+    let layout = layout(env);
     m.load(Width::U64, Reg::T1, Reg::T5, fixed(NODE_VALUE));
     m.load(Width::U64, Reg::T3, Reg::T5, fixed(NODE_VALUE + i64::from(PAYLOAD)));
     m.mov(Reg::T4, Reg::T1);

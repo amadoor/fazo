@@ -30,7 +30,7 @@ const MOVE_GAIN: i64 = 4;
 const UPVALUE_GAIN: i64 = 7;
 const COMPARE_GAIN: i64 = 8;
 const STORE_GAIN: i64 = 16;
-const GLOBAL_GAIN: i64 = 30;
+const GLOBAL_GAIN: i64 = 50;
 const LEN_GAIN: i64 = 90;
 const LOAD_GAIN: i64 = 6;
 /// Only an empty constructor allocates inline.
@@ -53,8 +53,10 @@ const TAIL_CALL_COST: i64 = 1000;
 const DIRECT_TAIL_CALL_GAIN: i64 = 50;
 /// Inlining saves Baseline's call and return.
 const INLINED_CALL_GAIN: i64 = 170;
-/// An inlined builtin saves Baseline's native call.
-const BUILTIN_GAIN: i64 = 250;
+/// An inlined builtin saves Baseline's native call; `setmetatable` keeps its runtime call.
+const BUILTIN_GAIN: i64 = 440;
+const SET_METATABLE_GAIN: i64 = 230;
+const SQRT_GAIN: i64 = 250;
 /// Matches `passes::inline::Policy` so the estimate inlines what the builder will.
 const INLINE_DEPTH: usize = 3;
 /// Matches the builder's limit on callees inlined at one site.
@@ -218,7 +220,7 @@ fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Loo
         _ => return None,
     };
     if let LuaValue::Native(native) = callee.value {
-        return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|_| (BUILTIN_GAIN, [0; CLASSES], 0));
+        return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|builtin| (builtin_gain(builtin), [0; CLASSES], 0));
     }
     inlined_gain(callee, instruction, lookup, depth)
 }
@@ -276,6 +278,14 @@ fn inlined_gain(callee: &crate::vm::ic::Callee, instruction: Instruction, lookup
         over_optimizing += site_over;
     }
     Some((gain, sizes, over_optimizing))
+}
+
+fn builtin_gain(builtin: Builtin) -> i64 {
+    match builtin {
+        Builtin::SetMetatable => SET_METATABLE_GAIN,
+        Builtin::Sqrt => SQRT_GAIN,
+        _ => BUILTIN_GAIN,
+    }
 }
 
 fn inlined_builtin(builtin: Builtin) -> bool {
