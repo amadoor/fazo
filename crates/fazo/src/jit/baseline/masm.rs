@@ -1,5 +1,5 @@
 //! Macro assembler the Baseline templates are written against, modeled on V8's `BaselineAssembler`. Operations are
-//! implemented once per architecture over asmkit; per-instruction operands are holes that each compile fills.
+//! implemented once per architecture; per-instruction operands are holes that each compile fills.
 
 /// `Ctx` holds the `JitCtx` pointer; temporaries do not survive a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub(crate) enum Width {
 }
 
 impl Width {
+    #[cfg_attr(all(target_arch = "x86_64", not(test)), expect(dead_code, reason = "only AArch64 templates use it"))]
     pub(crate) fn bytes(self) -> u32 {
         match self {
             Self::U8 => 1,

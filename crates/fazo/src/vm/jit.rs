@@ -208,6 +208,7 @@ impl Vm {
         function.jit.primed = false;
         function.jit.prepared = false;
         function.jit.entry().set(0);
+        function.jit.vararg_entry().set(0);
         function.jit.budget().set(0);
         function.jit.tier_budget().set(i64::MAX);
     }
@@ -348,6 +349,9 @@ impl Vm {
         function.jit.hidden = false;
         let entry = function.jit.code().filter(|_| !function.is_vararg).map_or(0, |code| code as usize);
         function.jit.entry().set(entry);
+        let hides_arguments = function.is_vararg && !function.vararg_table;
+        let vararg_entry = function.jit.code_at(VARARG_BODY).filter(|_| hides_arguments).map_or(0, |code| code as usize);
+        function.jit.vararg_entry().set(vararg_entry);
     }
 
     fn jit_code_budget(&mut self) -> Arc<crate::jit::CodeBudget> {
@@ -388,8 +392,7 @@ impl Vm {
         let budget = self.jit_code_budget();
         let layout = *self.jit.layout.get_or_insert_with(crate::jit::TableLayout::probe);
         let interned = self.jit_interned_constants(proto);
-        let declines = self.heap.protos.live(proto).jit.declines;
-        let peak_wait = if charges { crate::JitPolicy::backed_off(self.jit_peak_budget(proto, Tier::Baseline), declines) } else { i64::MAX };
+        let peak_wait = if charges { self.jit_baseline_wait(proto) } else { i64::MAX };
         let inline_caches = !self.options.jit_stress.inline_caches_off;
         let frames = *self.jit.frames.get_or_insert_with(crate::jit::FrameLayout::probe);
         let calls = self.jit_call_targets(proto);
@@ -415,6 +418,21 @@ impl Vm {
         };
         let library = self.jit.library.get_or_insert_with(|| Box::new(crate::jit::baseline::Library::new(layout, frames)));
         crate::jit::baseline::compile(library, budget, function, &facts)
+    }
+
+    /// A recompile keeps the work already done toward the next tier: V8 keeps the interrupt budget across feedback changes and
+    /// only raises it to `minimum_invocations_after_ic_update` (src/execution/tiering-manager.cc `NotifyICChanged`).
+    fn jit_baseline_wait(&mut self, proto: Ref<Proto>) -> i64 {
+        let policy = self.options.jit_policy;
+        let divisor = self.options.jit_stress.threshold_divisor;
+        let declines = self.heap.protos.live(proto).jit.declines;
+        let needed = crate::JitPolicy::backed_off(self.jit_peak_budget(proto, Tier::Baseline), declines);
+        let executed = self.jit_executed(proto) / i64::from(divisor.max(1));
+        if executed <= 0 {
+            return needed;
+        }
+        let after_change = policy.baseline.budget(self.heap.protos.live(proto).code.len(), divisor);
+        needed.saturating_sub(executed).max(after_change)
     }
 
     /// Keeps the child shapes alive so compiled code can move tables into them without checking they exist; a dead one is revived first, as `Heap::take_transition` does.
@@ -476,9 +494,15 @@ impl Vm {
             return;
         }
         let soon = crate::JitPolicy::backed_off(policy.baseline.budget(function.code.len(), divisor), function.jit.recompiles);
-        if function.jit.tier_budget().get() > soon {
-            function.jit.tier_budget().set(soon);
+        let unspent = function.jit.tier_budget().get();
+        if unspent <= soon {
+            return;
         }
+        if unspent != i64::MAX {
+            let dropped = (unspent - soon).saturating_mul(i64::from(divisor.max(1)));
+            function.jit.peak_executed = function.jit.peak_executed.saturating_sub(dropped);
+        }
+        function.jit.tier_budget().set(soon);
     }
 
     fn jit_compile_peak(&mut self, proto: Ref<Proto>) -> bool {
@@ -788,11 +812,24 @@ impl Vm {
 
     fn jit_peak_wait(&mut self, proto: Ref<Proto>, wait: i64) {
         let divisor = i64::from(self.options.jit_stress.threshold_divisor.max(1));
+        let executed = self.jit_executed(proto);
         let function = self.heap.protos.live_mut(proto);
         if wait != i64::MAX {
-            function.jit.peak_executed = function.jit.peak_executed.saturating_add(wait.saturating_mul(divisor));
+            function.jit.peak_executed = executed.saturating_add(wait.saturating_mul(divisor));
         }
         function.jit.tier_budget().set(wait);
+    }
+
+    /// The work done toward the next tier: the budgets handed out less what is left of the current one.
+    fn jit_executed(&mut self, proto: Ref<Proto>) -> i64 {
+        let divisor = i64::from(self.options.jit_stress.threshold_divisor.max(1));
+        let function = self.heap.protos.live_mut(proto);
+        let unspent = function.jit.tier_budget().get();
+        if unspent > 0 && unspent != i64::MAX {
+            function.jit.peak_executed = function.jit.peak_executed.saturating_sub(unspent.saturating_mul(divisor));
+            function.jit.tier_budget().set(0);
+        }
+        function.jit.peak_executed
     }
 
     /// Waits until the estimated savings would have paid for the compile. A prototype that saves nothing waits for new feedback, which recompiles Baseline and hands out a fresh budget.
@@ -996,6 +1033,7 @@ impl Vm {
         let function = self.heap.protos.live_mut(proto);
         function.jit.set_asides += 1;
         function.jit.entry().set(0);
+        function.jit.vararg_entry().set(0);
         if function.jit.set_asides > policy.recompile_limit {
             function.jit.failed = true;
             function.jit.budget().set(i64::MAX);
@@ -1023,6 +1061,7 @@ impl Vm {
         let function = self.heap.protos.live_mut(proto);
         function.jit.failed = true;
         function.jit.entry().set(0);
+        function.jit.vararg_entry().set(0);
         function.jit.budget().set(i64::MAX);
         false
     }
@@ -1954,7 +1993,10 @@ impl Vm {
         if let Some(point) = caller.inline_point() {
             self.jit_push_inlined_frames(caller, point);
         }
-        let called = crate::object::LuaFrame::called(ctx.closure, ctx.base, ctx.direct_results, 0);
+        let mut called = crate::object::LuaFrame::called(ctx.closure, ctx.base, ctx.direct_results, 0);
+        if let Some((params, extra)) = self.jit_hidden_arguments(ctx) {
+            called.set_hidden(params, extra);
+        }
         let mut frame = if ctx.pending & crate::jit::PENDING_TAIL != 0 { crate::object::LuaFrame::with_status(ctx.closure, ctx.base, called.status() | frame_status::TAIL) } else { called };
         if let Some(pc) = pc {
             frame.set_pc(pc as usize);
@@ -1963,6 +2005,17 @@ impl Vm {
         frames.push(crate::object::Frame::Lua(frame));
         ctx.pending = 0;
         ctx.frame_index = frames.len() as u32 - 1;
+    }
+
+    /// A direct call into a vararg prototype hid the arguments below the frame, and its results go past them: `ret_offset`
+    /// counts the hidden slots, the copied function and the fixed parameters (ltm.c `buildhiddenargs`).
+    fn jit_hidden_arguments(&self, ctx: &JitCtx) -> Option<(u8, usize)> {
+        let function = self.heap.protos.live(ctx.proto);
+        if !function.is_vararg || ctx.ret_offset == -(std::mem::size_of::<Value>() as i64) {
+            return None;
+        }
+        let total = (-ctx.ret_offset) as usize / std::mem::size_of::<Value>() - 2;
+        Some((function.num_params, total - usize::from(function.num_params)))
     }
 
     fn jit_thread_object(&mut self) -> *mut crate::object::Thread {
@@ -2136,17 +2189,19 @@ fn call_target(heap: &crate::heap::Heap, caller: Ref<Proto>, callee: super::ic::
         return None;
     };
     let function = heap.protos.try_get(proto)?;
-    if function.is_vararg {
+    if function.vararg_table {
         return None;
     }
+    let entry = if function.is_vararg { function.jit.vararg_entry() } else { function.jit.entry() };
     Some(crate::jit::CallTarget {
         closure: closure.packed(),
         proto: proto.packed(),
-        entry: std::ptr::from_ref(function.jit.entry()),
+        entry: std::ptr::from_ref(entry),
+        vararg: function.is_vararg,
         constants: function.constants.as_ptr(),
         num_params: function.num_params,
         max_stack: function.max_stack,
         has_upvalues: !function.upvalues.is_empty(),
-        pushes_frame: (function.jit.unit.is_none() && proto != caller) || crate::jit::sites::needs_frame(function),
+        pushes_frame: (function.jit.unit.is_none() && proto != caller) || function.is_vararg || crate::jit::sites::needs_frame(function),
     })
 }

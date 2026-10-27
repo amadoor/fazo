@@ -68,6 +68,8 @@ impl<A: Asm> Gen<'_, A> {
             self.settled = Some((pc as u32 + 1, label));
         }
         self.save(&saves);
+        let mut targets = targets;
+        targets.retain(|target| !target.vararg || c != 0);
         let unknown = targets.is_empty() && self.env.unknown_calls.get(pc).copied().unwrap_or(false);
         if b != 0 && (unknown || !targets.is_empty()) {
             let site = Site { pc, slot: u32::from(a), b, c, inlined: None };
@@ -84,7 +86,8 @@ impl<A: Asm> Gen<'_, A> {
     /// A call from an inlined frame takes no helper: its slow path resumes the call in the interpreter.
     pub(super) fn call_inlined(&mut self, value: Val, index: usize) {
         let call = self.func.inlined_calls[index];
-        let (targets, unknown) = self.env.inlined_targets.get(index).cloned().unwrap_or_default();
+        let (mut targets, unknown) = self.env.inlined_targets.get(index).cloned().unwrap_or_default();
+        targets.retain(|target| !target.vararg);
         let frames = self.func.state(call.resume).frames.len() as u32;
         let out = self.out(value);
         let temps = self.temps();
@@ -154,6 +157,7 @@ impl<A: Asm> Gen<'_, A> {
         let Site { pc, slot: function, b, c, inlined } = site;
         let arguments = u32::from(b) - 1;
         let wanted = i64::from(c) - 1;
+        let hidden = hidden_slots(callee, arguments);
         let callee_offset = (function as i32 + 1) * VALUE_SIZE;
         let slot = self.ctx_at;
         let popped = self.asm.new_label();
@@ -162,19 +166,31 @@ impl<A: Asm> Gen<'_, A> {
         self.load_entry(callee, t, helper);
         self.stack_check(t, helper);
         self.ctx_load(t.callee_base, offset_of!(JitCtx, base));
-        self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, function as i32 + 1);
+        self.asm.alu_imm(Alu::Add, t.callee_base, t.callee_base, (function + 1 + hidden) as i32);
         self.check_stack_room(callee, arguments, t, helper);
         self.clear_missing_parameters(callee, arguments, callee_offset, t);
+        if let Callee::Known(target) = callee
+            && target.vararg
+        {
+            self.hide_arguments(target, (function, hidden), t);
+        }
         let saved = if inlined.is_some() { i64::from(crate::jit::INLINED_CALL) } else { pc as i64 + 1 };
         self.asm.store_imm(Width::W, A::CTX, offset_of!(JitCtx, saved_pc) as i32, saved);
-        self.fill_callee_context(callee, t, (callee_offset, wanted));
-        if inlined.is_none() && matches!(callee, Callee::Known(target) if target.pushes_frame) {
-            self.push_callee_frame(pc, t, wanted);
+        self.fill_callee_context(callee, t, (callee_offset + hidden as i32 * VALUE_SIZE, wanted));
+        if self.calls_vararg {
+            let ret_offset = -i64::from(VALUE_SIZE) * (1 + i64::from(hidden));
+            self.asm.store_imm(Width::Q, A::SP, slot + offset_of!(JitCtx, ret_offset) as i32, ret_offset);
+        }
+        if inlined.is_none()
+            && let Callee::Known(target) = callee
+            && target.pushes_frame
+        {
+            self.push_callee_frame(pc, t, (wanted, target), hidden);
         }
 
         self.asm.mov(A::SCRATCH, t.entry);
         self.arg_address(0, slot);
-        self.place_arg(1, Src::I(0));
+        self.place_arg(1, Src::I(i64::from(hidden != 0)));
         self.asm.call_reg(A::SCRATCH);
         self.asm.mov(A::SCRATCH, A::result());
         self.asm.cmp_imm(A::SCRATCH, crate::jit::EXIT_RETURNED as i32);
@@ -205,12 +221,33 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.jump(join);
     }
 
+    /// Follows ltm.c `buildhiddenargs`: the function and fixed parameters move past the arguments, the originals and the
+    /// vararg parameter become nil, and the frame starts after the copies.
+    fn hide_arguments(&mut self, target: &CallTarget, (function, hidden): (u32, u32), t: Temps) {
+        let params = u32::from(target.num_params);
+        let at = |slot: u32| slot as i32 * VALUE_SIZE;
+        self.registers(A::SCRATCH);
+        for index in 0..=params {
+            let from = function + index;
+            for half in [0, PAYLOAD] {
+                self.asm.load(Width::Q, t.count, A::SCRATCH, at(from) + half);
+                self.asm.store(Width::Q, t.count, A::SCRATCH, at(from + hidden) + half);
+            }
+        }
+        for index in 1..=params {
+            self.asm.store_imm(Width::B, A::SCRATCH, at(function + index), 0);
+        }
+        self.asm.store_imm(Width::B, A::SCRATCH, at(function + hidden + params + 1), 0);
+    }
+
     /// Pushes the heap frame now, as the callee's first helper would; a pending caller or full frame vector stays lazy.
-    fn push_callee_frame(&mut self, pc: usize, t: Temps, wanted: i64) {
+    fn push_callee_frame(&mut self, pc: usize, t: Temps, (wanted, target): (i64, &CallTarget), hidden: u32) {
         let frames = self.env.frames;
         let slot = self.ctx_at;
         let lazy = self.asm.new_label();
-        let status = i64::from(crate::object::LuaFrame::call_status(wanted as i32, 0)) << lua_frame::STATUS_SHIFT;
+        let hidden_params = if target.vararg { (u32::from(target.num_params) + 1) << crate::object::status::HIDDEN_SHIFT } else { 0 };
+        let status = i64::from(crate::object::LuaFrame::call_status(wanted as i32, 0) | hidden_params) << lua_frame::STATUS_SHIFT;
+        let extra = if target.vararg { i64::from(hidden) - 1 - i64::from(target.num_params) } else { 0 };
 
         self.asm.cmp_mem_byte(A::CTX, offset_of!(JitCtx, pending) as i32, 0);
         self.asm.branch(Cond::Ne, lazy);
@@ -229,7 +266,7 @@ impl<A: Asm> Gen<'_, A> {
             self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::CACHE + word * std::mem::size_of::<usize>()), 0);
         }
         self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::PC), status);
-        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::NVARARGS), 0);
+        self.asm.store_imm(Width::Q, t.frame, frames.field(lua_frame::NVARARGS), extra);
         self.asm.store(Width::W, t.count, A::SP, slot + offset_of!(JitCtx, frame_index) as i32);
         self.asm.alu_imm(Alu::Add, t.count, t.count, 1);
         self.asm.store(Width::Q, t.count, t.thread, frames.frames_len);
@@ -409,7 +446,8 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     pub(super) fn tail_call(&mut self, pc: u32, (a, b, k): (u8, u8, bool)) {
-        let targets = self.call_targets(pc as usize);
+        let mut targets = self.call_targets(pc as usize);
+        targets.retain(|target| !target.vararg);
         let helper = self.asm.new_label();
         let unknown = targets.is_empty() && self.env.unknown_calls.get(pc as usize).copied().unwrap_or(false);
         if (unknown || !targets.is_empty()) && b != 0 && !k && !self.env.vararg {
@@ -533,7 +571,7 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.alu(Alu::Sub, count, count, word);
         self.asm.alu_imm(Alu::Sub, count, count, i32::from(first));
         self.registers(source);
-        self.asm.lea(destination, source, -VALUE_SIZE);
+        self.result_place(destination, source);
         self.asm.alu_imm(Alu::Add, source, source, i32::from(first) * VALUE_SIZE);
         self.asm.mov_imm(index, 0);
         self.asm.bind(next);
@@ -604,8 +642,10 @@ impl<A: Asm> Gen<'_, A> {
         self.copy_results(first, count, (base, destination, word));
         self.fill_results(results, (destination, word), count, done);
         self.asm.bind(wide);
-        self.asm.cmp_imm(results, -1);
-        self.asm.branch(Cond::Eq, place);
+        if !self.env.vararg {
+            self.asm.cmp_imm(results, -1);
+            self.asm.branch(Cond::Eq, place);
+        }
         self.asm.bind(helper);
         self.fast_args(pc, [u32::from(first), count, 0]);
         self.asm.call(self.addresses.fast[sites::FAST_RETURN]);
@@ -613,9 +653,19 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.jump(self.exit_with);
     }
 
+    /// A vararg prototype entered directly returns below its hidden arguments, at `ret_offset`.
+    fn result_place(&mut self, destination: u8, base: u8) {
+        if !self.env.vararg {
+            self.asm.lea(destination, base, -VALUE_SIZE);
+            return;
+        }
+        self.ctx_load(destination, offset_of!(JitCtx, ret_offset));
+        self.asm.alu(Alu::Add, destination, destination, base);
+    }
+
     fn copy_results(&mut self, first: u8, count: u32, (base, destination, word): (u8, u8, u8)) {
         self.registers(base);
-        self.asm.lea(destination, base, -VALUE_SIZE);
+        self.result_place(destination, base);
         for index in 0..count as i32 {
             let from = (i32::from(first) + index) * VALUE_SIZE;
             for half in [0, PAYLOAD] {
@@ -645,5 +695,13 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.store_imm(Width::B, A::SCRATCH, 0, 0);
         self.asm.alu_imm(Alu::Add, index, index, 1);
         self.asm.jump(next);
+    }
+}
+
+/// The slots a vararg callee's frame moves up: every argument (at least the fixed parameters) and the function's copy.
+fn hidden_slots(callee: Callee<'_>, arguments: u32) -> u32 {
+    match callee {
+        Callee::Known(target) if target.vararg => arguments.max(u32::from(target.num_params)) + 1,
+        _ => 0,
     }
 }

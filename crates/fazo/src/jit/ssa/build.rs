@@ -1130,6 +1130,9 @@ impl<'a> Builder<'a, '_> {
     }
 
     fn polymorphic_method(&mut self, table: Val, methods: &[MethodEntry], state: StateId) -> Val {
+        if methods.iter().all(|method| same_lookup(method, &methods[0])) {
+            return self.polymorphic_class(table, methods, state);
+        }
         let join = self.func.new_block();
         let result = self.func.add_param(join, Type::ANY, Rep::Boxed);
         for method in methods {
@@ -1140,6 +1143,32 @@ impl<'a> Builder<'a, '_> {
             let shaped = self.emit(Op::ShapeIs { table: metatable, shape: method.metatable_shape.packed() }, Type::BOOL, Rep::Bool);
             self.branch_or(shaped, next);
             let index = self.emit(Op::LoadSlot { table: metatable, slot: method.index_slot }, Type::ANY, Rep::Boxed);
+            let found = self.emit(Op::EqConst(index, Const::Gc { tag: 5, payload: method.class.packed() }), Type::BOOL, Rep::Bool);
+            self.branch_or(found, next);
+            let class = self.constant(Const::Gc { tag: 5, payload: method.class.packed() });
+            self.effect(Op::GuardShape { table: class, shape: method.class_shape.packed(), state });
+            let value = self.emit(Op::LoadSlot { table: class, slot: method.class_slot }, Type::ANY, Rep::Boxed);
+            let value = self.emit(Op::GuardNotNil { value, state }, Type::ANY.without(Type::NIL), Rep::Boxed);
+            self.end(Term::Jump(Edge { block: join, args: vec![value] }));
+            self.current = Some(next);
+        }
+        self.end(Term::Deopt { state });
+        self.current = Some(join);
+        result
+    }
+
+    /// Receivers of one shape whose metatables differ only in their `__index` class test the receiver and metatable once,
+    /// as Maglev's `BuildCheckMaps` merges the maps an access shares.
+    fn polymorphic_class(&mut self, table: Val, methods: &[MethodEntry], state: StateId) -> Val {
+        let first = &methods[0];
+        self.effect(Op::GuardShape { table, shape: first.receiver.packed(), state });
+        let metatable = self.emit(Op::GuardHasMeta { table, state }, Type::TABLE, Rep::Payload);
+        self.effect(Op::GuardShape { table: metatable, shape: first.metatable_shape.packed(), state });
+        let index = self.emit(Op::LoadSlot { table: metatable, slot: first.index_slot }, Type::ANY, Rep::Boxed);
+        let join = self.func.new_block();
+        let result = self.func.add_param(join, Type::ANY, Rep::Boxed);
+        for method in methods {
+            let next = self.func.new_block();
             let found = self.emit(Op::EqConst(index, Const::Gc { tag: 5, payload: method.class.packed() }), Type::BOOL, Rep::Bool);
             self.branch_or(found, next);
             let class = self.constant(Const::Gc { tag: 5, payload: method.class.packed() });
@@ -1326,6 +1355,11 @@ impl<'a> Builder<'a, '_> {
             return self.inline_call(frame, pc, (a, b, c), candidate);
         }
         if self.speculates(frame, pc)
+            && let Some(candidates) = self.polymorphic_candidates(frame, pc, (a, b, c))
+        {
+            return self.polymorphic_inline_call(frame, pc, (a, b, c), &candidates);
+        }
+        if self.speculates(frame, pc)
             && let Some(function) = self.builtin_candidate(frame.proto, pc, (b, c))
         {
             return self.builtin_call(frame, pc, (a, b, c), function);
@@ -1372,6 +1406,10 @@ impl<'a> Builder<'a, '_> {
         let Some(InlineCache::Callee(callee)) = proto.exec.feedback.get(pc) else {
             return None;
         };
+        self.callee_candidate(callee, base, depth)
+    }
+
+    fn callee_candidate(&self, callee: &crate::vm::ic::Callee, base: u32, depth: usize) -> Option<Candidate<'a>> {
         let reference = callee.proto?;
         let function = (self.facts.proto_of)(reference)?;
         if base as usize + usize::from(function.max_stack) > crate::vm::REGISTER_SPAN {
@@ -1379,6 +1417,24 @@ impl<'a> Builder<'a, '_> {
         }
         let candidate = inline::candidate(function, reference, &self.facts.policy)?;
         self.calls_inline(function, base, depth).then_some(candidate)
+    }
+
+    /// Every callee the site has seen, when each inlines and together they fit one inlining budget (TurboFan's
+    /// `kMaxCallPolymorphism` and cumulative budget, src/compiler/js-inlining-heuristic.cc).
+    fn polymorphic_candidates(&self, frame: &Frame<'_>, pc: usize, (a, b, c): (u8, u8, u8)) -> Option<Vec<Candidate<'a>>> {
+        if !self.facts.inline_caches || b == 0 || c == 0 || frame.chain.len() >= self.facts.policy.depth {
+            return None;
+        }
+        let Some(InlineCache::Callees(callees)) = frame.proto.exec.feedback.get(pc) else {
+            return None;
+        };
+        if !(2..=MAX_CALL_POLYMORPHISM).contains(&callees.len()) {
+            return None;
+        }
+        let base = Self::slot(frame, a) + 1;
+        let candidates: Vec<Candidate<'a>> = callees.iter().map(|callee| self.callee_candidate(callee, base, frame.chain.len() + 1)).collect::<Option<_>>()?;
+        let size: usize = candidates.iter().map(|candidate| candidate.proto.code.len()).sum();
+        (size <= self.facts.policy.max_instructions).then_some(candidates)
     }
 
     /// An inlined frame has no helper to call through, so its Lua calls inline or call directly.
@@ -1494,6 +1550,33 @@ impl<'a> Builder<'a, '_> {
         let closure = self.emit(Op::GuardType { value: function, ty: Type::CLOSURE, state }, Type::CLOSURE, Rep::Boxed);
         let proto = self.emit(Op::LoadProto { closure }, Type::NONE, Rep::Word);
         self.effect(Op::GuardEq { value: proto, expected: candidate.reference.packed(), state });
+        let returns = self.inline_body(frame, pc, (a, b, c), closure, candidate);
+        self.finish_inline(frame, pc, returns)
+    }
+
+    /// Dispatches on the callee's prototype and inlines each, as TurboFan's `CreateOrReuseDispatch`
+    /// (src/compiler/js-inlining-heuristic.cc) does; a callee the site never saw deoptimizes.
+    fn polymorphic_inline_call(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8), candidates: &[Candidate<'a>]) -> usize {
+        let state = self.state_at(frame, pc);
+        let function = self.read(frame, a);
+        let closure = self.emit(Op::GuardType { value: function, ty: Type::CLOSURE, state }, Type::CLOSURE, Rep::Boxed);
+        let proto = self.emit(Op::LoadProto { closure }, Type::NONE, Rep::Word);
+        let regs = self.regs.clone();
+        let mut returns = Vec::new();
+        for &candidate in candidates {
+            let next = self.func.new_block();
+            let same = self.emit(Op::EqConst(proto, Const::Int(candidate.reference.packed() as i64)), Type::BOOL, Rep::Bool);
+            self.branch_or(same, next);
+            self.regs.clone_from(&regs);
+            returns.append(&mut self.inline_body(frame, pc, (a, b, c), closure, candidate));
+            self.current = Some(next);
+        }
+        self.regs = regs;
+        self.end(Term::Deopt { state });
+        self.finish_inline(frame, pc, returns)
+    }
+
+    fn inline_body(&mut self, frame: &mut Frame<'a>, pc: usize, (a, b, c): (u8, u8, u8), closure: Val, candidate: Candidate<'a>) -> Vec<Incoming> {
         let base = Self::slot(frame, a) + 1;
         let arguments = u32::from(b) - 1;
         let nil = self.constant(Const::Nil);
@@ -1513,7 +1596,7 @@ impl<'a> Builder<'a, '_> {
         }
         self.jump_to(&mut callee, 0);
         self.run(&mut callee);
-        self.finish_inline(frame, pc, callee.returns)
+        callee.returns
     }
 
     fn finish_inline(&mut self, frame: &mut Frame<'a>, pc: usize, returns: Vec<Incoming>) -> usize {
@@ -1672,6 +1755,11 @@ fn hash_capacity(log_plus_one: u8) -> usize {
 
 /// A tail call replaces its frame but still costs a level of the candidate search.
 const TAIL_CALL_LINKS: usize = 2;
+const MAX_CALL_POLYMORPHISM: usize = 4;
+
+fn same_lookup(method: &MethodEntry, other: &MethodEntry) -> bool {
+    method.receiver == other.receiver && method.metatable_shape == other.metatable_shape && method.index_slot == other.index_slot
+}
 
 fn event_bit(event: Event) -> u8 {
     event.absence_bit().unwrap_or(0)

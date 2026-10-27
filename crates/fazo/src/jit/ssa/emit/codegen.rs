@@ -148,6 +148,8 @@ pub(super) struct Gen<'a, A: Asm> {
     pub(super) switched: Option<Val>,
     /// Lets a call's settled path jump straight to this pc's case.
     pub(super) settled: Option<(u32, Label)>,
+    /// A call into a vararg prototype moves the results' place, so every call writes `ret_offset`.
+    pub(super) calls_vararg: bool,
     pub(super) failed: bool,
 }
 
@@ -211,6 +213,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             next_block: None,
             switched: None,
             settled: None,
+            calls_vararg: env.calls.iter().flatten().any(|target| target.vararg),
             failed: false,
         }
     }

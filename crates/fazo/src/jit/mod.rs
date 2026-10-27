@@ -271,6 +271,7 @@ struct JitCells {
     budget: std::cell::Cell<i64>,
     tier_budget: std::cell::Cell<i64>,
     entry: std::cell::Cell<usize>,
+    vararg_entry: std::cell::Cell<usize>,
 }
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -327,6 +328,11 @@ impl ProtoJit {
 
     pub(crate) fn entry(&self) -> &std::cell::Cell<usize> {
         &self.cells.entry
+    }
+
+    /// A vararg prototype's code entered past `VARARGPREP`, once its caller has hidden the arguments.
+    pub(crate) fn vararg_entry(&self) -> &std::cell::Cell<usize> {
+        &self.cells.vararg_entry
     }
 
     pub(crate) fn code(&self) -> Option<*const u8> {

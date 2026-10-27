@@ -349,6 +349,8 @@ pub(crate) struct CallTarget {
     pub(crate) num_params: u8,
     pub(crate) max_stack: u8,
     pub(crate) has_upvalues: bool,
+    /// Its caller hides the arguments and enters at `vararg_entry`.
+    pub(crate) vararg: bool,
     /// Such callees push a lazy frame at their first helper anyway.
     pub(crate) pushes_frame: bool,
 }

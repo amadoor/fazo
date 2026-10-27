@@ -71,7 +71,7 @@ fn keys() -> Vec<Key> {
     for id in [HelperId::Step, HelperId::SafePoint, HelperId::Misc, HelperId::TierCheck] {
         keys.push(Key::Helper(id));
     }
-    for which in 0..21 {
+    for which in 0..crate::jit::sites::FAST_NAMES.len() as u8 {
         keys.push(Key::Helper(HelperId::Fast(which)));
     }
     let ops = [

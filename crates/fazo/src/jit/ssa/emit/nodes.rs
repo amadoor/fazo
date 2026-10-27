@@ -544,7 +544,7 @@ impl<A: Asm> Gen<'_, A> {
             return;
         }
         match (rep, constant) {
-            (Rep::Int, Const::Int(k)) => {
+            (Rep::Int | Rep::Word, Const::Int(k)) => {
                 let x = self.reg(operand);
                 let out = self.out(value);
                 self.asm.cmp_imm64(x, k);
@@ -1405,6 +1405,11 @@ impl<A: Asm> Gen<'_, A> {
 
     /// The branch of a comparison only its branch reads: compared here, so no flag lives in a register.
     pub(super) fn compare_branch(&mut self, cond: Val, negate: bool, target: Label) {
+        match *self.func.op(cond) {
+            Op::ShapeIs { table, shape } => return self.shape_branch((table, shape), negate, target),
+            Op::EqConst(operand, constant) => return self.equal_branch(operand, constant, negate, target),
+            _ => {}
+        }
         let Op::Binary(op, left, right) = self.func.op(cond).clone() else {
             unreachable!("a fused value is a comparison");
         };
@@ -1431,6 +1436,43 @@ impl<A: Asm> Gen<'_, A> {
             }
             _ => unreachable!("only comparisons fuse"),
         }
+    }
+
+    /// `SCRATCH` holds the table's address; the shape is compared in place, so no flag lives in a register.
+    fn shape_branch(&mut self, (table, shape): (Val, u64), negate: bool, target: Label) {
+        let layout = self.env.layout;
+        let payload = self.reg(table);
+        let skip = self.asm.new_label();
+        let unshaped = if negate { target } else { skip };
+        self.table_address(A::SCRATCH, payload);
+        self.asm.cmp_mem_byte(A::SCRATCH, layout.shaped, 0);
+        self.asm.branch(Cond::Eq, unshaped);
+        self.asm.load(Width::Q, A::SCRATCH, A::SCRATCH, layout.shape);
+        self.asm.cmp_imm64(A::SCRATCH, shape as i64);
+        self.asm.branch(if negate { Cond::Ne } else { Cond::Eq }, target);
+        self.asm.bind(skip);
+    }
+
+    fn equal_branch(&mut self, operand: Val, constant: Const, negate: bool, target: Label) {
+        let Some(form) = super::live::equality(self.func, operand, constant) else {
+            unreachable!("only equalities `equality` accepts fuse");
+        };
+        let found = if negate { Cond::Ne } else { Cond::Eq };
+        let (payload, value) = match form {
+            super::live::Equality::Word(value) => (self.reg(operand), value),
+            super::live::Equality::Boxed { tag: expected, payload: value } => {
+                let (tag, payload) = self.pair_regs(operand);
+                let skip = self.asm.new_label();
+                self.asm.cmp_byte(tag, expected);
+                self.asm.branch(Cond::Ne, if negate { target } else { skip });
+                self.asm.cmp_imm64(payload, value);
+                self.asm.branch(found, target);
+                self.asm.bind(skip);
+                return;
+            }
+        };
+        self.asm.cmp_imm64(payload, value);
+        self.asm.branch(found, target);
     }
 
     /// Charges the loop's length to the budget as Baseline does at a back edge; running out enters the tier check with state written back.

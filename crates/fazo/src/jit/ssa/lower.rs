@@ -909,7 +909,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
         let rep = self.ir.rep(operand);
         let word = if rep == Rep::Boxed || rep == Rep::None { None } else { Some(self.one(operand)) };
         match (rep, constant, word) {
-            (Rep::Int, Const::Int(k), Some(x)) => self.builder.ins().icmp_imm_s(IntCC::Equal, x, k),
+            (Rep::Int | Rep::Word, Const::Int(k), Some(x)) => self.builder.ins().icmp_imm_s(IntCC::Equal, x, k),
             (Rep::Int, Const::Float(f), Some(x)) => match exact_integer(f) {
                 Some(k) => self.builder.ins().icmp_imm_s(IntCC::Equal, x, k),
                 None => self.iconst(types::I8, 0),
@@ -1670,6 +1670,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
 
     fn call_targets(&self, pc: usize) -> Vec<CallTarget> {
         let mut targets = self.env.calls.get(pc).cloned().unwrap_or_default();
+        targets.retain(|target| !target.vararg);
         let mut seen = Vec::with_capacity(targets.len());
         targets.retain(|target| {
             let fresh = !seen.contains(&target.proto);

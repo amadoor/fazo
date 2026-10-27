@@ -1,6 +1,6 @@
 //! Block order and liveness, after Maglev's allocator (src/maglev/maglev-regalloc.cc).
 
-use super::super::ir::{BinOp, BlockId, Func, Op, Rep, Term, Val};
+use super::super::ir::{BinOp, BlockId, Const, Func, Op, Rep, Term, Val};
 
 pub(crate) struct Liveness {
     pub(crate) order: Vec<BlockId>,
@@ -80,7 +80,36 @@ fn fusable(func: &Func, block: BlockId, counts: &[u32]) -> Option<Val> {
     if data.insts.last() != Some(&cond) || counts[cond.0 as usize] != 1 {
         return None;
     }
-    matches!(func.op(cond), Op::Binary(BinOp::ICmp(_) | BinOp::FCmp(_), _, _)).then_some(cond)
+    fuses(func, cond).then_some(cond)
+}
+
+/// The tests `compare_branch` can make at the branch itself.
+fn fuses(func: &Func, cond: Val) -> bool {
+    match func.op(cond) {
+        Op::Binary(BinOp::ICmp(_) | BinOp::FCmp(_), _, _) | Op::ShapeIs { .. } => true,
+        Op::EqConst(operand, constant) => equality(func, *operand, *constant).is_some(),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Equality {
+    Word(i64),
+    Boxed { tag: u8, payload: i64 },
+}
+
+/// An `EqConst` the branch can compare: a word against an integer or a typed payload, or a boxed value against a
+/// collectable (a boxed integer also equals a float, which the branch does not test).
+pub(crate) fn equality(func: &Func, operand: Val, constant: Const) -> Option<Equality> {
+    if matches!(func.op(operand), Op::Const(_)) {
+        return None;
+    }
+    match (func.rep(operand), constant) {
+        (Rep::Int | Rep::Word, Const::Int(k)) => Some(Equality::Word(k)),
+        (Rep::Payload, Const::Gc { tag, payload }) if func.ty(operand).tag() == Some(tag) => Some(Equality::Word(payload as i64)),
+        (Rep::Boxed, Const::Gc { .. }) => Some(Equality::Boxed { tag: constant.tag(), payload: constant.payload() as i64 }),
+        _ => None,
+    }
 }
 
 impl Liveness {

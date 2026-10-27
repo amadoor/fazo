@@ -11,7 +11,7 @@ use crate::{
     jit::{
         sites::{
             FAST_ARITH, FAST_CALL, FAST_FOR_PREP, FAST_GET_FIELD, FAST_GET_INT, FAST_GET_SELF, FAST_GET_TABLE, FAST_GET_TABUP,
-            FAST_CLOSE, FAST_CLOSURE, FAST_GET_UPVAL, FAST_SET_LIST, FAST_NEW_TABLE, FAST_RETURN, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
+            FAST_CLOSE, FAST_CLOSURE, FAST_GET_UPVAL, FAST_SET_LIST, FAST_NEW_TABLE, FAST_RETURN, FAST_VARARG, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
             CallTarget, FAST_TABLE_BARRIER, FAST_TAIL_CALL, add_entries, all_method_entries, field_entries,
         },
         helpers::CONSTANT_OPERAND,
@@ -407,6 +407,7 @@ impl<'a> Emitter<'a> {
             Instruction::TailCall { a, b, k, .. } => self.tail_call(pc, a, b, k),
             Instruction::NewTable { a, b, c, k } => self.new_table(pc, a, b, c, k),
             Instruction::Closure { a, bx } => self.fast(pc, FAST_CLOSURE, [i64::from(a), i64::from(bx), 0], Some(pc + 1)),
+            Instruction::Vararg { a, c, k: false, .. } => self.fast(pc, FAST_VARARG, [i64::from(a), i64::from(c), 0], Some(pc + 1)),
             Instruction::SetList { a, b, c, k: false } => self.fast(pc, FAST_SET_LIST, [i64::from(a), i64::from(b), i64::from(c)], Some(pc + 1)),
             Instruction::Pow { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(c)),
             Instruction::PowK { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(CONSTANT_OPERAND | u32::from(c))),
@@ -763,7 +764,7 @@ impl<'a> Emitter<'a> {
         let mut targets: Vec<&CallTarget> = Vec::new();
         for target in self.facts.calls.get(pc).map_or(&[][..], Vec::as_slice) {
             let fits = u32::from(a) + 1 + u32::from(target.num_params.max(b.saturating_sub(1))) <= u32::from(MAX_REGISTER);
-            if fits && !targets.iter().any(|known| known.proto == target.proto) {
+            if fits && !target.vararg && !targets.iter().any(|known| known.proto == target.proto) {
                 targets.push(target);
             }
         }

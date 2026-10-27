@@ -37,7 +37,6 @@ const LOAD_GAIN: i64 = 6;
 const NEW_TABLE_GAIN: i64 = 200;
 const HELPER_COST: i64 = 5;
 const CONCAT_COST: i64 = 180;
-const VARARG_COST: i64 = 1100;
 /// A non-integer key goes through the value helper, where Baseline probes the hash part inline.
 const GENERIC_TABLE_COST: i64 = 20;
 /// Optimizing tests a polymorphic method's entries one after another.
@@ -58,6 +57,10 @@ const INLINED_CALL_GAIN: i64 = 170;
 const BUILTIN_GAIN: i64 = 250;
 /// Matches `passes::inline::Policy` so the estimate inlines what the builder will.
 const INLINE_DEPTH: usize = 3;
+/// Matches the builder's limit on callees inlined at one site.
+const MAX_CALL_POLYMORPHISM: usize = 4;
+/// Each callee the dispatch tests first costs a compare and a branch.
+const POLYMORPHIC_CALL_COST: i64 = 3;
 
 pub(crate) const CLASSES: usize = 6;
 pub(crate) type Sizes = [i64; CLASSES];
@@ -209,11 +212,44 @@ fn call_inlines(proto: &Proto, pc: usize, instruction: Instruction, lookup: &Loo
     if b == 0 || c == 0 || depth > INLINE_DEPTH {
         return None;
     }
-    let Some(InlineCache::Callee(callee)) = proto.exec.feedback.get(pc) else {
-        return None;
+    let callee = match proto.exec.feedback.get(pc) {
+        Some(InlineCache::Callee(callee)) => callee,
+        Some(InlineCache::Callees(callees)) if depth == 1 => return polymorphic_inlines(callees, instruction, lookup),
+        _ => return None,
     };
     if let LuaValue::Native(native) = callee.value {
         return (lookup.builtin_of)(native).filter(|&builtin| inlined_builtin(builtin)).map(|_| (BUILTIN_GAIN, [0; CLASSES], 0));
+    }
+    inlined_gain(callee, instruction, lookup, depth)
+}
+
+/// Matches the builder's polymorphic inlining: each callee's bytecodes are compiled, and a call runs one of them after
+/// comparing prototypes.
+fn polymorphic_inlines(callees: &[crate::vm::ic::Callee], instruction: Instruction, lookup: &Lookup<'_>) -> Option<(i64, Sizes, i64)> {
+    let policy = super::ssa::passes::inline::Policy::default();
+    if !(2..=MAX_CALL_POLYMORPHISM).contains(&callees.len()) {
+        return None;
+    }
+    let count = callees.len() as i64;
+    let mut gain = 0;
+    let mut peak = 0;
+    let mut sizes: Sizes = [0; CLASSES];
+    for callee in callees {
+        let (callee_gain, callee_sizes, callee_peak) = inlined_gain(callee, instruction, lookup, 1)?;
+        gain += callee_gain;
+        peak += callee_peak;
+        add(&mut sizes, &callee_sizes);
+    }
+    let bytecodes: i64 = sizes.iter().sum();
+    if bytecodes > policy.max_instructions as i64 {
+        return None;
+    }
+    Some((gain / count - count * POLYMORPHIC_CALL_COST, sizes, peak / count))
+}
+
+fn inlined_gain(callee: &crate::vm::ic::Callee, instruction: Instruction, lookup: &Lookup<'_>, depth: usize) -> Option<(i64, Sizes, i64)> {
+    if !matches!(callee.value, LuaValue::Closure(_)) {
+        return None;
     }
     let function = (lookup.proto_of)(callee.proto?)?;
     let policy = super::ssa::passes::inline::Policy::default();
@@ -275,7 +311,6 @@ fn bytecode_gain(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize, instructio
         Instruction::SelfOp { .. } if methods > 1 => -POLYMORPHIC_METHOD_COST,
         Instruction::GetField { .. } | Instruction::SetField { .. } if polymorphic => -POLYMORPHIC_FIELD_COST,
         Instruction::Concat { .. } => -CONCAT_COST,
-        Instruction::Vararg { .. } => -VARARG_COST,
         Instruction::NewTable { b: 0, c: 0, k: false, .. } => NEW_TABLE_GAIN,
         Instruction::NewTable { .. } | Instruction::Closure { .. } | Instruction::SetList { .. } | Instruction::Close { .. } | Instruction::Tbc { .. } => {
             -HELPER_COST
