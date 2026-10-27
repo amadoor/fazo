@@ -287,6 +287,7 @@ impl Asm for X64 {
     const SP: u8 = RSP;
     const SCRATCH: u8 = RAX;
     const FSCRATCH: u8 = FLOAT_SCRATCH;
+    const DIVIDE_CLOBBERS: Option<u8> = Some(RDX);
     const OUTGOING: i32 = if cfg!(windows) { 48 } else { 0 };
     const REGISTERS: Registers = Registers {
         gp: &GP_ORDER,
@@ -532,6 +533,32 @@ impl Asm for X64 {
         }
         self.mov_rr(dst, result);
         self.pop(RDX);
+    }
+
+    /// With a positive divisor the remainder's sign alone says whether to round toward minus infinity.
+    fn floor_div_by(&mut self, op: Division, dst: u8, x_reg: u8, divisor: i64, keep: bool) {
+        let done = self.new_label();
+        if keep {
+            self.push(RDX);
+        }
+        self.mov_imm(R11, divisor);
+        self.mov_rr(RAX, x_reg);
+        self.bytes(&[0x48, 0x99]);
+        self.op(None, Size::Qword, &[0xf7], 7, Rm::Reg(R11));
+        self.op(None, Size::Qword, &[0x85], RDX, Rm::Reg(RDX));
+        self.jcc_code(0x9, done);
+        match op {
+            Division::Mod => self.alu_rr(Alu::Add, RDX, R11),
+            Division::IDiv => self.group_imm(group(Alu::Sub), Size::Qword, Rm::Reg(RAX), 1),
+        }
+        self.bind(done);
+        let result = if op == Division::Mod { RDX } else { RAX };
+        if dst != result {
+            self.mov_rr(dst, result);
+        }
+        if keep {
+            self.pop(RDX);
+        }
     }
 
     /// `DIV` takes its dividend in `rdx:rax`, so `rdx` is kept on the stack around it.

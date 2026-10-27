@@ -305,6 +305,12 @@ fn fold_constants(func: &mut Func, order: &[BlockId]) -> bool {
             if matches!(op, Op::Const(_)) || !op.is_pure() {
                 continue;
             }
+            if let Some(same) = integer_identity(func, op) {
+                map[value.0 as usize] = same;
+                dead[value.0 as usize] = true;
+                changed = true;
+                continue;
+            }
             let Some(folded) = fold(func, op) else {
                 continue;
             };
@@ -319,6 +325,21 @@ fn fold_constants(func: &mut Func, order: &[BlockId]) -> bool {
     func.rewrite_uses(&map);
     remove(func, &dead);
     changed
+}
+
+/// Integer `x * 1`, `x // 1`, `x + 0` and `x - 0` are `x` with Lua's wrapping arithmetic.
+fn integer_identity(func: &Func, op: &Op) -> Option<Val> {
+    let &Op::Binary(op, left, right) = op else {
+        return None;
+    };
+    let int = |value: Val| constant(func, value).and_then(|constant| if let Const::Int(int) = constant { Some(int) } else { None });
+    let (right_int, left_int) = (int(right), int(left));
+    let same = match (op, left_int, right_int) {
+        (BinOp::IMul | BinOp::IDiv, _, Some(1)) | (BinOp::IAdd | BinOp::ISub, _, Some(0)) => left,
+        (BinOp::IMul, Some(1), _) | (BinOp::IAdd, Some(0), _) => right,
+        _ => return None,
+    };
+    (func.rep(same) == Rep::Int).then_some(same)
 }
 
 fn redundant_guard(func: &Func, op: &Op) -> Option<Option<Val>> {

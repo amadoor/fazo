@@ -2,12 +2,15 @@
 //! Follows V8 Maglev's known node types (src/maglev/maglev-known-node-aspects.cc).
 
 use super::{insert, remove};
-use crate::jit::ssa::ir::{BinOp, BlockId, Cc, Const, Func, KIND_FLOAT, KIND_INT, NumOp, Op, PureFn, Rep, StateId, Type, UnOp, Val};
+use crate::jit::ssa::ir::{BinOp, BlockId, Cc, Const, Func, KIND_FLOAT, KIND_INT, Loop, NumOp, Op, PureFn, Rep, StateId, Term, Type, UnOp, Val};
 
 pub(crate) fn run(func: &mut Func) {
     propagate(func);
     speculate(func);
     propagate(func);
+    if untag_loop_params(func) {
+        propagate(func);
+    }
     eliminate_guards(func);
     specialize(func);
     propagate(func);
@@ -165,6 +168,79 @@ fn speculate_operands(func: &mut Func, refined: &mut Refined, (block, position):
     set_operands(func, value, new_left, new_right);
     func.inst_mut(value).ty = transfer(func, value);
     inserted
+}
+
+/// A loop parameter whose header guards it to one number kind on every iteration, while each back edge already carries
+/// that kind, is guarded once on entry instead, as Maglev untags loop phis (maglev-phi-representation-selector.cc).
+fn untag_loop_params(func: &mut Func) -> bool {
+    let tagged = |func: &Func, entry: &Loop| func.block(entry.header).params.iter().any(|&param| kind(func.ty(param)).is_none());
+    if !func.loops.iter().any(|entry| tagged(func, entry)) {
+        return false;
+    }
+    let idom = func.dominators();
+    let mut changed = false;
+    for index in 0..func.loops.len() {
+        let entry = func.loops[index].clone();
+        if !tagged(func, &entry) || !Func::dominates(&idom, entry.preheader, entry.header) {
+            continue;
+        }
+        let Term::Jump(edge) = &func.block(entry.preheader).term else {
+            continue;
+        };
+        if edge.block != entry.header {
+            continue;
+        }
+        for position in 0..func.block(entry.header).params.len() {
+            changed |= untag_param(func, &entry, position);
+        }
+    }
+    changed
+}
+
+fn untag_param(func: &mut Func, entry: &Loop, position: usize) -> bool {
+    let param = func.block(entry.header).params[position];
+    if kind(func.ty(param)).is_some() {
+        return false;
+    }
+    let Some((ty, state)) = header_guard(func, entry.header, param) else {
+        return false;
+    };
+    if !back_edges_carry(func, entry, position, ty) {
+        return false;
+    }
+    let Term::Jump(edge) = &func.block(entry.preheader).term else {
+        return false;
+    };
+    let arg = edge.args[position];
+    let moved = super::hoist::entry_state_for(func, entry, state);
+    let guard = func.append(entry.preheader, Op::GuardType { value: arg, ty, state: moved }, ty, Rep::Boxed);
+    if let Term::Jump(edge) = &mut func.block_mut(entry.preheader).term {
+        edge.args[position] = guard;
+    }
+    true
+}
+
+fn header_guard(func: &Func, header: BlockId, param: Val) -> Option<(Type, StateId)> {
+    func.block(header).insts.iter().find_map(|&value| match *func.op(value) {
+        Op::GuardType { value: input, ty, state } if input == param && kind(ty) == Some(ty) => Some((ty, state)),
+        _ => None,
+    })
+}
+
+fn back_edges_carry(func: &Func, entry: &Loop, position: usize, ty: Type) -> bool {
+    let mut latches = 0;
+    for &block in &entry.blocks {
+        for edge in func.block(block).term.edges() {
+            if edge.block != entry.header {
+                continue;
+            }
+            latches += 1;
+            if !edge.args.get(position).is_some_and(|&arg| func.ty(arg).within(ty)) {
+                return false;
+            }
+        }
+    }
+    latches > 0
 }
 
 fn set_operands(func: &mut Func, value: Val, new_left: Val, new_right: Val) {

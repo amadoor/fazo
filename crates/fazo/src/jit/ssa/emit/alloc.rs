@@ -272,6 +272,17 @@ impl Alloc {
         reg
     }
 
+    /// Maglev's fixed-register result hint: the result takes `reg` only when nothing holds it.
+    pub(crate) fn define_in(&mut self, part: Part, reg: PReg) -> Option<PReg> {
+        let busy = self.pinned.union(self.temps);
+        if reg.class != self.class_of(part) || self.owner[reg.index()].is_some() || busy.contains(reg) || !self.regs.order(reg.class).any(|candidate| candidate == reg) {
+            return None;
+        }
+        self.in_slot[part as usize] = false;
+        self.place(part, reg);
+        Some(reg)
+    }
+
     /// Maglev's `DefineSameAsFirst` (src/maglev/x64/maglev-ir-x64.cc); a two-address op then needs no copy.
     pub(crate) fn define_over(&mut self, part: Part, input: Part) -> Option<PReg> {
         let reg = self.reg_of[input as usize].filter(|reg| reg.class == self.class_of(part))?;

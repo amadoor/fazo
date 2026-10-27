@@ -383,9 +383,10 @@ impl Vm {
         }
         function.jit.declined = false;
         function.jit.compiled_changes = function.jit.feedback_changes;
+        let start = unit.entry() as usize;
         function.jit.baseline = Some(Box::new(unit));
         self.jit_reveal(proto);
-        self.jit_trace(proto, "baseline");
+        self.jit_trace(proto, &format!("baseline at {start:#x}"));
     }
 
     fn jit_emit_baseline(&mut self, proto: Ref<Proto>, charges: bool) -> Option<crate::jit::baseline::BaselineUnit> {
@@ -634,12 +635,13 @@ impl Vm {
         }
         function.jit.compiled_bytecodes[usize::from(tier == Tier::Peak)] += estimate.bytecodes();
         let shapes = unit.shapes.clone();
+        let start = unit.entry() as usize;
         if let Some(old) = function.jit.unit.replace(Box::new(unit)) {
             function.jit.retired_peak.push(*old);
         }
         self.jit_keep_shapes(proto, shapes);
         self.jit_reveal(proto);
-        self.jit_trace(proto, tier.name());
+        self.jit_trace(proto, &format!("{} at {start:#x}", tier.name()));
         true
     }
 

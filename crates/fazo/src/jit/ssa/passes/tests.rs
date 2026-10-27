@@ -662,3 +662,118 @@ fn an_inlined_callee_keeps_its_calls_with_the_inlined_frames_as_their_deopt_fram
     let without = built_after_running(source, false);
     assert!(without.inlined_calls.is_empty(), "a backend without calls from inlined frames inlines no caller of them");
 }
+#[test]
+fn folding_drops_integer_identities() {
+    let (mut func, block) = straight_line();
+    let x = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let s = state(&mut func, 1);
+    let int = func.append(block, Op::GuardType { value: x, ty: Type::INT, state: s }, Type::INT, Rep::Int);
+    let one = constant(&mut func, block, Const::Int(1));
+    let zero = constant(&mut func, block, Const::Int(0));
+    let times = func.append(block, Op::Binary(BinOp::IMul, one, int), Type::INT, Rep::Int);
+    let divided = func.append(block, Op::Binary(BinOp::IDiv, times, one), Type::INT, Rep::Int);
+    let less = func.append(block, Op::Binary(BinOp::ISub, divided, zero), Type::INT, Rep::Int);
+    let modulo = func.append(block, Op::Binary(BinOp::IMod, less, one), Type::INT, Rep::Int);
+    returns(&mut func, block, modulo);
+    fold::run(&mut func);
+    assert_eq!(func.op(modulo), &Op::Binary(BinOp::IMod, int, one), "x % 1 stays an operation; the identities before it fold away");
+}
+
+/// `header -> body -> (side ->) latch -> header`, where `side` reads a constant table only on some iterations.
+fn loop_with_side_block(reads: impl FnOnce(&mut Func, BlockId, StateId)) -> (Func, BlockId, BlockId) {
+    let mut func = Func::default();
+    let [entry, preheader, header, body, side, latch, exit] = [(); 7].map(|_| func.new_block());
+    func.entry = Some(entry);
+    let entry_state = state(&mut func, 3);
+    let body_state = state(&mut func, 4);
+    func.block_mut(entry).term = Term::Jump(Edge::to(preheader));
+    let count = constant(&mut func, preheader, Const::Int(9));
+    func.block_mut(preheader).term = Term::Jump(Edge { block: header, args: vec![count] });
+    let remaining = func.add_param(header, Type::INT, Rep::Int);
+    let zero = constant(&mut func, header, Const::Int(0));
+    let done = func.append(header, Op::Binary(BinOp::ICmp(Cc::Eq), remaining, zero), Type::BOOL, Rep::Bool);
+    func.block_mut(header).term = Term::Branch { cond: done, then: Edge::to(exit), other: Edge::to(body) };
+    let two = constant(&mut func, body, Const::Int(2));
+    let parity = func.append(body, Op::Binary(BinOp::IMod, remaining, two), Type::INT, Rep::Int);
+    let odd = func.append(body, Op::Binary(BinOp::ICmp(Cc::Eq), parity, zero), Type::BOOL, Rep::Bool);
+    func.block_mut(body).term = Term::Branch { cond: odd, then: Edge::to(side), other: Edge::to(latch) };
+    reads(&mut func, side, body_state);
+    func.block_mut(side).term = Term::Jump(Edge::to(latch));
+    let one = constant(&mut func, latch, Const::Int(1));
+    let next = func.append(latch, Op::Binary(BinOp::ISub, remaining, one), Type::INT, Rep::Int);
+    func.block_mut(latch).term = Term::Jump(Edge { block: header, args: vec![next] });
+    func.block_mut(exit).term = Term::Return { pc: 9, first: 0, count: 0, close: false };
+    func.loops.push(Loop { header, preheader, blocks: vec![header, body, side, latch], entry_state, counted: None });
+    (func, preheader, side)
+}
+
+fn table_constant(func: &mut Func, block: BlockId) -> Val {
+    func.append(block, Op::Const(Const::Gc { tag: 5, payload: 7 }), Type::TABLE, Rep::Payload)
+}
+
+#[test]
+fn hoisting_moves_a_constant_tables_guard_and_reads_out_of_a_conditional_block() {
+    let mut table = Val(0);
+    let (mut func, preheader, side) = loop_with_side_block(|func, side, s| {
+        table = table_constant(func, side);
+        func.append(side, Op::GuardShape { table, shape: 5, state: s }, Type::NONE, Rep::None);
+        let field = func.append(side, Op::LoadSlot { table, slot: 2 }, Type::ANY, Rep::Boxed);
+        func.append(side, Op::StoreReg { slot: 1, value: field }, Type::NONE, Rep::None);
+    });
+    hoist::run(&mut func);
+    let moved = ops(&func, preheader);
+    assert!(moved.iter().any(|op| matches!(op, Op::GuardShape { table: t, .. } if *t == table)), "{moved:?}");
+    assert!(moved.iter().any(|op| matches!(op, Op::LoadSlot { table: t, slot: 2 } if *t == table)), "{moved:?}");
+    assert!(ops(&func, side).iter().all(|op| !matches!(op, Op::GuardShape { .. } | Op::LoadSlot { .. })));
+}
+
+#[test]
+fn load_forwarding_keeps_facts_across_a_merge_nothing_between_disturbs() {
+    let (mut func, entry) = straight_line();
+    let s = state(&mut func, 1);
+    let [left, right, merge] = [(); 3].map(|_| func.new_block());
+    let loaded = func.append(entry, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let table = func.append(entry, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
+    func.append(entry, Op::GuardShape { table, shape: 9, state: s }, Type::NONE, Rep::None);
+    let flag = func.append(entry, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let cond = func.append(entry, Op::GuardType { value: flag, ty: Type::BOOL, state: s }, Type::BOOL, Rep::Bool);
+    func.block_mut(entry).term = Term::Branch { cond, then: Edge::to(left), other: Edge::to(right) };
+    func.block_mut(left).term = Term::Jump(Edge::to(merge));
+    let x = constant(&mut func, right, Const::Int(3));
+    func.append(right, Op::StoreReg { slot: 2, value: x }, Type::NONE, Rep::None);
+    func.block_mut(right).term = Term::Jump(Edge::to(merge));
+    let again = func.append(merge, Op::GuardShape { table, shape: 9, state: s }, Type::NONE, Rep::None);
+    func.block_mut(merge).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
+    let mut disturbed = func.clone();
+    forward::run(&mut func);
+    assert!(!func.block(merge).insts.contains(&again), "neither path changes the table");
+    disturbed.append(right, Op::StoreSlot { table, slot: 0, value: x, state: s }, Type::NONE, Rep::None);
+    forward::run(&mut disturbed);
+    assert!(disturbed.block(merge).insts.contains(&again), "a store on one path forgets the shape");
+}
+
+#[test]
+fn type_propagation_guards_a_loop_parameter_once_on_entry() {
+    let mut func = Func::default();
+    let [entry, preheader, header, latch, exit] = [(); 5].map(|_| func.new_block());
+    func.entry = Some(entry);
+    let entry_state = state(&mut func, 3);
+    let body_state = state(&mut func, 4);
+    let loaded = func.append(entry, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    func.block_mut(entry).term = Term::Jump(Edge::to(preheader));
+    func.block_mut(preheader).term = Term::Jump(Edge { block: header, args: vec![loaded] });
+    let j = func.add_param(header, Type::ANY, Rep::Boxed);
+    let int = func.append(header, Op::GuardType { value: j, ty: Type::INT, state: body_state }, Type::INT, Rep::Boxed);
+    let zero = constant(&mut func, header, Const::Int(0));
+    let done = func.append(header, Op::Binary(BinOp::ICmp(Cc::Le), int, zero), Type::BOOL, Rep::Bool);
+    func.block_mut(header).term = Term::Branch { cond: done, then: Edge::to(exit), other: Edge::to(latch) };
+    let one = constant(&mut func, latch, Const::Int(1));
+    let next = func.append(latch, Op::Binary(BinOp::ISub, int, one), Type::INT, Rep::Int);
+    func.block_mut(latch).term = Term::Jump(Edge { block: header, args: vec![next] });
+    func.block_mut(exit).term = Term::Return { pc: 9, first: 0, count: 0, close: false };
+    func.loops.push(Loop { header, preheader, blocks: vec![header, latch], entry_state, counted: None });
+    types::run(&mut func);
+    assert_eq!(func.ty(j), Type::INT, "the parameter is an integer on every iteration");
+    assert!(ops(&func, preheader).iter().any(|op| matches!(op, Op::GuardType { value, ty: Type::INT, .. } if *value == loaded)));
+    assert!(ops(&func, header).iter().all(|op| !matches!(op, Op::GuardType { .. })), "the header no longer checks");
+}

@@ -93,6 +93,8 @@ pub(crate) trait Asm {
     /// Without loops, values seldom outlive a call, so a register the prologue need not save is cheapest.
     const CALLER_SAVED_FIRST: Registers;
     const MAX_FRAME: u32;
+    /// The register a hardware divide overwrites besides the scratch register, when it is allocatable.
+    const DIVIDE_CLOBBERS: Option<u8>;
 
     fn new() -> Self;
     fn new_label(&mut self) -> Label;
@@ -124,6 +126,8 @@ pub(crate) trait Asm {
     fn not(&mut self, dst: u8, src: u8);
     /// Follows lvm.c's `luaV_mod` and `luaV_idiv`; `y` is neither 0 nor -1.
     fn floor_div(&mut self, op: Division, dst: u8, x: u8, y: u8);
+    /// `floor_div` by a positive constant; `keep` preserves `DIVIDE_CLOBBERS` around the divide.
+    fn floor_div_by(&mut self, op: Division, dst: u8, x: u8, divisor: i64, keep: bool);
     /// `y` is not zero.
     fn unsigned_rem(&mut self, dst: u8, x: u8, y: u8);
 

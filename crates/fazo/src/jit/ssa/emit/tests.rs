@@ -291,6 +291,18 @@ mod x64_encoding {
     }
 
     #[test]
+    fn floor_division_by_a_positive_constant_rounds_on_the_remainder_sign() {
+        assert_eq!(
+            listing(|a| a.floor_div_by(Division::Mod, 12, 13, 1009, false)),
+            ["mov r11d,3F1h", "mov rax,r13", "cqo", "idiv r11", "test rdx,rdx", "jns 000000000000001Ah", "add rdx,r11", "mov r12,rdx"]
+        );
+        let quotient = listing(|a| a.floor_div_by(Division::IDiv, 12, 13, 7, true));
+        assert_eq!(quotient.first().map(String::as_str), Some("push rdx"));
+        assert!(quotient.iter().any(|line| line == "sub rax,1"), "{quotient:?}");
+        assert_eq!(quotient.last().map(String::as_str), Some("pop rdx"));
+    }
+
+    #[test]
     fn unsigned_remainder_keeps_rdx() {
         let lines = listing(|a| a.unsigned_rem(12, 13, 2));
         assert_eq!(lines.first().map(String::as_str), Some("push rdx"));
@@ -639,6 +651,9 @@ mod a64_encoding {
         assert_eq!(listing(|a| a.shl_imm(3, 4, 4)), ["lsl x3, x4, #0x4"]);
         assert_eq!(listing(|a| a.zext32(3, 4)), ["mov w3, w4"]);
         assert_eq!(listing(|a| a.neg(3, 4)), ["neg x3, x4"]);
+        let modulo = listing(|a| a.floor_div_by(Division::Mod, 3, 4, 1009, false));
+        assert_eq!(&modulo[..3], ["mov x16, #0x3f1", "sdiv x17, x4, x16", "msub x30, x17, x16, x4"], "{modulo:?}");
+        assert_eq!(modulo[4..], ["add x30, x30, x16", "mov x3, x30"], "{modulo:?}");
         assert_eq!(listing(|a| a.not(3, 4)), ["mvn x3, x4"]);
         assert_eq!(listing(|a| a.sub_mem(20, 0, 300)), ["ldr x17, [x20]", "subs x17, x17, #0x12c", "str x17, [x20]"]);
         assert_eq!(listing(|a| a.sub_mem(20, 0, 5000))[2], "subs x17, x17, x30");

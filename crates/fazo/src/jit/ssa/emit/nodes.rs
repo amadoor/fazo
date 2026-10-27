@@ -461,14 +461,18 @@ impl<A: Asm> Gen<'_, A> {
     /// answers as one would instead of trapping, as `lower.rs` does.
     fn floor_division(&mut self, value: Val, op: BinOp, left: Val, right: Val) {
         let division = if op == BinOp::IMod { Division::Mod } else { Division::IDiv };
-        let ordinary = self.is_const(right).is_some_and(|divisor| (divisor.payload() as i64) > 0);
+        let positive = self.is_const(right).map(|divisor| divisor.payload() as i64).filter(|&divisor| divisor > 0);
         let x = self.reg(left);
-        let y = self.reg(right);
-        if ordinary {
-            let out = self.out(value);
-            self.asm.floor_div(division, out, x, y);
+        if let Some(divisor) = positive {
+            let out = match (division, A::DIVIDE_CLOBBERS) {
+                (Division::Mod, Some(remainder)) => self.out_in(value, remainder),
+                _ => self.out(value),
+            };
+            let keep = A::DIVIDE_CLOBBERS.is_some_and(|clobbered| clobbered != out && self.alloc.held().any(|(reg, _)| reg == PReg::gp(clobbered)));
+            self.asm.floor_div_by(division, out, x, divisor, keep);
             return;
         }
+        let y = self.reg(right);
         let probe = self.temp();
         let out = self.out(value);
         let special = self.asm.new_label();
@@ -1058,7 +1062,7 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.branch(Cond::Eq, slow);
         self.asm.alu_imm(Alu::Sub, index, index, 1);
         self.asm.alu_imm(Alu::Or, index, index, 1);
-        self.asm.unsigned_rem(index, key, index);
+        self.key_modulo(key, index);
         self.asm.load(Width::Q, entry, address, layout.nodes);
         self.asm.bind(walk);
         self.asm.alu_imm(Alu::Mul, node, index, NODE_SIZE);
@@ -1079,6 +1083,19 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.alu_imm(Alu::Sub, index, index, 1);
         self.asm.jump(walk);
         self.asm.bind(found);
+    }
+
+    /// `key % index`, unsigned as ltable.c's `hashint`; a key below the divisor is its own remainder, which skips the divide.
+    fn key_modulo(&mut self, key: u8, index: u8) {
+        let small = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.cmp(key, index);
+        self.asm.branch(Cond::Below, small);
+        self.asm.unsigned_rem(index, key, index);
+        self.asm.jump(done);
+        self.asm.bind(small);
+        self.asm.mov(index, key);
+        self.asm.bind(done);
     }
 
     /// Jumps to `slow` past the array part.

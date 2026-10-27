@@ -87,11 +87,18 @@ pub(crate) fn run(func: &mut Func) {
             _ => roots.push(block),
         }
     }
+    let disturbs: Vec<bool> = func.blocks.iter().map(|block| block.insts.iter().any(|&value| disturbs_tables(func.op(value)))).collect();
+    let mut seen = vec![u32::MAX; func.blocks.len()];
     let mut map = func.identity_map();
     let mut dead = vec![false; func.insts.len()];
     let mut stack: Vec<(BlockId, Facts)> = roots.into_iter().map(|root| (root, Facts::default())).collect();
     while let Some((block, inherited)) = stack.pop() {
-        let mut facts = if incoming[block.0 as usize].len() == 1 { inherited } else { Facts::default() };
+        let keeps = match incoming[block.0 as usize].len() {
+            1 => true,
+            _ if inherited.tables.is_empty() => false,
+            _ => idom[block.0 as usize].is_some_and(|parent| quiet_between(parent, block, (&incoming, &disturbs), &mut seen)),
+        };
+        let mut facts = if keeps { inherited } else { Facts::default() };
         forward_block(func, block, &mut facts, (&mut map, &mut dead));
         for &child in &children[block.0 as usize] {
             stack.push((child, facts.clone()));
@@ -99,6 +106,57 @@ pub(crate) fn run(func: &mut Func) {
     }
     func.rewrite_uses(&map);
     remove(func, &dead);
+}
+
+type Incoming = [Vec<(BlockId, usize)>];
+
+/// Facts from the dominator hold at a merge when no block on a path between them can change table memory, as Maglev
+/// keeps known node aspects across a loop header its `LoopEffects` do not clobber (maglev-graph-builder.cc line 14786).
+fn quiet_between(dominator: BlockId, merge: BlockId, (incoming, disturbs): (&Incoming, &[bool]), seen: &mut [u32]) -> bool {
+    if dominator.0 == u32::MAX || dominator == merge {
+        return false;
+    }
+    let stamp = merge.0;
+    let mut work: Vec<BlockId> = incoming[merge.0 as usize].iter().map(|&(pred, _)| pred).collect();
+    while let Some(block) = work.pop() {
+        if block == dominator || seen[block.0 as usize] == stamp {
+            continue;
+        }
+        seen[block.0 as usize] = stamp;
+        if disturbs[block.0 as usize] {
+            return false;
+        }
+        work.extend(incoming[block.0 as usize].iter().map(|&(pred, _)| pred));
+    }
+    true
+}
+
+/// Reads and guards leave table memory as it was; anything else may run code or allocate.
+fn disturbs_tables(op: &Op) -> bool {
+    !op.is_pure()
+        && !matches!(
+            op,
+            Op::GuardType { .. }
+                | Op::GuardNotNil { .. }
+                | Op::GuardEq { .. }
+                | Op::GuardFalse { .. }
+                | Op::GuardShape { .. }
+                | Op::GuardNode { .. }
+                | Op::GuardHasMeta { .. }
+                | Op::GuardNoMeta { .. }
+                | Op::GuardRange { .. }
+                | Op::ShapeIs { .. }
+                | Op::LoadSlot { .. }
+                | Op::LoadNode { .. }
+                | Op::LoadProto { .. }
+                | Op::LoadUpval { .. }
+                | Op::LoadReg { .. }
+                | Op::ArrayBase { .. }
+                | Op::Requests
+                | Op::Safepoint { .. }
+                | Op::StoreReg { .. }
+                | Op::Param
+        )
 }
 
 fn base(func: &Func, map: &[Val], mut value: Val) -> Val {

@@ -62,7 +62,8 @@ fn hoist_loop(func: &mut Func, entry: &Loop, shape: &mut Shape) {
             let mut position = 0;
             while position < func.block(block).insts.len() {
                 let value = func.block(block).insts[position];
-                if !movable(func, value, &invariant, &clobbers, every_iteration[block.0 as usize]) {
+                let every = every_iteration[block.0 as usize] || constant_table_read(func, value, entry.preheader, &clobbers);
+                if !movable(func, value, &invariant, &clobbers, every) {
                     position += 1;
                     continue;
                 }
@@ -77,6 +78,22 @@ fn hoist_loop(func: &mut Func, entry: &Loop, shape: &mut Shape) {
                 changed = true;
             }
         }
+    }
+}
+
+/// A constant table's shape is the same on every path, so its guard and the slot reads it covers move out of a
+/// conditional block too; a loop that cannot reshape it would only repeat the check.
+fn constant_table_read(func: &Func, value: Val, preheader: BlockId, clobbers: &Clobbers) -> bool {
+    if clobbers.calls || clobbers.shapes {
+        return false;
+    }
+    let is_constant = |table: Val| matches!(func.op(table), Op::Const(_));
+    match *func.op(value) {
+        Op::GuardShape { table, .. } => is_constant(table),
+        Op::LoadSlot { table, .. } => {
+            is_constant(table) && func.block(preheader).insts.iter().any(|&hoisted| matches!(*func.op(hoisted), Op::GuardShape { table: guarded, .. } if guarded == table))
+        }
+        _ => false,
     }
 }
 

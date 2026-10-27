@@ -155,6 +155,7 @@ impl Asm for A64 {
     const CTX: u8 = CTX;
     const SP: u8 = STACK;
     const SCRATCH: u8 = SCRATCH;
+    const DIVIDE_CLOBBERS: Option<u8> = None;
     const FSCRATCH: u8 = FLOAT_SCRATCH;
     const OUTGOING: i32 = 0;
     const REGISTERS: Registers = Registers {
@@ -348,6 +349,25 @@ impl Asm for A64 {
         self.asm().tbz(t, imm(63), done);
         match op {
             Division::Mod => self.asm().add(rem, rem, yv),
+            Division::IDiv => self.asm().sub(q, q, imm(1)),
+        }
+        self.buffer.bind_label(done);
+        match op {
+            Division::Mod => self.asm().mov(r(dst), rem),
+            Division::IDiv => self.asm().mov(r(dst), q),
+        }
+    }
+
+    fn floor_div_by(&mut self, op: Division, dst: u8, x_reg: u8, divisor: i64, _keep: bool) {
+        let done = self.buffer.get_label();
+        let (q, rem, d) = (r(SCRATCH2), r(LINK), r(SCRATCH));
+        let xv = r(x_reg);
+        self.asm().mov(d, imm(divisor));
+        self.asm().sdiv(q, xv, d);
+        self.asm().msub(rem, q, d, xv);
+        self.asm().tbz(rem, imm(63), done);
+        match op {
+            Division::Mod => self.asm().add(rem, rem, d),
             Division::IDiv => self.asm().sub(q, q, imm(1)),
         }
         self.buffer.bind_label(done);

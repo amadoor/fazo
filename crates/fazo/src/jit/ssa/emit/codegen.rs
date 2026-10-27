@@ -446,8 +446,9 @@ impl<'a, A: Asm> Gen<'a, A> {
             Rep::Int | Rep::Float | Rep::Bool => &[0],
             _ => return false,
         };
+        let unboxed = rep == Rep::Int && self.func.rep(input) == Rep::Boxed;
         let placed = parts.iter().all(|&half| self.alloc.reg_of(part(input, half)).is_some());
-        if !dies || rep != self.func.rep(input) || self.is_const(input).is_some() || !live::has_location(self.func, value) || !placed {
+        if !dies || (rep != self.func.rep(input) && !unboxed) || self.is_const(input).is_some() || !live::has_location(self.func, value) || !placed {
             return false;
         }
         for &half in parts {
@@ -464,6 +465,16 @@ impl<'a, A: Asm> Gen<'a, A> {
             && self.is_const(input).is_none()
             && live::has_location(self.func, value)
             && let Some(reg) = self.alloc.define_over(part(value, 0), part(input, 0))
+        {
+            return reg.hw;
+        }
+        self.out(value)
+    }
+
+    pub(super) fn out_in(&mut self, value: Val, preferred: u8) -> u8 {
+        if self.func.rep(value) == Rep::Int
+            && live::has_location(self.func, value)
+            && let Some(reg) = self.alloc.define_in(part(value, 0), PReg::gp(preferred))
         {
             return reg.hw;
         }
