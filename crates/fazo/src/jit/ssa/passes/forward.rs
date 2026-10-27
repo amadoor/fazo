@@ -152,6 +152,7 @@ fn disturbs_tables(op: &Op) -> bool {
                 | Op::LoadUpval { .. }
                 | Op::LoadReg { .. }
                 | Op::ArrayBase { .. }
+                | Op::TableAddr { .. }
                 | Op::Requests
                 | Op::Safepoint { .. }
                 | Op::StoreReg { .. }

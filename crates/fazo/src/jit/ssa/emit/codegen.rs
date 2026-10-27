@@ -146,6 +146,10 @@ pub(super) struct Gen<'a, A: Asm> {
     pub(super) ctx_at: i32,
     next_block: Option<BlockId>,
     pub(super) switched: Option<Val>,
+    /// A load that already matched the next node's type guard jumps past the guard's check.
+    pub(super) guarded: Option<(Val, Label)>,
+    pub(super) block_now: BlockId,
+    idom: Option<Vec<Option<BlockId>>>,
     /// Lets a call's settled path jump straight to this pc's case.
     pub(super) settled: Option<(u32, Label)>,
     /// A call into a vararg prototype moves the results' place, so every call writes `ret_offset`.
@@ -164,12 +168,14 @@ pub(super) struct Generated<A> {
     pub(super) roots: Vec<(u32, Label)>,
 }
 
+/// One extra value past the instructions holds the VM register base between nodes that cannot move the stack.
 fn classes(func: &Func) -> Vec<Class> {
-    let mut classes = Vec::with_capacity(func.insts.len() * 2);
+    let mut classes = Vec::with_capacity(func.insts.len() * 2 + 2);
     for inst in &func.insts {
         classes.push(if inst.rep == Rep::Float { Class::Fp } else { Class::Gp });
         classes.push(Class::Gp);
     }
+    classes.extend([Class::Gp, Class::Gp]);
     classes
 }
 
@@ -212,6 +218,9 @@ impl<'a, A: Asm> Gen<'a, A> {
             ctx_at,
             next_block: None,
             switched: None,
+            guarded: None,
+            block_now: BlockId(0),
+            idom: None,
             settled: None,
             calls_vararg: env.calls.iter().flatten().any(|target| target.vararg),
             failed: false,
@@ -275,6 +284,7 @@ impl<'a, A: Asm> Gen<'a, A> {
             }
         };
         self.alloc.enter(&entries);
+        self.block_now = block;
         self.dying = self.live.deaths(self.func, block, &mut self.alloc.last);
         let data = self.func.block(block);
         self.switched = match data.term {
@@ -554,6 +564,24 @@ impl<'a, A: Asm> Gen<'a, A> {
         self.ctx_load(dst, offset_of!(JitCtx, registers));
     }
 
+    fn base_value(&self) -> Val {
+        Val(self.func.insts.len() as u32)
+    }
+
+    /// The register base, kept from an earlier node until a call can move the stack.
+    pub(super) fn registers_base(&mut self) -> u8 {
+        let part = part(self.base_value(), 0);
+        if let Some(reg) = self.alloc.reg_of(part) {
+            self.alloc.pin(reg);
+            return reg.hw;
+        }
+        let (alloc, mut moves) = self.mover();
+        let reg = alloc.define(part, &mut moves);
+        alloc.mark_rebuilt(part);
+        self.registers(reg.hw);
+        reg.hw
+    }
+
     fn place(&mut self, value: Val) -> Place {
         let ty = self.func.ty(value);
         if let Some(constant) = self.is_const(value) {
@@ -692,6 +720,7 @@ impl<'a, A: Asm> Gen<'a, A> {
     }
 
     pub(super) fn saves(&mut self, after: &[Val]) -> Vec<(PReg, u32, bool)> {
+        self.alloc.release(self.base_value());
         let value = self.current;
         let needed = self.state_values(value);
         let dying = self.dying.get(self.position).cloned().unwrap_or_default();
@@ -878,27 +907,45 @@ impl<'a, A: Asm> Gen<'a, A> {
             }
         }
         let used = self.used_in_loop(target);
-        let entries = self.alloc.fix(&live, &params, |part| used.as_ref().is_some_and(|used| !used[value_of(part).0 as usize]));
+        let spilled = |part: Part| used.as_ref().is_some_and(|(used, _)| !used[value_of(part).0 as usize]);
+        let hot = |part: Part| used.as_ref().is_some_and(|(_, hot)| hot[value_of(part).0 as usize]);
+        let entries = self.alloc.fix(&live, &params, spilled, hot);
         self.snapshots[target.0 as usize] = Some(entries.clone());
         entries
     }
 
-    /// For a loop header, the values its loop reads as operands; the rest are only carried for frame states.
-    fn used_in_loop(&self, header: BlockId) -> Option<Vec<bool>> {
+    /// For a loop header, the values its loop reads as operands, and those read on every iteration; the rest are only
+    /// carried for frame states.
+    fn used_in_loop(&mut self, header: BlockId) -> Option<(Vec<bool>, Vec<bool>)> {
         let looped = self.func.loops.iter().find(|candidate| candidate.header == header)?;
+        let mut inside = vec![false; self.func.blocks.len()];
+        for &block in &looped.blocks {
+            inside[block.0 as usize] = true;
+        }
+        let idom = self.idom.get_or_insert_with(|| self.func.dominators());
+        let every = crate::jit::ssa::passes::hoist::blocks_on_every_iteration(self.func, looped, &inside, idom);
         let mut used = vec![false; self.func.insts.len()];
+        let mut hot = vec![false; self.func.insts.len()];
         for &block in &looped.blocks {
             let data = self.func.block(block);
+            let mut mark = |operand: Val| {
+                used[operand.0 as usize] = true;
+                hot[operand.0 as usize] |= every[block.0 as usize];
+            };
             for &value in &data.insts {
-                self.func.op(value).for_each_operand(|operand| used[operand.0 as usize] = true);
+                let op = self.func.op(value);
+                op.for_each_operand(&mut mark);
+                if let Some(payload) = live::payload_use(self.func, op) {
+                    mark(payload);
+                }
             }
             match &data.term {
-                Term::Branch { cond, .. } => used[cond.0 as usize] = true,
-                Term::Switch { code, .. } => used[code.0 as usize] = true,
+                Term::Branch { cond, .. } => mark(*cond),
+                Term::Switch { code, .. } => mark(*code),
                 _ => {}
             }
         }
-        Some(used)
+        Some((used, hot))
     }
 
     fn edge_pairs(&mut self, edge: &Edge) -> Vec<(Want, Have)> {

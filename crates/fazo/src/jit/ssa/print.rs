@@ -181,6 +181,7 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::LoadSlot { table, slot } => format!("load.slot {} #{slot}", v(table)),
         Op::LoadProto { closure } => format!("load.proto {}", v(closure)),
         Op::ArrayBase { table } => format!("array.base {}", v(table)),
+        Op::TableAddr { table } => format!("table.addr {}", v(table)),
         Op::LoadArray { table, base, index, state } => format!("load.array {} {} [{}] s{}", v(table), v(base), v(index), state.0),
         Op::GuardType { value, ty, state } => format!("guard.type {} {ty} s{}", v(value), state.0),
         Op::GuardShape { table, shape, state } => format!("guard.shape {} {shape:x} s{}", v(table), state.0),

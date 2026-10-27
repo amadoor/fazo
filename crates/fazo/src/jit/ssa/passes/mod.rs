@@ -1,3 +1,4 @@
+pub(crate) mod address;
 pub(crate) mod bounds;
 pub(crate) mod dce;
 pub(crate) mod escape;
@@ -41,6 +42,7 @@ pub(crate) const OPTIMIZING: &[Pass] = &[
     ("hoist", hoist::run),
     ("bounds", bounds::run),
     ("dce", dce::run),
+    ("address", address::run),
 ];
 
 /// Follows V8's `--maglev-verify-graph`.

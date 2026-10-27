@@ -717,6 +717,7 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 Word::None
             }
             Op::Requests => Word::One(self.ctx_load(self.pointer, offset_of!(JitCtx, requests))),
+            Op::TableAddr { table } => Word::One(self.table_address(self.one(table))),
             Op::ArrayBase { table } => {
                 let address = self.table_address(self.one(table));
                 Word::One(self.builder.ins().load(self.pointer, self.heap_flags, address, self.env.layout.array))

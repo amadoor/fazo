@@ -22,6 +22,13 @@ const NODE_VALUE: i32 = crate::table::offsets::NODE_VALUE as i32;
 
 type Saves = Vec<(PReg, u32, bool)>;
 
+#[derive(Clone, Copy)]
+pub(super) struct Base {
+    pub(super) reg: u8,
+    payload: Option<u8>,
+    reusable: bool,
+}
+
 pub(super) fn int_cond(cc: Cc) -> Cond {
     match cc {
         Cc::Eq => Cond::Eq,
@@ -63,15 +70,13 @@ impl<A: Asm> Gen<'_, A> {
         match &func.inst(value).op {
             Op::Param | Op::Const(_) => {}
             Op::LoadReg { slot } => {
-                let base = self.temp();
                 let def = self.define(value);
-                self.registers(base);
+                let base = self.registers_base();
                 self.load_def(def, base, slot_offset(*slot));
             }
             Op::StoreReg { slot, value: stored } => {
                 let pair = self.pair(*stored);
-                let base = self.temp();
-                self.registers(base);
+                let base = self.registers_base();
                 self.store_pair(pair, base, slot_offset(*slot));
             }
             Op::LoadUpval { closure, index } => {
@@ -92,12 +97,12 @@ impl<A: Asm> Gen<'_, A> {
             Op::Len { value: operand, state } => self.len(value, *operand, *state),
             Op::ShapeIs { table, shape } => self.shape_is(value, *table, *shape),
             Op::LoadSlot { table, slot } => {
-                let payload = self.reg(*table);
-                let address = self.temp();
+                let base = self.table_base(*table);
+                let slots = self.writable(base);
                 let def = self.define(value);
-                self.table_address(address, payload);
-                self.asm.load(Width::Q, address, address, self.env.layout.slots);
-                self.load_def(def, address, slot_offset(*slot));
+                self.fill(base);
+                self.asm.load(Width::Q, slots, base.reg, self.env.layout.slots);
+                self.load_def(def, slots, slot_offset(*slot));
             }
             Op::LoadProto { closure } => {
                 let payload = self.reg(*closure);
@@ -106,13 +111,21 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.load(Width::Q, out, out, offset_of!(crate::object::Closure, proto) as i32);
             }
             Op::ArrayBase { table } => {
+                let base = self.table_base(*table);
+                let Def::Gp(out) = self.define(value) else {
+                    self.failed = true;
+                    return;
+                };
+                self.fill(base);
+                self.asm.load(Width::Q, out, base.reg, self.env.layout.array);
+            }
+            Op::TableAddr { table } => {
                 let payload = self.reg(*table);
                 let Def::Gp(out) = self.define(value) else {
                     self.failed = true;
                     return;
                 };
                 self.table_address(out, payload);
-                self.asm.load(Width::Q, out, out, self.env.layout.array);
             }
             Op::LoadArray { table, base, index, state } => self.load_array(value, (*table, *base), *index, *state),
             Op::Requests => {
@@ -124,23 +137,21 @@ impl<A: Asm> Gen<'_, A> {
             }
             Op::GuardType { value: input, ty, state } => self.guard_type(value, *input, *ty, *state),
             Op::GuardShape { table, shape, state } => {
-                let payload = self.reg(*table);
-                let address = self.temp();
+                let base = self.table_base(*table);
                 let exit = self.exit(*state);
-                self.table_address(address, payload);
-                self.check_shape(address, *shape, exit);
+                self.fill(base);
+                self.check_shape(base.reg, *shape, exit);
             }
             Op::GuardHasMeta { table, state } => {
-                let payload = self.reg(*table);
-                let address = self.temp();
+                let base = self.table_base(*table);
                 let out = self.out(value);
                 let exit = self.exit(*state);
                 let layout = self.env.layout;
-                self.table_address(address, payload);
-                self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_tag);
+                self.fill(base);
+                self.asm.load(Width::W, A::SCRATCH, base.reg, layout.metatable_tag);
                 self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
                 self.asm.branch(Cond::Eq, exit);
-                self.asm.load(Width::Q, out, address, layout.metatable_index);
+                self.asm.load(Width::Q, out, base.reg, layout.metatable_index);
             }
             Op::GuardNoMeta { table, bit, state } => self.guard_no_meta(*table, *bit, *state),
             Op::GuardEq { value: input, expected, state } => {
@@ -177,26 +188,26 @@ impl<A: Asm> Gen<'_, A> {
             Op::StoreSlot { table, slot, value: stored, state } => {
                 let disp = slot_offset(*slot);
                 let layout = self.env.layout;
-                self.store_checked(*table, *stored, *state, |g, address| {
-                    g.asm.load(Width::Q, address, address, layout.slots);
+                self.store_checked(*table, *stored, *state, |g, (dst, table)| {
+                    g.asm.load(Width::Q, dst, table, layout.slots);
                     disp
                 });
             }
             Op::AddSlot { table, key, shape, next, slot, value: stored, state } => self.add_slot(*table, *key, (*shape, *next, *slot), *stored, *state),
             Op::GuardNode { table, node, nodes, key, state } => self.guard_node(*table, (*node, *nodes), *key, *state),
             Op::LoadNode { table, node } => {
-                let payload = self.reg(*table);
-                let address = self.temp();
+                let base = self.table_base(*table);
+                let nodes = self.writable(base);
                 let def = self.define(value);
-                self.table_address(address, payload);
-                self.asm.load(Width::Q, address, address, self.env.layout.nodes);
-                self.load_def(def, address, *node as i32 * NODE_SIZE + NODE_VALUE);
+                self.fill(base);
+                self.asm.load(Width::Q, nodes, base.reg, self.env.layout.nodes);
+                self.load_def(def, nodes, *node as i32 * NODE_SIZE + NODE_VALUE);
             }
             Op::StoreNode { table, node, value: stored, state } => {
                 let disp = *node as i32 * NODE_SIZE + NODE_VALUE;
                 let layout = self.env.layout;
-                self.store_checked(*table, *stored, *state, |g, address| {
-                    g.asm.load(Width::Q, address, address, layout.nodes);
+                self.store_checked(*table, *stored, *state, |g, (dst, table)| {
+                    g.asm.load(Width::Q, dst, table, layout.nodes);
                     disp
                 });
             }
@@ -205,17 +216,49 @@ impl<A: Asm> Gen<'_, A> {
             Op::NewTable { hash_log, top, shape, fields, state, after } => self.new_table(value, (*hash_log, *top), (*shape, fields), (*state, *after)),
             Op::Materialize { object } => self.materialize(value, object),
             Op::GuardAbsent { table, bit, state } => {
-                let payload = self.reg(*table);
-                let address = self.temp();
+                let base = self.table_base(*table);
                 let exit = self.exit(*state);
-                self.table_address(address, payload);
-                self.asm.load(Width::B, A::SCRATCH, address, self.env.layout.absent);
+                self.fill(base);
+                self.asm.load(Width::B, A::SCRATCH, base.reg, self.env.layout.absent);
                 self.asm.test_imm(A::SCRATCH, i32::from(*bit));
                 self.asm.branch(Cond::Eq, exit);
             }
             Op::CallLua { pc, a, b, c, inlined: None } => self.call_lua(value, *pc as usize, (*a, *b, *c)),
             Op::CallLua { inlined: Some(call), .. } => self.call_inlined(value, *call as usize),
             Op::Safepoint { pc, weight, requests, state } => self.safepoint(*pc, *weight, *requests, *state),
+        }
+    }
+
+    /// A table operand's address: a `TableAddr` value's register, which the node only reads, or a temporary `fill`
+    /// computes from the payload.
+    pub(super) fn table_base(&mut self, table: Val) -> Base {
+        if let Op::TableAddr { .. } = self.func.op(table) {
+            let reusable = self.dying.get(self.position).is_some_and(|dying| dying.contains(&table));
+            return Base { reg: self.reg(table), payload: None, reusable };
+        }
+        let payload = self.reg(table);
+        Base { reg: self.temp(), payload: Some(payload), reusable: true }
+    }
+
+    /// The table's payload, for helpers and the collector's marks.
+    pub(super) fn table_payload(&mut self, table: Val) -> u8 {
+        match *self.func.op(table) {
+            Op::TableAddr { table: payload } => self.reg(payload),
+            _ => self.reg(table),
+        }
+    }
+
+    /// A register the node may overwrite once it has read the table through `base`.
+    pub(super) fn writable(&mut self, base: Base) -> u8 {
+        if base.reusable {
+            return base.reg;
+        }
+        self.temp()
+    }
+
+    pub(super) fn fill(&mut self, base: Base) {
+        if let Some(payload) = base.payload {
+            self.table_address(base.reg, payload);
         }
     }
 
@@ -818,13 +861,12 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn shape_is(&mut self, value: Val, table: Val, shape: u64) {
-        let payload = self.reg(table);
-        let address = self.temp();
+        let base = self.table_base(table);
         let out = self.out(value);
         let done = self.asm.new_label();
-        self.table_address(address, payload);
+        self.fill(base);
         self.asm.mov_imm(out, 0);
-        self.check_shape(address, shape, done);
+        self.check_shape(base.reg, shape, done);
         self.asm.mov_imm(out, 1);
         self.asm.bind(done);
     }
@@ -845,6 +887,7 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.alu(Alu::Add, address, address, elements);
         self.asm.load(Width::Q, tag, address, -VALUE_SIZE);
         self.asm.load(Width::Q, word, address, -VALUE_SIZE + PAYLOAD);
+        self.expected_tag(value, tag);
         self.asm.cmp_byte(tag, NIL_TAG);
         self.asm.branch(Cond::Ne, join);
         self.call_value(runtime::KIND_INDEX, &[(Src::I(i64::from(TABLE_TAG)), Src::R(payload)), key], 0, &saves);
@@ -855,9 +898,30 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(join);
     }
 
+    /// When the next node guards this load to one tag, a match skips both the nil test and that guard.
+    fn expected_tag(&mut self, value: Val, tag: u8) {
+        let Some(&next) = self.func.block(self.block_now).insts.get(self.position + 1) else {
+            return;
+        };
+        let Op::GuardType { value: guarded, ty, .. } = *self.func.op(next) else {
+            return;
+        };
+        let Some(wanted) = ty.tag().filter(|&wanted| guarded == value && wanted != NIL_TAG) else {
+            return;
+        };
+        let label = match self.guarded {
+            Some((known, label)) if known == next => label,
+            _ => self.asm.new_label(),
+        };
+        self.guarded = Some((next, label));
+        self.asm.cmp_byte(tag, wanted);
+        self.asm.branch(Cond::Eq, label);
+    }
+
     fn guard_type(&mut self, value: Val, input: Val, ty: Type, state: StateId) {
         let tag = self.tag(input);
         let exit = self.exit(state);
+        let skip = self.guarded.take().filter(|&(guard, _)| guard == value).map(|(_, label)| label);
         match tag {
             Src::R(reg) => match ty.tag() {
                 Some(single) => {
@@ -885,6 +949,9 @@ impl<A: Asm> Gen<'_, A> {
             Src::I(known) if ty.intersect(Type::of_tag(known as u8)).is_none() => self.asm.jump(exit),
             _ => {}
         }
+        if let Some(label) = skip {
+            self.asm.bind(label);
+        }
         if !self.same_as_input(value, input) {
             let def = self.define(value);
             self.convert(def, input);
@@ -892,16 +959,16 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn guard_no_meta(&mut self, table: Val, bit: u8, state: StateId) {
-        let payload = self.reg(table);
-        let address = self.temp();
+        let base = self.table_base(table);
+        let address = self.writable(base);
         let exit = self.exit(state);
         let layout = self.env.layout;
         let absent = self.asm.new_label();
-        self.table_address(address, payload);
-        self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_tag);
+        self.fill(base);
+        self.asm.load(Width::W, A::SCRATCH, base.reg, layout.metatable_tag);
         self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
         self.asm.branch(Cond::Eq, absent);
-        self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_index);
+        self.asm.load(Width::W, A::SCRATCH, base.reg, layout.metatable_index);
         self.table_address(address, A::SCRATCH);
         self.asm.load(Width::B, A::SCRATCH, address, layout.absent);
         self.asm.test_imm(A::SCRATCH, i32::from(bit));
@@ -910,13 +977,13 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn guard_range(&mut self, table: Val, (low, high): (Val, Val), state: StateId) {
-        let payload = self.reg(table);
+        let base = self.table_base(table);
         let low = self.reg(low);
         let high = self.reg(high);
-        let length = self.temp();
+        let length = self.writable(base);
         let exit = self.exit(state);
-        self.table_address(length, payload);
-        self.asm.load(Width::Q, length, length, self.env.layout.array_len);
+        self.fill(base);
+        self.asm.load(Width::Q, length, base.reg, self.env.layout.array_len);
         for index in [low, high] {
             self.asm.alu_imm(Alu::Sub, A::SCRATCH, index, 1);
             self.asm.cmp(A::SCRATCH, length);
@@ -937,10 +1004,11 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn index(&mut self, value: Val, object: Val, key: Val, state: StateId) {
-        let payload = self.reg(object);
+        let base = self.table_base(object);
+        let payload = self.table_payload(object);
         let pair = self.pair(key);
         let integer = self.integer_key(key);
-        let address = self.temp();
+        let address = self.writable(base);
         let Def::Two(tag, word) = self.define(value) else {
             self.failed = true;
             return;
@@ -959,19 +1027,21 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.cmp_byte(key_tag, INT_TAG);
                 self.asm.branch(Cond::Ne, strings);
             }
-            self.inside(address, payload, index, tag, ints);
-            self.asm.load(Width::Q, address, address, self.env.layout.array);
+            self.inside(base, index, tag, ints);
+            self.asm.load(Width::Q, address, base.reg, self.env.layout.array);
             self.asm.shl_imm(tag, tag, 4);
             self.asm.alu(Alu::Add, address, address, tag);
             self.asm.load(Width::Q, tag, address, 0);
             self.asm.load(Width::Q, word, address, PAYLOAD);
+            self.expected_tag(value, tag);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
             self.asm.jump(slow);
             self.asm.bind(ints);
-            self.int_node((address, index), temps, slow);
+            self.int_node((base.reg, index), temps, slow);
             self.asm.load(Width::Q, tag, temps[2], NODE_VALUE);
             self.asm.load(Width::Q, word, temps[2], NODE_VALUE + PAYLOAD);
+            self.expected_tag(value, tag);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
             if string.is_some() {
@@ -980,7 +1050,7 @@ impl<A: Asm> Gen<'_, A> {
         }
         if let (Some((key_tag, key_word)), Some((entry, key, node))) = (string, probe) {
             self.asm.bind(strings);
-            self.string_node((payload, key_tag, key_word), [address, entry, tag, key, node], slow);
+            self.string_node((base, key_tag, key_word), [entry, tag, key, node], slow);
             self.asm.load(Width::Q, tag, node, NODE_VALUE);
             self.asm.load(Width::Q, word, node, NODE_VALUE + PAYLOAD);
             self.asm.cmp_byte(tag, NIL_TAG);
@@ -1005,15 +1075,16 @@ impl<A: Asm> Gen<'_, A> {
 
     /// Follows LuaJIT's `asm_href` (lj_asm.c).
     /// The key is copied first, since the result registers may share the key's.
-    fn string_node(&mut self, (table, key_tag, key_word): (u8, u8, u8), [address, entry, index, key, node]: [u8; 5], slow: Label) {
+    fn string_node(&mut self, (base, key_tag, key_word): (Base, u8, u8), [entry, index, key, node]: [u8; 4], slow: Label) {
         let layout = self.env.layout;
         let walk = self.asm.new_label();
         let follow = self.asm.new_label();
         let found = self.asm.new_label();
+        let address = base.reg;
         self.asm.cmp_byte(key_tag, STRING_TAG);
         self.asm.branch(Cond::Ne, slow);
         self.asm.mov(key, key_word);
-        self.table_address(address, table);
+        self.fill(base);
         self.asm.load(Width::B, A::SCRATCH, address, layout.shaped);
         self.asm.cmp_imm(A::SCRATCH, 0);
         self.asm.branch(Cond::Ne, slow);
@@ -1099,9 +1170,9 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// Jumps to `slow` past the array part.
-    fn inside(&mut self, address: u8, table: u8, index: u8, position: u8, slow: Label) {
-        self.table_address(address, table);
-        self.asm.load(Width::Q, A::SCRATCH, address, self.env.layout.array_len);
+    fn inside(&mut self, base: Base, index: u8, position: u8, slow: Label) {
+        self.fill(base);
+        self.asm.load(Width::Q, A::SCRATCH, base.reg, self.env.layout.array_len);
         self.asm.alu_imm(Alu::Sub, position, index, 1);
         self.asm.cmp(position, A::SCRATCH);
         self.asm.branch(Cond::AboveEq, slow);
@@ -1110,11 +1181,12 @@ impl<A: Asm> Gen<'_, A> {
     /// The raw store runs only when no `__newindex` can fire (`quick::raw_set` decides).
     fn new_index(&mut self, object: Val, key: Val, stored: Val, state: StateId) {
         let value = self.pair(stored);
-        let payload = self.reg(object);
+        let base = self.table_base(object);
+        let payload = self.table_payload(object);
         let key_pair = self.pair(key);
         let integer = self.integer_key(key);
         let string = self.string_key(key);
-        let address = self.temp();
+        let address = self.writable(base);
         let element = self.temp();
         let scratch = (string.is_some() || integer.is_some()).then(|| [self.temp(), self.temp()]);
         let probe = string.and(scratch).map(|[entry, key]| (entry, key, self.temp()));
@@ -1131,14 +1203,14 @@ impl<A: Asm> Gen<'_, A> {
                 self.asm.cmp_byte(key_tag, INT_TAG);
                 self.asm.branch(Cond::Ne, strings);
             }
-            self.inside(address, payload, index, element, ints);
+            self.inside(base, index, element, ints);
             self.asm.shl_imm(element, element, 4);
-            self.asm.load(Width::Q, A::SCRATCH, address, layout.array);
+            self.asm.load(Width::Q, A::SCRATCH, base.reg, layout.array);
             self.asm.alu(Alu::Add, element, element, A::SCRATCH);
             self.asm.load(Width::B, A::SCRATCH, element, 0);
             self.asm.cmp_imm(A::SCRATCH, 0);
             self.asm.branch(Cond::Ne, store);
-            self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_tag);
+            self.asm.load(Width::W, A::SCRATCH, base.reg, layout.metatable_tag);
             self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
             self.asm.branch(Cond::Ne, slow);
             self.asm.bind(store);
@@ -1148,7 +1220,7 @@ impl<A: Asm> Gen<'_, A> {
             }
             self.asm.jump(done);
             self.asm.bind(ints);
-            self.int_node((address, index), temps, slow);
+            self.int_node((base.reg, index), temps, slow);
             self.asm.load(Width::B, A::SCRATCH, element, NODE_VALUE);
             self.asm.cmp_imm(A::SCRATCH, i32::from(NIL_TAG));
             self.asm.branch(Cond::Eq, slow);
@@ -1160,7 +1232,7 @@ impl<A: Asm> Gen<'_, A> {
         }
         if let (Some((key_tag, key_word)), Some((entry, key, node))) = (string, probe) {
             self.asm.bind(strings);
-            self.string_node((payload, key_tag, key_word), [address, entry, element, key, node], slow);
+            self.string_node((base, key_tag, key_word), [entry, element, key, node], slow);
             self.asm.load(Width::B, A::SCRATCH, node, NODE_VALUE);
             self.asm.cmp_imm(A::SCRATCH, i32::from(NIL_TAG));
             self.asm.branch(Cond::Eq, slow);
@@ -1205,15 +1277,16 @@ impl<A: Asm> Gen<'_, A> {
     fn add_slot(&mut self, table: Val, key: Val, (shape, next, slot): (u64, u64, u32), stored: Val, state: StateId) {
         let layout = self.env.layout;
         let value = self.pair(stored);
-        let payload = self.reg(table);
+        let base = self.table_base(table);
+        let payload = self.table_payload(table);
         let key_pair = self.pair(key);
-        let address = self.temp();
+        let address = base.reg;
         let length = self.temp();
         let mark = self.temp();
         let saves = self.saves(&[]);
         let slow = self.asm.new_label();
         let done = self.asm.new_label();
-        self.table_address(address, payload);
+        self.fill(base);
         self.check_shape(address, shape, slow);
         self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_tag);
         self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
@@ -1259,16 +1332,17 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// `address` returns the displacement from the table's base.
-    fn store_checked(&mut self, table: Val, stored: Val, state: StateId, address: impl FnOnce(&mut Self, u8) -> i32) {
+    fn store_checked(&mut self, table: Val, stored: Val, state: StateId, address: impl FnOnce(&mut Self, (u8, u8)) -> i32) {
         let value = self.pair(stored);
-        let payload = self.reg(table);
-        let base = self.temp();
-        let temp = self.temp();
+        let table_base = self.table_base(table);
         let collects = self.may_collect(stored);
+        let payload = if collects { self.table_payload(table) } else { A::SCRATCH };
+        let base = self.writable(table_base);
+        let temp = self.temp();
         let saves = if collects { self.saves(&[]) } else { Vec::new() };
         let exit = self.exit(state);
-        self.table_address(base, payload);
-        let disp = address(self, base);
+        self.fill(table_base);
+        let disp = address(self, (base, table_base.reg));
         self.asm.cmp_mem_byte(base, disp, 0);
         self.asm.branch(Cond::Eq, exit);
         self.store_pair(value, base, disp);
@@ -1279,18 +1353,18 @@ impl<A: Asm> Gen<'_, A> {
 
     fn guard_node(&mut self, table: Val, (node, nodes): (u32, u32), key: u64, state: StateId) {
         let layout = self.env.layout;
-        let payload = self.reg(table);
-        let address = self.temp();
+        let base = self.table_base(table);
+        let address = self.writable(base);
         let exit = self.exit(state);
         let key_at = node as i32 * NODE_SIZE + NODE_KEY;
-        self.table_address(address, payload);
-        self.asm.load(Width::B, A::SCRATCH, address, layout.shaped);
+        self.fill(base);
+        self.asm.load(Width::B, A::SCRATCH, base.reg, layout.shaped);
         self.asm.cmp_imm(A::SCRATCH, 0);
         self.asm.branch(Cond::Ne, exit);
-        self.asm.load(Width::Q, A::SCRATCH, address, layout.nodes_len);
+        self.asm.load(Width::Q, A::SCRATCH, base.reg, layout.nodes_len);
         self.asm.cmp_imm64(A::SCRATCH, i64::from(nodes));
         self.asm.branch(Cond::Ne, exit);
-        self.asm.load(Width::Q, address, address, layout.nodes);
+        self.asm.load(Width::Q, address, base.reg, layout.nodes);
         self.asm.load(Width::B, A::SCRATCH, address, key_at);
         self.asm.cmp_imm(A::SCRATCH, i32::from(STRING_TAG));
         self.asm.branch(Cond::Ne, exit);
@@ -1458,13 +1532,19 @@ impl<A: Asm> Gen<'_, A> {
     /// `SCRATCH` holds the table's address; the shape is compared in place, so no flag lives in a register.
     fn shape_branch(&mut self, (table, shape): (Val, u64), negate: bool, target: Label) {
         let layout = self.env.layout;
-        let payload = self.reg(table);
         let skip = self.asm.new_label();
         let unshaped = if negate { target } else { skip };
-        self.table_address(A::SCRATCH, payload);
-        self.asm.cmp_mem_byte(A::SCRATCH, layout.shaped, 0);
+        let address = match self.func.op(table) {
+            Op::TableAddr { .. } => self.reg(table),
+            _ => {
+                let payload = self.reg(table);
+                self.table_address(A::SCRATCH, payload);
+                A::SCRATCH
+            }
+        };
+        self.asm.cmp_mem_byte(address, layout.shaped, 0);
         self.asm.branch(Cond::Eq, unshaped);
-        self.asm.load(Width::Q, A::SCRATCH, A::SCRATCH, layout.shape);
+        self.asm.load(Width::Q, A::SCRATCH, address, layout.shape);
         self.asm.cmp_imm64(A::SCRATCH, shape as i64);
         self.asm.branch(if negate { Cond::Ne } else { Cond::Eq }, target);
         self.asm.bind(skip);

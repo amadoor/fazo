@@ -2,7 +2,7 @@ use super::super::{
     build, check,
     ir::{BinOp, BlockId, BuiltinFn, Cc, Const, Counted, Edge, FrameState, Func, Loop, NumOp, Op, Rep, StateId, Term, Type, UnOp, Val},
 };
-use super::{bounds, dce, escape, fold, forward, hoist, inline, repr, types};
+use super::{address, bounds, dce, escape, fold, forward, hoist, inline, repr, types};
 use crate::{arena::Ref, proto::Proto};
 
 fn state(func: &mut Func, pc: u32) -> StateId {
@@ -776,4 +776,53 @@ fn type_propagation_guards_a_loop_parameter_once_on_entry() {
     assert_eq!(func.ty(j), Type::INT, "the parameter is an integer on every iteration");
     assert!(ops(&func, preheader).iter().any(|op| matches!(op, Op::GuardType { value, ty: Type::INT, .. } if *value == loaded)));
     assert!(ops(&func, header).iter().all(|op| !matches!(op, Op::GuardType { .. })), "the header no longer checks");
+}
+
+fn table_reads(fixture: &mut CountedLoop, between: Option<Op>) -> Vec<Val> {
+    let header = fixture.header;
+    let mut reads = Vec::new();
+    for slot in 0..2 {
+        let read = fixture.func.add_inst(Op::LoadSlot { table: fixture.guard, slot }, Type::ANY, Rep::Boxed);
+        fixture.func.block_mut(header).insts.insert(2 + slot as usize * 2, read);
+        reads.push(read);
+        if slot == 0
+            && let Some(op) = between.clone()
+        {
+            let value = fixture.func.add_inst(op, Type::NONE, Rep::Word);
+            fixture.func.block_mut(header).insts.insert(3, value);
+        }
+    }
+    reads
+}
+
+fn table_operand_of(func: &Func, value: Val) -> Val {
+    match *func.op(value) {
+        Op::LoadSlot { table, .. } => table,
+        _ => unreachable!("a slot read"),
+    }
+}
+
+#[test]
+fn table_addresses_move_to_the_preheader_of_a_loop_that_cannot_allocate() {
+    let mut fixture = counted_loop();
+    hoist::run(&mut fixture.func);
+    let reads = table_reads(&mut fixture, None);
+    address::run(&mut fixture.func);
+    check::check(&fixture.func, true).expect("the graph stays valid");
+    let address = table_operand_of(&fixture.func, reads[0]);
+    assert_eq!(*fixture.func.op(address), Op::TableAddr { table: fixture.guard });
+    assert!(fixture.func.block(fixture.preheader).insts.contains(&address), "the preheader computes the address");
+    assert_eq!(table_operand_of(&fixture.func, reads[1]), address, "both reads share it");
+}
+
+#[test]
+fn table_addresses_are_recomputed_after_a_call() {
+    let mut fixture = counted_loop();
+    hoist::run(&mut fixture.func);
+    let reads = table_reads(&mut fixture, Some(Op::CallLua { pc: 6, a: 0, b: 1, c: 1, inlined: None }));
+    address::run(&mut fixture.func);
+    check::check(&fixture.func, true).expect("the graph stays valid");
+    let preheader = ops(&fixture.func, fixture.preheader);
+    assert!(!preheader.iter().any(|op| matches!(op, Op::TableAddr { .. })), "the loop may grow the arena");
+    assert_eq!(table_operand_of(&fixture.func, reads[1]), fixture.guard, "a lone read after the call computes its own address");
 }

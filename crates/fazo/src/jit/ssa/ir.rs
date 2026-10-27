@@ -257,6 +257,9 @@ pub(crate) enum Op {
     LoadProto { closure: Val },
     /// Read once before a loop that cannot resize the array.
     ArrayBase { table: Val },
+    /// A table's address in the arena, valid until something allocates a collectable object; only the Optimizing
+    /// backend reads it, as the table operand of the table operations after it.
+    TableAddr { table: Val },
     LoadArray { table: Val, base: Val, index: Val, state: StateId },
     GuardType { value: Val, ty: Type, state: StateId },
     GuardShape { table: Val, shape: u64, state: StateId },
@@ -298,7 +301,7 @@ impl Op {
         match self {
             Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
             Op::Safepoint { requests, .. } => f(*requests),
-            Op::ArrayBase { table } => f(*table),
+            Op::ArrayBase { table } | Op::TableAddr { table } => f(*table),
             Op::NewTable { fields, .. } => fields.iter().for_each(|&field| f(field)),
             Op::Materialize { object } => object.for_each_operand(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) | Op::Len { value, .. } => f(*value),
@@ -357,7 +360,7 @@ impl Op {
         match self {
             Op::Param | Op::Const(_) | Op::LoadReg { .. } | Op::Helper(_) | Op::CallLua { .. } | Op::Requests => {}
             Op::Safepoint { requests, .. } => *requests = f(*requests),
-            Op::ArrayBase { table } => *table = f(*table),
+            Op::ArrayBase { table } | Op::TableAddr { table } => *table = f(*table),
             Op::NewTable { fields, .. } => fields.iter_mut().for_each(|field| *field = f(*field)),
             Op::Materialize { object } => object.map_operands(&mut f),
             Op::StoreReg { value, .. } | Op::Unary(_, value) | Op::EqConst(value, _) => *value = f(*value),
@@ -483,7 +486,7 @@ impl Op {
     pub(crate) fn is_removable(&self) -> bool {
         match self {
             Op::Builtin { function, .. } => !function.writes(),
-            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. } | Op::ArrayBase { .. }),
+            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. } | Op::ArrayBase { .. } | Op::TableAddr { .. }),
         }
     }
 }

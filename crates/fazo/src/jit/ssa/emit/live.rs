@@ -24,6 +24,9 @@ pub(crate) fn safepoint_polls(func: &Func, pc: u32) -> bool {
 pub(crate) fn for_each_use(func: &Func, value: Val, mut f: impl FnMut(Val)) {
     let op = &func.inst(value).op;
     op.for_each_operand(&mut f);
+    if let Some(payload) = payload_use(func, op) {
+        f(payload);
+    }
     match op {
         Op::Safepoint { pc, state, .. } if safepoint_polls(func, *pc) => func.state(*state).for_each_operand(&mut f),
         Op::Safepoint { .. } => {}
@@ -40,6 +43,19 @@ pub(crate) fn for_each_use(func: &Func, value: Val, mut f: impl FnMut(Val)) {
                 func.state(state).for_each_operand(&mut f);
             }
         }
+    }
+}
+
+/// A node reading its table through a `TableAddr` still passes the table itself to helpers and the collector's marks.
+pub(crate) fn payload_use(func: &Func, op: &Op) -> Option<Val> {
+    let table = match *op {
+        Op::Index { object, .. } | Op::NewIndex { object, .. } => object,
+        Op::StoreSlot { table, .. } | Op::StoreNode { table, .. } | Op::AddSlot { table, .. } => table,
+        _ => return None,
+    };
+    match *func.op(table) {
+        Op::TableAddr { table } => Some(table),
+        _ => None,
     }
 }
 

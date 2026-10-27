@@ -174,7 +174,7 @@ fn clobbers(func: &Func, entry: &Loop) -> Clobbers {
     found
 }
 
-fn blocks_on_every_iteration(func: &Func, entry: &Loop, inside: &[bool], idom: &[Option<BlockId>]) -> Vec<bool> {
+pub(crate) fn blocks_on_every_iteration(func: &Func, entry: &Loop, inside: &[bool], idom: &[Option<BlockId>]) -> Vec<bool> {
     let latches: Vec<BlockId> = entry
         .blocks
         .iter()

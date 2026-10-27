@@ -71,6 +71,7 @@ pub(crate) struct Alloc {
 }
 
 const NO_SLOT: u32 = u32::MAX;
+const LOOP_RESERVE: usize = 4;
 
 impl Alloc {
     pub(crate) fn new(regs: Registers, classes: Vec<Class>) -> Self {
@@ -152,8 +153,8 @@ impl Alloc {
         }
     }
 
-    /// Parameters take a free register, preferring their argument's; `spilled` parts stay in their slots across the loop, as Maglev's `HoistLoopSpills` keeps them (src/maglev/maglev-regalloc.cc).
-    pub(crate) fn fix(&mut self, live: &[Part], params: &[(Part, Option<PReg>)], spilled: impl Fn(Part) -> bool) -> Vec<Entry> {
+    /// Parameters take a free register, preferring their argument's; `spilled` parts stay in their slots across the loop, as Maglev's `HoistLoopSpills` keeps them, and at a loop header the rest take the registers left, as its `HoistLoopReloads` does (src/maglev/maglev-regalloc.cc).
+    pub(crate) fn fix(&mut self, live: &[Part], params: &[(Part, Option<PReg>)], spilled: impl Fn(Part) -> bool, hot: impl Fn(Part) -> bool) -> Vec<Entry> {
         let mut entries = Vec::with_capacity(live.len() + params.len());
         for &part in live {
             if spilled(part) {
@@ -183,7 +184,24 @@ impl Alloc {
                 }
             }
         }
+        self.hoist_reloads(&mut entries, &mut taken, &hot);
         entries
+    }
+
+    /// Only values read on every iteration, leaving `LOOP_RESERVE` registers of each class for the body's own values.
+    fn hoist_reloads(&self, entries: &mut [Entry], taken: &mut RegSet, hot: &impl Fn(Part) -> bool) {
+        for entry in entries.iter_mut().filter(|entry| entry.reg.is_none() && hot(entry.part)) {
+            let class = self.class_of(entry.part);
+            let free = self.regs.order(class).filter(|&reg| !taken.contains(reg)).count();
+            if free <= LOOP_RESERVE {
+                continue;
+            }
+            let Some(reg) = self.regs.order(class).find(|&reg| !taken.contains(reg)) else {
+                continue;
+            };
+            taken.insert(reg);
+            entry.reg = Some(reg);
+        }
     }
 
     /// A block no edge has reached yet finds every value in its slot.
@@ -304,6 +322,15 @@ impl Alloc {
         self.temps.insert(reg);
         self.used.insert(reg);
         reg
+    }
+
+    pub(crate) fn pin(&mut self, reg: PReg) {
+        self.pinned.insert(reg);
+    }
+
+    /// A value rebuilt rather than reloaded: eviction drops it without a store.
+    pub(crate) fn mark_rebuilt(&mut self, part: Part) {
+        self.in_slot[part as usize] = true;
     }
 
     pub(crate) fn release(&mut self, value: Val) {
