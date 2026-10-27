@@ -165,6 +165,7 @@ pub(crate) fn virtual_text(object: &super::ir::Virtual) -> String {
 
 pub(crate) fn describe(op: &Op) -> String {
     let v = |value: &Val| format!("v{}", value.0);
+    let through = |node: &Option<Val>| node.map_or(String::new(), |node| format!(" via v{}", node.0));
     match op {
         Op::Param => "param".to_owned(),
         Op::Const(constant) => format!("const {constant}"),
@@ -197,8 +198,9 @@ pub(crate) fn describe(op: &Op) -> String {
         Op::GuardFalse { cond, state } => format!("guard.false {} s{}", v(cond), state.0),
         Op::GuardNotNil { value, state } => format!("guard.notnil {} s{}", v(value), state.0),
         Op::GuardRange { table, low, high, state } => format!("guard.range {} [{}..{}] s{}", v(table), v(low), v(high), state.0),
-        Op::Index { object, key, state } => format!("index {} [{}] s{}", v(object), v(key), state.0),
-        Op::NewIndex { object, key, value, state } => format!("newindex {} [{}] = {} s{}", v(object), v(key), v(value), state.0),
+        Op::Index { object, key, node, state } => format!("index {} [{}]{} s{}", v(object), v(key), through(node), state.0),
+        Op::NewIndex { object, key, value, node, state } => format!("newindex {} [{}]{} = {} s{}", v(object), v(key), through(node), v(value), state.0),
+        Op::NodeRef { table, key } => format!("node.ref {} [{}]", v(table), v(key)),
         Op::AddSlot { table, key, shape, next, slot, value, state } => format!("add.slot {} [{}] {shape:x}->{next:x} #{slot} = {} s{}", v(table), v(key), v(value), state.0),
         Op::StoreSlot { table, slot, value, state } => format!("store.slot {} #{slot} = {} s{}", v(table), v(value), state.0),
         Op::GuardNode { table, node, nodes, key, state } => format!("guard.node {} #{node}/{nodes} {key:x} s{}", v(table), state.0),

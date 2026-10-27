@@ -399,6 +399,7 @@ fn key(op: &Op, rep: Rep, map: &[Val]) -> Option<(Key, bool)> {
         Op::LoadUpval { closure, index } => (UPVALUE_KIND, [u64::from(*index), u64::from(matches!(closure, Closure::Root))], true),
         Op::LoadNode { node, .. } => (NODE_KIND, [u64::from(*node), 0], true),
         Op::LoadArray { .. } => (ARRAY_KIND, [0, 0], true),
+        Op::Index { node: None, .. } => (INDEX_KIND, [0, 0], true),
         Op::LoadProto { .. } => (19, [0, 0], false),
         Op::Requests => (21, [0, 0], false),
         Op::Builtin { function, .. } if function.is_pure() => (20, [*function as u64, 0], false),
@@ -498,6 +499,7 @@ fn cse(func: &mut Func, order: &[BlockId]) -> bool {
 const UPVALUE_KIND: u64 = 17;
 const NODE_KIND: u64 = 18;
 const ARRAY_KIND: u64 = 22;
+const INDEX_KIND: u64 = 23;
 
 /// Follows LuaJIT's `fwd_ahload` (lj_opt_mem.c): a load of the node just stored reads the stored value. A store to the same node of another table may alias every load of that node.
 fn forward_store(local: &mut HashMap<Key, Val>, map: &[Val], (table, node, stored): (Val, u32, Val)) {
@@ -507,12 +509,13 @@ fn forward_store(local: &mut HashMap<Key, Val>, map: &[Val], (table, node, store
     local.insert(key, super::super::ir::resolve(map, stored));
 }
 
-/// Array loads are merged only across ops that run no metamethod and write no table.
+/// Array loads and indexing are merged only across ops that run no metamethod and write no table; an index that would
+/// run one leaves the compiled code instead.
 fn reads_quietly(op: &Op) -> bool {
     op.is_pure()
         || matches!(
             op,
-            Op::LoadReg { .. } | Op::StoreReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadUpval { .. } | Op::LoadArray { .. } | Op::TableAddr { .. } | Op::ArrayBase { .. }
+            Op::Index { .. } | Op::LoadReg { .. } | Op::StoreReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadUpval { .. } | Op::LoadArray { .. } | Op::TableAddr { .. } | Op::ArrayBase { .. }
                 | Op::ShapeIs { .. } | Op::GuardType { .. } | Op::GuardShape { .. } | Op::GuardEq { .. } | Op::GuardNotNil { .. } | Op::GuardRange { .. }
                 | Op::GuardFalse { .. } | Op::GuardNoMeta { .. } | Op::GuardHasMeta { .. } | Op::GuardAbsent { .. } | Op::GuardNode { .. }
         )
@@ -535,7 +538,7 @@ fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key,
             local.retain(|key, _| key.0[0] != UPVALUE_KIND);
         }
         if arrays && !reads_quietly(op) {
-            local.retain(|key, _| key.0[0] != ARRAY_KIND);
+            local.retain(|key, _| key.0[0] != ARRAY_KIND && key.0[0] != INDEX_KIND);
             arrays = false;
         }
         if let Op::StoreNode { table, node, value: stored, .. } = op {
@@ -552,7 +555,7 @@ fn cse_block(func: &Func, block: BlockId, (table, map, dead): (&mut HashMap<Key,
             continue;
         }
         if memory {
-            arrays |= key.0[0] == ARRAY_KIND;
+            arrays |= key.0[0] == ARRAY_KIND || key.0[0] == INDEX_KIND;
             local.insert(key, value);
         } else {
             table.insert(key, value);

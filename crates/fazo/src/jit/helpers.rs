@@ -321,6 +321,37 @@ pub(super) extern "C" fn vararg(ctx: *mut JitCtx, pc: u32, a: u32, c: u32, _unus
     with_vm(ctx, pc, |ctx, vm| vm.jit_vararg(ctx, a as u8, c as u8).then(|| i64::from(pc) + 1))
 }
 
+/// `next` or `ipairs`'s iterator runs without a call frame, leaving the registers and top as the interpreter's
+/// `generic_call` and `generic_builtin` do.
+pub(super) extern "C" fn tfor_call(ctx: *mut JitCtx, pc: u32, a: u32, c: u32, _unused: u32) -> i64 {
+    if pending(ctx) {
+        return settle_then(ctx, pc, a, c, _unused, tfor_call);
+    }
+    with_vm(ctx, pc, |ctx, vm| {
+        let state = register(ctx, a + 1);
+        let control = register(ctx, a + 3);
+        let found = vm.jit_iterate(register(ctx, a), state, control)?;
+        write_register(ctx, a + 5, control);
+        write_register(ctx, a + 4, state);
+        let placed = match found {
+            Some((key, value)) => {
+                write_register(ctx, a + 3, key);
+                write_register(ctx, a + 4, value);
+                2
+            }
+            None => {
+                write_register(ctx, a + 3, crate::value::Value::Nil);
+                1
+            }
+        };
+        for index in placed..c {
+            write_register(ctx, a + 3 + index, crate::value::Value::Nil);
+        }
+        vm.jit_set_top(ctx.base + a as usize + 6);
+        next(pc)
+    })
+}
+
 pub(super) extern "C" fn get_tabup(ctx: *mut JitCtx, pc: u32, target: u32, upvalue: u32, key: u32) -> i64 {
     if pending(ctx) {
         return settle_then(ctx, pc, target, upvalue, key, get_tabup);

@@ -7,6 +7,7 @@ pub(crate) mod fold;
 pub(crate) mod forward;
 pub(crate) mod hoist;
 pub(crate) mod inline;
+pub(crate) mod refs;
 pub(crate) mod repr;
 pub(crate) mod types;
 
@@ -28,6 +29,7 @@ pub(crate) const PEAK: &[Pass] = &[
     ("hoist", hoist::run),
     ("bounds", bounds::run),
     ("fold", fold::run),
+    ("refs", refs::run),
     ("dce", dce::run),
 ];
 
@@ -43,6 +45,7 @@ pub(crate) const OPTIMIZING: &[Pass] = &[
     ("repr", repr::run),
     ("hoist", hoist::run),
     ("bounds", bounds::run),
+    ("refs", refs::run),
     ("dce", dce::run),
     ("address", address::run),
 ];

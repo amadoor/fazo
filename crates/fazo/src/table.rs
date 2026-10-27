@@ -25,6 +25,8 @@ pub struct Table {
     shaped: bool,
     shape: Ref<Shape>,
     dynamic_transitions: u8,
+    has_dead: bool,
+    next_hint: Cell<u32>,
     array: Vec<Value>,
     slots: Vec<Value>,
     nodes: Vec<Node>,
@@ -44,6 +46,7 @@ pub(crate) mod offsets {
     pub(crate) const SLOTS: usize = std::mem::offset_of!(Table, slots);
     pub(crate) const ARRAY: usize = std::mem::offset_of!(Table, array);
     pub(crate) const NODES: usize = std::mem::offset_of!(Table, nodes);
+    pub(crate) const LENGTH_HINT: usize = std::mem::offset_of!(Table, length_hint);
     pub(crate) const NODE_SIZE: usize = std::mem::size_of::<super::Node>();
     pub(crate) const NODE_KEY: usize = std::mem::offset_of!(super::Node, key);
     pub(crate) const NODE_VALUE: usize = std::mem::offset_of!(super::Node, value);
@@ -59,6 +62,8 @@ impl Default for Table {
             shaped: true,
             shape: ROOT,
             dynamic_transitions: 0,
+            has_dead: false,
+            next_hint: Cell::new(0),
             array: Vec::new(),
             slots: Vec::new(),
             nodes: Vec::new(),
@@ -116,6 +121,8 @@ impl Table {
             shaped: true,
             shape: ROOT,
             dynamic_transitions: 0,
+            has_dead: false,
+            next_hint: Cell::new(0),
             array: array_values,
             slots,
             nodes: Vec::new(),
@@ -631,6 +638,9 @@ impl Table {
                 if self.nodes.is_empty() {
                     return Err(());
                 }
+                if let Some(node) = self.hinted_node(key) {
+                    return Ok(array_len + self.slots.len() + node + 1);
+                }
                 let hash = key_hash(keys, key);
                 match self.find(keys, key, hash, true) {
                     Some(node) => Ok(array_len + self.slots.len() + node + 1),
@@ -638,6 +648,14 @@ impl Table {
                 }
             }
         }
+    }
+
+    /// The node `next` last returned, when it holds `key`; without dead keys no other node can, so `find` would return
+    /// the same one.
+    fn hinted_node(&self, key: Value) -> Option<usize> {
+        let index = self.next_hint.get() as usize;
+        let node = self.nodes.get(index)?;
+        (!self.has_dead && !node.dead && same_reference(node.key, key)).then_some(index)
     }
 
     fn string_slot(&self, keys: KeyView, key: Value) -> Option<usize> {
@@ -670,10 +688,10 @@ impl Table {
             }
             position = node_base;
         }
-        self.nodes[position - node_base..]
-            .iter()
-            .find(|node| !node.value.is_nil())
-            .map(|node| (node.key, node.value))
+        let start = position - node_base;
+        let (offset, node) = self.nodes[start..].iter().enumerate().find(|(_, node)| !node.value.is_nil())?;
+        self.next_hint.set((start + offset) as u32);
+        Some((node.key, node.value))
     }
 
     fn find(&self, keys: KeyView, key: Value, hash: u64, dead_ok: bool) -> Option<usize> {
@@ -838,6 +856,7 @@ impl Table {
             self.reserve_array(array_size)?;
         }
         let old_nodes = std::mem::replace(&mut self.nodes, nodes);
+        self.has_dead = false;
         self.last_free = self.nodes.len();
         if array_size < old_size {
             self.reinsert_old_slice(array_size)?;
@@ -986,6 +1005,7 @@ impl Table {
     }
 
     pub(crate) fn clear_node_key(&mut self, index: usize) {
+        self.has_dead = true;
         self.nodes[index].dead = true;
     }
 }

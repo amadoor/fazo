@@ -12,7 +12,7 @@ use crate::{
         sites::{
             FAST_ARITH, FAST_CALL, FAST_FOR_PREP, FAST_GET_FIELD, FAST_GET_INT, FAST_GET_SELF, FAST_GET_TABLE, FAST_GET_TABUP,
             FAST_CLOSE, FAST_CLOSURE, FAST_GET_UPVAL, FAST_SET_LIST, FAST_NEW_TABLE, FAST_RETURN, FAST_VARARG, FAST_SET_FIELD, FAST_SET_INT, FAST_SET_TABLE, FAST_SET_UPVAL,
-            CallTarget, FAST_TABLE_BARRIER, FAST_TAIL_CALL, add_entries, all_method_entries, field_entries,
+            CallTarget, FAST_TABLE_BARRIER, FAST_TAIL_CALL, FAST_TFOR_CALL, add_entries, all_method_entries, field_entries, iterates_builtin, loop_ranges,
         },
         helpers::CONSTANT_OPERAND,
         jit_operand::IMMEDIATE,
@@ -28,6 +28,7 @@ pub(crate) struct BaselineFacts<'a> {
     pub(crate) tier_budget: Option<*const std::cell::Cell<i64>>,
     pub(crate) inline_caches: bool,
     pub(crate) calls: &'a [Vec<CallTarget>],
+    pub(crate) builtin_of: &'a dyn Fn(crate::arena::Ref<crate::object::Native>) -> Option<crate::vm::Builtin>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ struct Emitter<'a> {
     exit: u32,
     trap: u32,
     shared_step: u32,
+    loops: std::cell::OnceCell<Vec<(usize, usize)>>,
 }
 
 static DISCARDED_KINDS: [std::sync::atomic::AtomicU8; 2] = [const { std::sync::atomic::AtomicU8::new(0) }; 2];
@@ -108,6 +110,7 @@ pub(super) fn emit(library: &mut Library, proto: &Proto, facts: &BaselineFacts<'
         exit: 0,
         trap: 0,
         shared_step: 0,
+        loops: std::cell::OnceCell::new(),
     };
 
     emitter.frame();
@@ -408,6 +411,7 @@ impl<'a> Emitter<'a> {
             Instruction::NewTable { a, b, c, k } => self.new_table(pc, a, b, c, k),
             Instruction::Closure { a, bx } => self.fast(pc, FAST_CLOSURE, [i64::from(a), i64::from(bx), 0], Some(pc + 1)),
             Instruction::Vararg { a, c, k: false, .. } => self.fast(pc, FAST_VARARG, [i64::from(a), i64::from(c), 0], Some(pc + 1)),
+            Instruction::TForCall { a, c } if iterates_builtin(self.proto, pc, self.facts.builtin_of) => self.fast(pc, FAST_TFOR_CALL, [i64::from(a), i64::from(c), 0], Some(pc + 1)),
             Instruction::SetList { a, b, c, k: false } => self.fast(pc, FAST_SET_LIST, [i64::from(a), i64::from(b), i64::from(c)], Some(pc + 1)),
             Instruction::Pow { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(c)),
             Instruction::PowK { a, b, c } => self.arith_helper(pc, a, ArithOp::Pow, i64::from(b), i64::from(CONSTANT_OPERAND | u32::from(c))),
@@ -650,7 +654,7 @@ impl<'a> Emitter<'a> {
         let which = if upvalue { FAST_GET_TABUP } else { FAST_GET_FIELD };
         let args = [i64::from(a), i64::from(b), i64::from(c)];
         let entries: Vec<_> = field_entries(self.proto, pc).into_iter().filter(|entry| entry.slot == ABSENT || entry.slot <= MAX_SLOT).collect();
-        if upvalue && entries.is_empty() && self.library.has_tables() && self.facts.inline_caches && self.string_constant(usize::from(c)) {
+        if upvalue && entries.is_empty() && self.library.has_tables() && self.facts.inline_caches && self.string_constant(usize::from(c)) && !self.runs_once(pc) {
             return self.constant_key_get(pc, (a, b, c), which);
         }
         if !self.library.has_tables() || !self.facts.inline_caches || entries.is_empty() {
@@ -674,6 +678,15 @@ impl<'a> Emitter<'a> {
         let labels = self.with(pc, &[(ext::SLOW, slow)]);
         self.put(false, Key::UpvalueTable, &values(&[(slot::B, crate::jit::layout::upvalue::cell(b))]), &labels);
         self.put(false, Key::ConstantKeyGet, &values(&[(slot::A, offset(a)), (slot::K, i64::from(c) * VALUE)]), &labels);
+    }
+
+    /// A main chunk's site outside its loops runs once, which does not pay back the probe template's one-time build.
+    fn runs_once(&self, pc: usize) -> bool {
+        if self.proto.line_defined != 0 || self.library.has_stencil(Key::ConstantKeyGet) {
+            return false;
+        }
+        let loops = self.loops.get_or_init(|| loop_ranges(self.proto));
+        !loops.iter().any(|&(start, end)| (start..=end).contains(&pc))
     }
 
     fn string_constant(&self, index: usize) -> bool {

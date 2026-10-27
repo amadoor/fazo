@@ -2385,6 +2385,7 @@ impl Vm {
             && let Some(builtin) = self.builtin_of(native)
             && self.generic_builtin(builtin, base, c)
         {
+            self.record_call(activation.proto, pc - 1, function);
             return Ok(Flow::Untraced);
         }
         let caller = self.current_thread;

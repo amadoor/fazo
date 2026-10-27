@@ -656,11 +656,12 @@ impl<'a, 'f> Lowering<'a, 'f> {
                 self.guard(both, state);
                 Word::None
             }
-            Op::Index { object, key, state } => self.index(object, key, state),
-            Op::NewIndex { object, key, value: stored, state } => {
-                self.new_index(object, key, stored, state);
+            Op::Index { object, key, node, state } => self.index((object, key), node, state),
+            Op::NewIndex { object, key, value: stored, node, state } => {
+                self.new_index((object, key), stored, node, state);
                 Word::None
             }
+            Op::NodeRef { table, key } => Word::One(self.node_ref(table, key)),
             Op::AddSlot { table, key, shape, next, slot, value: stored, state } => {
                 self.add_slot(table, key, (shape, next, slot), stored, state);
                 Word::None
@@ -1197,31 +1198,129 @@ impl<'a, 'f> Lowering<'a, 'f> {
         }
     }
 
-    fn index(&mut self, object: Val, key: Val, state: StateId) -> Word {
-        let Some((index, is_int)) = self.integer_key(key) else {
+    fn index(&mut self, (object, key): (Val, Val), node: Option<Val>, state: StateId) -> Word {
+        let integer = if node.is_some() { None } else { self.integer_key(key) };
+        if integer.is_none() && node.is_none() {
             let (tag, payload) = self.index_helper(object, key, state);
             return Word::Two(tag, payload);
-        };
+        }
         let join = self.builder.create_block();
         let tag = self.builder.append_block_param(join, types::I64);
         let payload = self.builder.append_block_param(join, types::I64);
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
-        if let Some(is_int) = is_int {
-            self.continue_if(is_int, slow);
+        if let Some((index, is_int)) = integer {
+            if let Some(is_int) = is_int {
+                self.continue_if(is_int, slow);
+            }
+            let inside = self.inside(object, index);
+            self.continue_if(inside, slow);
+            let element = self.element_address(object, index);
+            self.read_present(element, join, slow);
         }
-        let inside = self.inside(object, index);
-        self.continue_if(inside, slow);
-        let element = self.element_address(object, index);
-        let (found_tag, found) = self.load_pair(self.heap_flags, element, 0);
-        let low = self.tag_of(found_tag);
-        let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, low, NIL_TAG);
-        self.builder.ins().brif(present, join, &[BlockArg::Value(found_tag), BlockArg::Value(found)], slow, &[]);
+        if let Some(node) = node {
+            let address = self.one(node);
+            let found = self.builder.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
+            self.continue_if(found, slow);
+            self.read_present(address, join, slow);
+        }
         self.builder.switch_to_block(slow);
         let (result_tag, result) = self.index_helper(object, key, state);
         self.builder.ins().jump(join, &[BlockArg::Value(result_tag), BlockArg::Value(result)]);
         self.builder.switch_to_block(join);
         Word::Two(tag, payload)
+    }
+
+    fn read_present(&mut self, address: Value, join: Block, absent: Block) {
+        let (found_tag, found) = self.load_pair(self.heap_flags, address, 0);
+        let low = self.tag_of(found_tag);
+        let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, low, NIL_TAG);
+        self.builder.ins().brif(present, join, &[BlockArg::Value(found_tag), BlockArg::Value(found)], absent, &[]);
+    }
+
+    /// The address of the key's value in the array part or in a string key's node (LuaJIT's `AREF`, and `asm_href` in
+    /// lj_asm_x86.h), or 0; an integer key past the array part takes the helper, as `index` does.
+    fn node_ref(&mut self, table: Val, key: Val) -> Value {
+        let done = self.builder.create_block();
+        let result = self.builder.append_block_param(done, self.pointer);
+        let miss = self.builder.create_block();
+        let strings = self.builder.create_block();
+        match self.integer_key(key) {
+            Some((position, is_int)) => {
+                if let Some(is_int) = is_int {
+                    self.continue_if(is_int, strings);
+                }
+                let inside = self.inside(table, position);
+                self.continue_if(inside, miss);
+                let element = self.element_address(table, position);
+                self.builder.ins().jump(done, &[BlockArg::Value(element)]);
+            }
+            None => {
+                self.builder.ins().jump(strings, &[]);
+            }
+        }
+        self.builder.switch_to_block(strings);
+        if self.ir.rep(key) == Rep::Boxed {
+            self.string_slot(table, key, (miss, done));
+        } else {
+            self.builder.ins().jump(miss, &[]);
+        }
+        self.builder.switch_to_block(miss);
+        let zero = self.iconst(self.pointer, 0);
+        self.builder.ins().jump(done, &[BlockArg::Value(zero)]);
+        self.builder.switch_to_block(done);
+        result
+    }
+
+    fn string_slot(&mut self, table: Val, key: Val, (miss, done): (Block, Block)) {
+        let layout = self.env.layout;
+        let walk = self.builder.create_block();
+        let index = self.builder.append_block_param(walk, types::I64);
+        let follow = self.builder.create_block();
+        let (key_tag, key_word) = self.pair(key);
+        let tag = self.tag_of(key_tag);
+        let is_string = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, STRING_TAG);
+        self.continue_if(is_string, miss);
+        let address = self.table_address(self.one(table));
+        let shaped = self.builder.ins().uload8(types::I64, self.heap_flags, address, layout.shaped);
+        let unshaped = self.builder.ins().icmp_imm_s(IntCC::Equal, shaped, 0);
+        self.continue_if(unshaped, miss);
+        let entry = self.string_key_entry(key_word);
+        let interned = self.builder.ins().uload8(types::I64, self.heap_flags, entry, offset_of!(crate::heap::StringKey, interned) as i32);
+        let is_interned = self.builder.ins().icmp_imm_s(IntCC::NotEqual, interned, 0);
+        self.continue_if(is_interned, miss);
+        let length = self.builder.ins().load(types::I64, self.heap_flags, address, layout.nodes_len);
+        let mask = self.builder.ins().iadd_imm_s(length, -1);
+        let hash = self.builder.ins().load(types::I64, self.heap_flags, entry, offset_of!(crate::heap::StringKey, hash) as i32);
+        let start = self.builder.ins().band(mask, hash);
+        let nodes = self.builder.ins().load(self.pointer, self.heap_flags, address, layout.nodes);
+        self.builder.ins().jump(walk, &[BlockArg::Value(start)]);
+        self.builder.switch_to_block(walk);
+        let offset = self.builder.ins().imul_imm_s(index, NODE_SIZE);
+        let node = self.builder.ins().iadd(nodes, offset);
+        let held_tag = self.builder.ins().uload8(types::I64, self.heap_flags, node, NODE_KEY as i32);
+        let held = self.builder.ins().load(types::I64, self.heap_flags, node, NODE_KEY as i32 + PAYLOAD);
+        let dead = self.builder.ins().uload8(types::I64, self.heap_flags, node, crate::table::offsets::NODE_DEAD as i32);
+        let string_key = self.builder.ins().icmp_imm_s(IntCC::Equal, held_tag, STRING_TAG);
+        let same = self.builder.ins().icmp(IntCC::Equal, held, key_word);
+        let alive = self.builder.ins().icmp_imm_s(IntCC::Equal, dead, 0);
+        let same_string = self.builder.ins().band(string_key, same);
+        let hit = self.builder.ins().band(same_string, alive);
+        let value = self.builder.ins().iadd_imm_s(node, NODE_VALUE);
+        self.builder.ins().brif(hit, done, &[BlockArg::Value(value)], follow, &[]);
+        self.builder.switch_to_block(follow);
+        let next = self.builder.ins().uload32(self.heap_flags, node, crate::table::offsets::NODE_NEXT as i32);
+        let more = self.builder.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        let following = self.builder.ins().iadd_imm_s(next, -1);
+        self.builder.ins().brif(more, walk, &[BlockArg::Value(following)], miss, &[]);
+    }
+
+    fn string_key_entry(&mut self, key_word: Value) -> Value {
+        let index = self.builder.ins().band_imm_s(key_word, 0xffff_ffff);
+        let offset = self.builder.ins().imul_imm_s(index, std::mem::size_of::<crate::heap::StringKey>() as i64);
+        let vm = self.ctx_load(self.pointer, offset_of!(JitCtx, vm));
+        let keys = self.builder.ins().load(self.pointer, self.heap_flags, vm, self.env.layout.string_keys);
+        self.builder.ins().iadd(keys, offset)
     }
 
     fn index_helper(&mut self, object: Val, key: Val, state: StateId) -> (Value, Value) {
@@ -1259,22 +1358,38 @@ impl<'a, 'f> Lowering<'a, 'f> {
     }
 
     /// The raw store runs only when no `__newindex` can fire (`quick::raw_set` decides).
-    fn new_index(&mut self, object: Val, key: Val, stored: Val, state: StateId) {
+    fn new_index(&mut self, (object, key): (Val, Val), stored: Val, node: Option<Val>, state: StateId) {
         let value = self.pair(stored);
-        let Some((index, is_int)) = self.integer_key(key) else {
+        let integer = if node.is_some() { None } else { self.integer_key(key) };
+        if integer.is_none() && node.is_none() {
             self.new_index_helper(object, key, value, state);
             return;
-        };
+        }
         let done = self.builder.create_block();
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
-        if let Some(is_int) = is_int {
-            self.continue_if(is_int, slow);
+        if let Some((index, is_int)) = integer {
+            if let Some(is_int) = is_int {
+                self.continue_if(is_int, slow);
+            }
+            let inside = self.inside(object, index);
+            self.continue_if(inside, slow);
+            self.array_store(object, index, value, slow);
+            self.builder.ins().jump(done, &[]);
         }
-        let inside = self.inside(object, index);
-        self.continue_if(inside, slow);
-        self.array_store(object, index, value, slow);
-        self.builder.ins().jump(done, &[]);
+        if let Some(node) = node {
+            let address = self.one(node);
+            let found = self.builder.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
+            self.continue_if(found, slow);
+            let tag = self.builder.ins().uload8(types::I64, self.heap_flags, address, 0);
+            let present = self.builder.ins().icmp_imm_s(IntCC::NotEqual, tag, NIL_TAG);
+            self.continue_if(present, slow);
+            self.store_pair(self.heap_flags, value, address, 0);
+            if self.may_collect(stored) {
+                self.barrier(object, value);
+            }
+            self.builder.ins().jump(done, &[]);
+        }
         self.builder.switch_to_block(slow);
         self.new_index_helper(object, key, value, state);
         self.builder.ins().jump(done, &[]);

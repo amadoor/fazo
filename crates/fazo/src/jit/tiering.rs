@@ -23,6 +23,7 @@ const OPTIMIZING_IR_PER_JUMP: i64 = 88_707;
 const PEAK_IR_PER_OPTIMIZING_BYTE: i64 = 3_096;
 const LOOP_WEIGHT: i64 = 8;
 const MAX_DEPTH: u32 = 3;
+const KEY_LOOKBACK: usize = 8;
 
 /// Measured with `cargo xtask perf`.
 const ARITHMETIC_GAIN: i64 = 9;
@@ -33,6 +34,8 @@ const STORE_GAIN: i64 = 16;
 const GLOBAL_GAIN: i64 = 50;
 const LEN_GAIN: i64 = 90;
 const LOAD_GAIN: i64 = 6;
+/// A key loaded from a table is usually a string, whose Baseline probe Optimizing code shares or removes.
+const HASHED_KEY_GAIN: i64 = 40;
 /// Only an empty constructor allocates inline.
 const NEW_TABLE_GAIN: i64 = 200;
 const HELPER_COST: i64 = 5;
@@ -300,6 +303,20 @@ fn direct_lua_call(proto: &Proto, calls: &[Vec<CallTarget>], pc: usize) -> Optio
     super::sites::calls_lua(proto, pc).then(|| calls.get(pc).is_some_and(|targets| !targets.is_empty()))
 }
 
+/// The key register was last written, a few instructions back, by a table load rather than by arithmetic or a loop.
+fn loaded_key(proto: &Proto, pc: usize, key: u8) -> bool {
+    let key = usize::from(key);
+
+    for &instruction in proto.code[pc.saturating_sub(KEY_LOOKBACK)..pc].iter().rev() {
+        let written = super::ssa::flow::written(instruction, proto.max_stack as usize);
+        if !written.contains(&key) {
+            continue;
+        }
+        return matches!(instruction, Instruction::GetTable { .. } | Instruction::GetField { .. } | Instruction::GetTabUp { .. });
+    }
+    false
+}
+
 /// A site the interpreter never reached records no feedback and counts for nothing.
 fn bytecode_gain(proto: &Proto, (calls, in_loop): (&[Vec<CallTarget>], bool), pc: usize, instruction: Instruction) -> i64 {
     let reached = !matches!(proto.exec.feedback.get(pc), None | Some(InlineCache::Uninitialized));
@@ -326,6 +343,8 @@ fn bytecode_gain(proto: &Proto, (calls, in_loop): (&[Vec<CallTarget>], bool), pc
         Instruction::NewTable { .. } | Instruction::Closure { .. } | Instruction::SetList { .. } | Instruction::Close { .. } | Instruction::Tbc { .. } => {
             -HELPER_COST
         }
+        Instruction::SetTable { b, .. } if in_loop && loaded_key(proto, pc, b) => STORE_GAIN + HASHED_KEY_GAIN,
+        Instruction::GetTable { c, .. } if in_loop && loaded_key(proto, pc, c) => LOAD_GAIN + HASHED_KEY_GAIN,
         Instruction::SetTable { .. } | Instruction::SetI { .. } | Instruction::SetField { .. } | Instruction::SetTabUp { .. } => STORE_GAIN,
         Instruction::GetField { .. } | Instruction::SelfOp { .. } | Instruction::GetTable { .. } | Instruction::GetI { .. } => LOAD_GAIN,
         Instruction::GetTabUp { .. } if reached => GLOBAL_GAIN,

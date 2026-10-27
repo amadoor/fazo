@@ -112,6 +112,10 @@ impl Library {
         self.env.frames.is_some()
     }
 
+    fn has_stencil(&self, key: Key) -> bool {
+        self.stencils[key.index()].is_some()
+    }
+
     fn stencil(&mut self, key: Key) -> &SplitStencil {
         let Self { env, stencils, .. } = self;
         stencils[key.index()].get_or_insert_with(|| {

@@ -151,7 +151,7 @@ pub(crate) enum Key {
     TailEnter { upvalues: bool },
 }
 
-pub(crate) const KEY_COUNT: usize = 285;
+pub(crate) const KEY_COUNT: usize = 286;
 const HELPER_SLOTS: u8 = 19;
 
 impl Key {
@@ -204,7 +204,8 @@ impl Key {
             Key::ArraySet { constant_key, constant_value } => 33 + 2 * usize::from(constant_key) + usize::from(constant_value),
             Key::FieldGet { absent, method } => 37 + 2 * usize::from(absent) + usize::from(method),
             Key::FieldSet { constant } => 41 + usize::from(constant),
-            Key::Helper(HelperId::Fast(which)) if which >= HELPER_SLOTS + 2 => 283 + usize::from(which - HELPER_SLOTS - 2),
+            Key::Helper(HelperId::Fast(which)) if which >= HELPER_SLOTS + 3 => 285 + usize::from(which - HELPER_SLOTS - 3),
+            Key::Helper(HelperId::Fast(which)) if which == HELPER_SLOTS + 2 => 283,
             Key::Helper(HelperId::Fast(which)) if which >= HELPER_SLOTS => 277 + usize::from(which - HELPER_SLOTS),
             Key::Helper(id) => {
                 43 + match id {

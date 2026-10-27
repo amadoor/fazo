@@ -66,7 +66,8 @@ fn required(func: &Func, value: Val) -> Vec<Option<Rep>> {
         Op::GuardRange { .. } => vec![payload, int, int],
         Op::StoreSlot { .. } | Op::StoreNode { .. } => vec![payload, boxed],
         Op::AddSlot { .. } => vec![payload, boxed, boxed],
-        Op::NewIndex { .. } => vec![None, None, boxed],
+        Op::NewIndex { .. } => vec![None, None, boxed, None],
+        Op::NodeRef { .. } => vec![payload, boxed],
         Op::GuardEq { value: operand, .. } => match func.rep(*operand) {
             Rep::Word | Rep::Payload => vec![None],
             _ => vec![payload],

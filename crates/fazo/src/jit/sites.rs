@@ -29,11 +29,12 @@ const NEW_TABLE: &str = "fazo_jit_new_table";
 const CLOSURE: &str = "fazo_jit_closure";
 const CLOSE: &str = "fazo_jit_close";
 const SET_LIST: &str = "fazo_jit_set_list";
+const TFOR_CALL: &str = "fazo_jit_tfor_call";
 
 /// Indexes match the function references in `Helpers::fast`.
-pub(crate) const FAST_NAMES: [&str; 22] = [
+pub(crate) const FAST_NAMES: [&str; 23] = [
     GET_FIELD, GET_TABLE, GET_INT, GET_SELF, SET_FIELD, SET_TABLE, SET_INT, CALL_DIRECT, RETURN, FOR_PREP, GET_TABUP, ARITH, GET_UPVAL,
-    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE, CLOSE, SET_LIST, VARARG,
+    SET_UPVAL, TAIL_CALL, TABLE_BARRIER, AFTER_CALL, NEW_TABLE, CLOSURE, CLOSE, SET_LIST, VARARG, TFOR_CALL,
 ];
 pub(crate) const FAST_GET_FIELD: usize = 0;
 pub(crate) const FAST_GET_TABLE: usize = 1;
@@ -57,10 +58,11 @@ pub(crate) const FAST_CLOSURE: usize = 18;
 pub(crate) const FAST_CLOSE: usize = 19;
 pub(crate) const FAST_SET_LIST: usize = 20;
 pub(crate) const FAST_VARARG: usize = 21;
+pub(crate) const FAST_TFOR_CALL: usize = 22;
 
 pub(crate) type FastFn = extern "C" fn(*mut JitCtx, u32, u32, u32, u32) -> i64;
 
-pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 22] {
+pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 23] {
     [
         (GET_FIELD, helpers::get_field as FastFn as *const u8),
         (GET_TABLE, helpers::get_table as FastFn as *const u8),
@@ -84,6 +86,7 @@ pub(crate) fn fast_symbols() -> [(&'static str, *const u8); 22] {
         (CLOSE, helpers::close as FastFn as *const u8),
         (SET_LIST, helpers::set_list as FastFn as *const u8),
         (VARARG, helpers::vararg as FastFn as *const u8),
+        (TFOR_CALL, helpers::tfor_call as FastFn as *const u8),
     ]
 }
 pub(crate) const ENTRY: &str = "fazo_jit_entry";
@@ -226,6 +229,21 @@ pub(crate) fn forward_jumps(proto: &Proto) -> usize {
 
 pub(crate) fn back_edges(proto: &Proto) -> usize {
     proto.code.iter().enumerate().filter(|&(pc, &instruction)| loop_start(pc, instruction).is_some()).count()
+}
+
+/// The generic for at `pc` has called `next` or `ipairs`'s iterator, the only calls the interpreter records there.
+pub(crate) fn iterates_builtin(proto: &Proto, pc: usize, builtin_of: &dyn Fn(crate::arena::Ref<crate::object::Native>) -> Option<crate::vm::Builtin>) -> bool {
+    match proto.exec.feedback.get(pc) {
+        Some(InlineCache::Callee(callee)) => match callee.value {
+            LuaValue::Native(native) => matches!(builtin_of(native), Some(crate::vm::Builtin::Next | crate::vm::Builtin::IpairsStep)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+pub(crate) fn loop_ranges(proto: &Proto) -> Vec<(usize, usize)> {
+    proto.code.iter().enumerate().filter_map(|(end, &instruction)| Some((loop_start(end, instruction)?, end))).collect()
 }
 
 fn loop_start(pc: usize, instruction: Instruction) -> Option<usize> {

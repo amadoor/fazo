@@ -109,6 +109,7 @@ fn table_operand(op: &Op) -> Option<Val> {
     match *op {
         Op::LoadSlot { table, .. }
         | Op::LoadNode { table, .. }
+        | Op::NodeRef { table, .. }
         | Op::ShapeIs { table, .. }
         | Op::ArrayBase { table }
         | Op::GuardShape { table, .. }
@@ -129,6 +130,7 @@ fn set_table_operand(op: &mut Op, address: Val) {
     match op {
         Op::LoadSlot { table, .. }
         | Op::LoadNode { table, .. }
+        | Op::NodeRef { table, .. }
         | Op::ShapeIs { table, .. }
         | Op::ArrayBase { table }
         | Op::GuardShape { table, .. }

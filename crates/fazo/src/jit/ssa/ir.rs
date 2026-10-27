@@ -270,13 +270,17 @@ pub(crate) enum Op {
     GuardFalse { cond: Val, state: StateId },
     GuardNotNil { value: Val, state: StateId },
     GuardRange { table: Val, low: Val, high: Val, state: StateId },
-    Index { object: Val, key: Val, state: StateId },
-    NewIndex { object: Val, key: Val, value: Val, state: StateId },
+    /// `node` is a `NodeRef` of the same table and key.
+    Index { object: Val, key: Val, node: Option<Val>, state: StateId },
+    NewIndex { object: Val, key: Val, value: Val, node: Option<Val>, state: StateId },
     StoreSlot { table: Val, slot: u32, value: Val, state: StateId },
     AddSlot { table: Val, key: Val, shape: u64, next: u64, slot: u32, value: Val, state: StateId },
     /// Follows LuaJIT's `HREFK`: the hash node at `node` of a table with `nodes` nodes holds the interned string `key`.
     GuardNode { table: Val, node: u32, nodes: u32, key: u64, state: StateId },
     LoadNode { table: Val, node: u32 },
+    /// Follows LuaJIT's `AREF` and `HREF` (lj_ir.h): the address of the value an integer or string `key` has in the
+    /// array part or a live node, or 0. It stays valid until something can insert into the table.
+    NodeRef { table: Val, key: Val },
     StoreNode { table: Val, node: u32, value: Val, state: StateId },
     Helper(Helper),
     Builtin { function: BuiltinFn, args: Box<[Val]>, state: StateId },
@@ -338,14 +342,24 @@ impl Op {
                 f(*low);
                 f(*high);
             }
-            Op::Index { object, key, .. } => {
+            Op::Index { object, key, node, .. } => {
                 f(*object);
                 f(*key);
+                if let Some(node) = node {
+                    f(*node);
+                }
             }
-            Op::NewIndex { object, key, value, .. } => {
+            Op::NewIndex { object, key, value, node, .. } => {
                 f(*object);
                 f(*key);
                 f(*value);
+                if let Some(node) = node {
+                    f(*node);
+                }
+            }
+            Op::NodeRef { table, key } => {
+                f(*table);
+                f(*key);
             }
             Op::StoreSlot { table, value, .. } | Op::StoreNode { table, value, .. } => {
                 f(*table);
@@ -403,14 +417,24 @@ impl Op {
                 *low = f(*low);
                 *high = f(*high);
             }
-            Op::Index { object, key, .. } => {
+            Op::Index { object, key, node, .. } => {
                 *object = f(*object);
                 *key = f(*key);
+                if let Some(node) = node {
+                    *node = f(*node);
+                }
             }
-            Op::NewIndex { object, key, value, .. } => {
+            Op::NewIndex { object, key, value, node, .. } => {
                 *object = f(*object);
                 *key = f(*key);
                 *value = f(*value);
+                if let Some(node) = node {
+                    *node = f(*node);
+                }
+            }
+            Op::NodeRef { table, key } => {
+                *table = f(*table);
+                *key = f(*key);
             }
             Op::StoreSlot { table, value, .. } | Op::StoreNode { table, value, .. } => {
                 *table = f(*table);
@@ -490,7 +514,7 @@ impl Op {
     pub(crate) fn is_removable(&self) -> bool {
         match self {
             Op::Builtin { function, .. } => !function.writes(),
-            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. } | Op::ArrayBase { .. } | Op::TableAddr { .. }),
+            _ => self.is_pure() || matches!(self, Op::Param | Op::LoadReg { .. } | Op::LoadSlot { .. } | Op::LoadNode { .. } | Op::NodeRef { .. } | Op::LoadProto { .. } | Op::LoadUpval { .. } | Op::ShapeIs { .. } | Op::ArrayBase { .. } | Op::TableAddr { .. }),
         }
     }
 }

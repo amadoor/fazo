@@ -411,11 +411,14 @@ impl Vm {
             function.jit.tier_budget().set(i64::MAX);
         }
         let function = self.heap.protos.live(proto);
+        let natives = &self.heap.natives;
+        let builtin_of = |native: Ref<crate::object::Native>| natives.try_get(native).and_then(|native| native.builtin);
         let facts = crate::jit::baseline::BaselineFacts {
             interned: &interned,
             tier_budget: charges.then_some(std::ptr::from_ref(function.jit.tier_budget())),
             inline_caches,
             calls: &calls,
+            builtin_of: &builtin_of,
         };
         let library = self.jit.library.get_or_insert_with(|| Box::new(crate::jit::baseline::Library::new(layout, frames)));
         crate::jit::baseline::compile(library, budget, function, &facts)
@@ -1725,6 +1728,30 @@ impl Vm {
             return Control::Error;
         }
         Control::Reload
+    }
+
+    /// `None` leaves TFORCALL to the interpreter's `generic_call`: another iterator, or an error to raise.
+    pub(crate) fn jit_iterate(&mut self, function: Value, state: Value, control: Value) -> Option<Option<(Value, Value)>> {
+        let Value::Native(native) = function else {
+            return None;
+        };
+        if self.tracing {
+            return None;
+        }
+        match self.builtin_of(native)? {
+            super::builtin::Builtin::Next => {
+                let Value::Table(table) = state else {
+                    return None;
+                };
+                self.heap.tables.get(table).next(self.heap.key_view(), control).ok()
+            }
+            super::builtin::Builtin::IpairsStep => self.ipairs_step(state, control),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn jit_set_top(&mut self, top: usize) {
+        self.thread_mut().top = top;
     }
 
     /// `false` leaves VARARG without a vararg table to the interpreter (`copy_varargs`).

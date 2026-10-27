@@ -1,6 +1,6 @@
 //! Block order and liveness, after Maglev's allocator (src/maglev/maglev-regalloc.cc).
 
-use super::super::ir::{BinOp, BlockId, Const, Func, Op, Rep, Term, Val};
+use super::super::ir::{BinOp, BlockId, Const, Func, Op, Rep, Term, UnOp, Val};
 
 pub(crate) struct Liveness {
     pub(crate) order: Vec<BlockId>,
@@ -104,6 +104,7 @@ fn fuses(func: &Func, cond: Val) -> bool {
     match func.op(cond) {
         Op::Binary(BinOp::ICmp(_) | BinOp::FCmp(_), _, _) | Op::ShapeIs { .. } => true,
         Op::EqConst(operand, constant) => equality(func, *operand, *constant).is_some(),
+        Op::Unary(UnOp::Truthy, operand) => func.rep(*operand) == Rep::Boxed && !matches!(func.op(*operand), Op::Const(_)),
         _ => false,
     }
 }

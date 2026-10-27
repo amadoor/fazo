@@ -257,6 +257,15 @@ impl Vm {
         Some(Results::One(object))
     }
 
+    /// One step of `ipairs`'s iterator; `None` leaves the call to the interpreter.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn ipairs_step(&mut self, state: Value, control: Value) -> Option<Option<(Value, Value)>> {
+        match self.ipairs_results(state, control)? {
+            Results::Two(index, value) => Some(Some((index, value))),
+            _ => Some(None),
+        }
+    }
+
     fn next_results(&self, object: Value, key: Value) -> Option<Results> {
         let Value::Table(table) = object else {
             return None;

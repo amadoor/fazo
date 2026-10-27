@@ -183,8 +183,9 @@ impl<A: Asm> Gen<'_, A> {
                 }
             }
             Op::GuardRange { table, low, high, state } => self.guard_range(*table, (*low, *high), *state),
-            Op::Index { object, key, state } => self.index(value, *object, *key, *state),
-            Op::NewIndex { object, key, value: stored, state } => self.new_index(*object, *key, *stored, *state),
+            Op::Index { object, key, node, state } => self.index(value, (*object, *key), *node, *state),
+            Op::NewIndex { object, key, value: stored, node, state } => self.new_index((*object, *key), *stored, *node, *state),
+            Op::NodeRef { table, key } => self.node_ref(value, *table, *key),
             Op::StoreSlot { table, slot, value: stored, state } => {
                 let disp = slot_offset(*slot);
                 let layout = self.env.layout;
@@ -874,14 +875,47 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn len(&mut self, value: Val, operand: Val, state: StateId) {
-        let pair = self.pair(operand);
+        let (tag, word) = self.pair_regs(operand);
+        let [base, size] = [self.temp(), self.temp()];
         let out = self.out(value);
         let saves = self.saves(&[]);
-        self.call_value(runtime::KIND_LEN, &[pair], 0, &saves);
+        let call = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        self.array_border((tag, word), [base, size], call);
+        self.asm.mov(out, size);
+        self.asm.jump(done);
+        self.asm.bind(call);
+        self.call_value(runtime::KIND_LEN, &[(Src::R(tag), Src::R(word))], 0, &saves);
         let exit = self.exit(state);
         self.asm.cmp_imm(A::SCRATCH, 0);
         self.asm.branch(Cond::Eq, exit);
         self.asm.load(Width::Q, out, A::SP, self.scratch_at + PAYLOAD);
+        self.asm.bind(done);
+    }
+
+    /// The border of a table without a metatable or hash part whose length hint already names its full array part, the
+    /// case where `Table::border` (after `luaH_getn` in ltable.c) returns the array size and keeps the hint.
+    fn array_border(&mut self, (tag, word): (u8, u8), [base, size]: [u8; 2], call: Label) {
+        let layout = self.env.layout;
+
+        self.asm.cmp_byte(tag, TABLE_TAG);
+        self.asm.branch(Cond::Ne, call);
+        self.table_address(base, word);
+        self.asm.load(Width::W, A::SCRATCH, base, layout.metatable_tag);
+        self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
+        self.asm.branch(Cond::Ne, call);
+        self.asm.cmp_mem_imm(Width::Q, base, layout.nodes_len, 0);
+        self.asm.branch(Cond::Ne, call);
+        self.asm.load(Width::Q, size, base, layout.array_len);
+        self.asm.cmp_imm(size, 0);
+        self.asm.branch(Cond::Eq, call);
+        self.asm.cmp_mem(size, base, layout.length_hint);
+        self.asm.branch(Cond::Ne, call);
+        self.asm.shl_imm(A::SCRATCH, size, 4);
+        self.asm.add_mem(A::SCRATCH, base, layout.array);
+        self.asm.cmp_mem_byte(A::SCRATCH, -VALUE_SIZE, NIL_TAG);
+        self.asm.branch(Cond::Eq, call);
     }
 
     fn shape_is(&mut self, value: Val, table: Val, shape: u64) {
@@ -1027,17 +1061,18 @@ impl<A: Asm> Gen<'_, A> {
         }
     }
 
-    fn index(&mut self, value: Val, object: Val, key: Val, state: StateId) {
+    fn index(&mut self, value: Val, (object, key): (Val, Val), node: Option<Val>, state: StateId) {
         let base = self.table_base(object);
         let payload = self.table_payload(object);
         let pair = self.pair(key);
-        let integer = self.integer_key(key);
+        let shared = node.map(|node| self.reg(node));
+        let integer = if shared.is_some() { None } else { self.integer_key(key) };
         let address = self.writable(base);
         let Def::Two(tag, word) = self.define(value) else {
             self.failed = true;
             return;
         };
-        let string = self.string_key(key);
+        let string = if shared.is_some() { None } else { self.string_key(key) };
         let scratch = (string.is_some() || integer.is_some()).then(|| [self.temp(), self.temp(), self.temp()]);
         let probe = string.and(scratch).map(|[entry, key, node]| (entry, key, node));
         let hashed = integer.and(scratch);
@@ -1045,6 +1080,15 @@ impl<A: Asm> Gen<'_, A> {
         let join = self.asm.new_label();
         let slow = self.asm.new_label();
         let strings = if string.is_some() { self.asm.new_label() } else { slow };
+        if let Some(slot) = shared {
+            self.asm.cmp_imm(slot, 0);
+            self.asm.branch(Cond::Eq, slow);
+            self.asm.load(Width::Q, tag, slot, 0);
+            self.asm.load(Width::Q, word, slot, PAYLOAD);
+            self.expected_tag(value, tag);
+            self.asm.cmp_byte(tag, NIL_TAG);
+            self.asm.branch(Cond::Ne, join);
+        }
         if let (Some((index, is_int)), Some(temps)) = (integer, hashed) {
             let ints = self.asm.new_label();
             if let Some(key_tag) = is_int {
@@ -1060,17 +1104,17 @@ impl<A: Asm> Gen<'_, A> {
             self.expected_tag(value, tag);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
-            self.asm.jump(slow);
+            let absent = self.asm.new_label();
+            self.asm.jump(if address == base.reg { slow } else { absent });
             self.asm.bind(ints);
-            self.int_node((base.reg, index), temps, slow);
+            self.int_node((base.reg, index), temps, absent);
             self.asm.load(Width::Q, tag, temps[2], NODE_VALUE);
             self.asm.load(Width::Q, word, temps[2], NODE_VALUE + PAYLOAD);
             self.expected_tag(value, tag);
             self.asm.cmp_byte(tag, NIL_TAG);
             self.asm.branch(Cond::Ne, join);
-            if string.is_some() {
-                self.asm.jump(slow);
-            }
+            self.asm.bind(absent);
+            self.absent_without_metatable(value, base.reg, (tag, word), (slow, join));
         }
         if let (Some((key_tag, key_word)), Some((entry, key, node))) = (string, probe) {
             self.asm.bind(strings);
@@ -1089,12 +1133,76 @@ impl<A: Asm> Gen<'_, A> {
         self.asm.bind(join);
     }
 
+    /// An integer key the table does not hold reads nil without the helper when no metatable can supply `__index`.
+    fn absent_without_metatable(&mut self, value: Val, address: u8, (tag, word): (u8, u8), (slow, join): (Label, Label)) {
+        let layout = self.env.layout;
+
+        self.asm.load(Width::W, A::SCRATCH, address, layout.metatable_tag);
+        self.asm.cmp_imm64(A::SCRATCH, i64::from(layout.metatable_none));
+        self.asm.branch(Cond::Ne, slow);
+        self.asm.mov_imm(tag, i64::from(NIL_TAG));
+        self.asm.mov_imm(word, 0);
+        self.expected_tag(value, tag);
+        self.asm.jump(join);
+    }
+
     fn string_key(&mut self, key: Val) -> Option<(u8, u8)> {
         let may_be_string = !self.func.ty(key).intersect(Type::of_tag(STRING_TAG)).is_none();
         if self.func.rep(key) != Rep::Boxed || !may_be_string || self.is_const(key).is_some() {
             return None;
         }
         Some(self.pair_regs(key))
+    }
+
+    /// 0 when the table holds no slot for the key: an integer past the array part and absent from the nodes, or a
+    /// string that is not interned or not a key.
+    fn node_ref(&mut self, value: Val, table: Val, key: Val) {
+        let base = self.table_base(table);
+        let integer = self.integer_key(key);
+        let string = self.string_key(key);
+        let [entry, index, copy] = [self.temp(), self.temp(), self.temp()];
+        let Def::Gp(out) = self.define(value) else {
+            self.failed = true;
+            return;
+        };
+        let miss = self.asm.new_label();
+        let done = self.asm.new_label();
+        let strings = if string.is_some() { self.asm.new_label() } else { miss };
+        if let Some((key_word, is_int)) = integer {
+            let ints = self.asm.new_label();
+            if let Some(key_tag) = is_int {
+                self.asm.cmp_byte(key_tag, INT_TAG);
+                self.asm.branch(Cond::Ne, strings);
+            }
+            self.inside(base, key_word, out, ints);
+            self.asm.shl_imm(out, out, 4);
+            self.asm.add_mem(out, base.reg, self.env.layout.array);
+            self.asm.jump(done);
+            self.asm.bind(ints);
+            self.int_node((base.reg, key_word), [entry, index, out], miss);
+            self.asm.alu_imm(Alu::Add, out, out, NODE_VALUE);
+            self.asm.jump(done);
+        }
+        let Some((key_tag, key_word)) = string else {
+            self.asm.bind(miss);
+            self.asm.mov_imm(out, 0);
+            self.asm.bind(done);
+            return;
+        };
+        if integer.is_some() {
+            self.asm.bind(miss);
+            self.asm.mov_imm(out, 0);
+            self.asm.jump(done);
+        }
+        self.asm.bind(strings);
+        self.string_node((base, key_tag, key_word), [entry, index, copy, out], miss);
+        self.asm.alu_imm(Alu::Add, out, out, NODE_VALUE);
+        if integer.is_none() {
+            self.asm.jump(done);
+            self.asm.bind(miss);
+            self.asm.mov_imm(out, 0);
+        }
+        self.asm.bind(done);
     }
 
     /// Follows LuaJIT's `asm_href` (lj_asm.c).
@@ -1203,13 +1311,14 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// The raw store runs only when no `__newindex` can fire (`quick::raw_set` decides).
-    fn new_index(&mut self, object: Val, key: Val, stored: Val, state: StateId) {
+    fn new_index(&mut self, (object, key): (Val, Val), stored: Val, node: Option<Val>, state: StateId) {
         let value = self.pair(stored);
         let base = self.table_base(object);
         let payload = self.table_payload(object);
         let key_pair = self.pair(key);
-        let integer = self.integer_key(key);
-        let string = self.string_key(key);
+        let shared = node.map(|node| self.reg(node));
+        let integer = if shared.is_some() { None } else { self.integer_key(key) };
+        let string = if shared.is_some() { None } else { self.string_key(key) };
         let address = self.writable(base);
         let element = self.temp();
         let scratch = (string.is_some() || integer.is_some()).then(|| [self.temp(), self.temp()]);
@@ -1219,6 +1328,17 @@ impl<A: Asm> Gen<'_, A> {
         let done = self.asm.new_label();
         let slow = self.asm.new_label();
         let strings = if string.is_some() { self.asm.new_label() } else { slow };
+        if let Some(slot) = shared {
+            self.asm.cmp_imm(slot, 0);
+            self.asm.branch(Cond::Eq, slow);
+            self.asm.cmp_mem_byte(slot, 0, NIL_TAG);
+            self.asm.branch(Cond::Eq, slow);
+            self.store_pair(value, slot, 0);
+            if self.may_collect(stored) {
+                self.barrier(payload, value, address, &saves);
+            }
+            self.asm.jump(done);
+        }
         if let (Some((index, is_int)), Some(temps)) = (integer, hashed) {
             let layout = self.env.layout;
             let store = self.asm.new_label();
@@ -1522,6 +1642,7 @@ impl<A: Asm> Gen<'_, A> {
         match *self.func.op(cond) {
             Op::ShapeIs { table, shape } => return self.shape_branch((table, shape), negate, target),
             Op::EqConst(operand, constant) => return self.equal_branch(operand, constant, negate, target),
+            Op::Unary(UnOp::Truthy, operand) => return self.truthy_branch(operand, negate, target),
             _ => {}
         }
         let Op::Binary(op, left, right) = self.func.op(cond).clone() else {
@@ -1553,6 +1674,25 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     /// `SCRATCH` holds the table's address; the shape is compared in place, so no flag lives in a register.
+    /// Only nil and false are falsy, and their tags sit below every other.
+    fn truthy_branch(&mut self, operand: Val, negate: bool, target: Label) {
+        let (tag, payload) = self.pair_regs(operand);
+        let decided = self.asm.new_label();
+        self.asm.cmp_byte(tag, BOOL_TAG);
+        if negate {
+            self.asm.branch(Cond::Below, target);
+            self.asm.branch(Cond::Above, decided);
+            self.asm.test_imm(payload, 0xff);
+            self.asm.branch(Cond::Eq, target);
+        } else {
+            self.asm.branch(Cond::Above, target);
+            self.asm.branch(Cond::Below, decided);
+            self.asm.test_imm(payload, 0xff);
+            self.asm.branch(Cond::Ne, target);
+        }
+        self.asm.bind(decided);
+    }
+
     fn shape_branch(&mut self, (table, shape): (Val, u64), negate: bool, target: Label) {
         let layout = self.env.layout;
         let address = match self.func.op(table) {

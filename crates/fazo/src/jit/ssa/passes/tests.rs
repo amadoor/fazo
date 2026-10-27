@@ -2,7 +2,7 @@ use super::super::{
     build, check,
     ir::{BinOp, BlockId, BuiltinFn, Cc, Const, Counted, Edge, FrameState, Func, Loop, NumOp, Op, Rep, StateId, Term, Type, UnOp, Val},
 };
-use super::{address, bounds, dce, escape, fold, forward, hoist, inline, repr, types};
+use super::{address, bounds, dce, escape, fold, forward, hoist, inline, refs, repr, types};
 use crate::{arena::Ref, proto::Proto};
 
 fn state(func: &mut Func, pc: u32) -> StateId {
@@ -63,7 +63,7 @@ fn counted_loop() -> CountedLoop {
     let index = func.add_param(header, Type::INT, Rep::Int);
     let remaining = func.add_param(header, Type::INT, Rep::Int);
     let guard = func.append(header, Op::GuardType { value: table, ty: Type::TABLE, state: body_state }, Type::TABLE, Rep::Payload);
-    let element = func.append(header, Op::Index { object: guard, key: index, state: body_state }, Type::ANY, Rep::Boxed);
+    let element = func.append(header, Op::Index { object: guard, key: index, node: None, state: body_state }, Type::ANY, Rep::Boxed);
     func.append(header, Op::StoreReg { slot: 5, value: element }, Type::NONE, Rep::None);
     let zero = constant(&mut func, header, Const::Int(0));
     let done = func.append(header, Op::Binary(BinOp::ICmp(Cc::Eq), remaining, zero), Type::BOOL, Rep::Bool);
@@ -358,7 +358,7 @@ fn cse_merges_guards_but_not_across_a_store_that_moves_shapes() {
     let first = func.append(block, Op::GuardShape { table, shape: 7, state: s }, Type::NONE, Rep::None);
     let second = func.append(block, Op::GuardShape { table: again, shape: 7, state: s }, Type::NONE, Rep::None);
     let key = constant(&mut func, block, Const::Int(1));
-    func.append(block, Op::NewIndex { object: table, key, value: loaded, state: s }, Type::NONE, Rep::None);
+    func.append(block, Op::NewIndex { object: table, key, value: loaded, node: None, state: s }, Type::NONE, Rep::None);
     let third = func.append(block, Op::GuardShape { table, shape: 7, state: s }, Type::NONE, Rep::None);
     func.block_mut(block).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
     fold::run(&mut func);
@@ -369,7 +369,7 @@ fn cse_merges_guards_but_not_across_a_store_that_moves_shapes() {
 }
 
 #[test]
-fn cse_merges_array_loads_until_an_op_that_may_run_code() {
+fn cse_merges_array_loads_and_indexing_until_an_op_that_writes_a_table() {
     let (mut func, block) = straight_line();
     let s = state(&mut func, 1);
     let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
@@ -377,17 +377,22 @@ fn cse_merges_array_loads_until_an_op_that_may_run_code() {
     let base = func.append(block, Op::ArrayBase { table }, Type::NONE, Rep::Word);
     let index = constant(&mut func, block, Const::Int(1));
     let first = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
+    let read = func.append(block, Op::Index { object: table, key: index, node: None, state: s }, Type::ANY, Rep::Boxed);
     let second = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
+    let again = func.append(block, Op::Index { object: table, key: index, node: None, state: s }, Type::ANY, Rep::Boxed);
     func.append(block, Op::StoreReg { slot: 1, value: second }, Type::NONE, Rep::None);
-    let read = func.append(block, Op::Index { object: loaded, key: index, state: s }, Type::ANY, Rep::Boxed);
+    func.append(block, Op::StoreReg { slot: 2, value: again }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreNode { table, node: 0, value: read, state: s }, Type::NONE, Rep::None);
     let third = func.append(block, Op::LoadArray { table, base, index, state: s }, Type::ANY, Rep::Boxed);
-    func.append(block, Op::StoreReg { slot: 2, value: read }, Type::NONE, Rep::None);
+    let after = func.append(block, Op::Index { object: table, key: index, node: None, state: s }, Type::ANY, Rep::Boxed);
     func.append(block, Op::StoreReg { slot: 3, value: third }, Type::NONE, Rep::None);
+    func.append(block, Op::StoreReg { slot: 4, value: after }, Type::NONE, Rep::None);
     func.block_mut(block).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
     fold::run(&mut func);
     let insts = &func.block(block).insts;
-    assert!(insts.contains(&first) && !insts.contains(&second), "a repeated array load is merged");
-    assert!(insts.contains(&third), "an index may run a metamethod that writes the array");
+    assert!(insts.contains(&first) && !insts.contains(&second), "an index runs no metamethod, so the array load is merged across it");
+    assert!(insts.contains(&read) && !insts.contains(&again), "a repeated index is merged");
+    assert!(insts.contains(&third) && insts.contains(&after), "a store into a node may change both");
 }
 
 #[test]
@@ -888,4 +893,67 @@ fn an_accumulator_that_starts_as_an_integer_loops_as_a_float() {
 {func}");
     assert!(params.iter().all(|&param| func.rep(param) != Rep::Boxed), "no boxed number goes around the loop:\n{func}");
     assert!(func.states.iter().any(|state| !state.mixed.is_empty()), "the loop's frame states rebuild the sum:\n{func}");
+}
+
+/// `t[k] = (t[k] or 0) + 1` with `t` in register 0 and `k` in register 1; `between` runs after the read's branch.
+fn read_then_write(between: impl FnOnce(&mut Func, BlockId, StateId)) -> (Func, Val, Val) {
+    let mut func = Func::default();
+    let entry = func.new_block();
+    let empty = func.new_block();
+    let join = func.new_block();
+    func.entry = Some(entry);
+    let s = state(&mut func, 1);
+    let loaded = func.append(entry, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+    let table = func.append(entry, Op::GuardType { value: loaded, ty: Type::TABLE, state: s }, Type::TABLE, Rep::Payload);
+    let key = func.append(entry, Op::LoadReg { slot: 1 }, Type::ANY, Rep::Boxed);
+    let read = func.append(entry, Op::Index { object: table, key, node: None, state: s }, Type::ANY, Rep::Boxed);
+    let present = func.append(entry, Op::Unary(UnOp::Truthy, read), Type::BOOL, Rep::Bool);
+    func.block_mut(entry).term = Term::Branch { cond: present, then: Edge { block: join, args: vec![read] }, other: Edge::to(empty) };
+    let zero = func.append(empty, Op::Const(Const::Nil), Type::NIL, Rep::Boxed);
+    func.block_mut(empty).term = Term::Jump(Edge { block: join, args: vec![zero] });
+    let old = func.add_param(join, Type::ANY, Rep::Boxed);
+    between(&mut func, join, s);
+    let write = func.append(join, Op::NewIndex { object: table, key, value: old, node: None, state: s }, Type::NONE, Rep::None);
+    func.block_mut(join).term = Term::Return { pc: 2, first: 0, count: 0, close: false };
+    (func, read, write)
+}
+
+fn shared_node(func: &Func, value: Val) -> Option<Val> {
+    match *func.op(value) {
+        Op::Index { node, .. } | Op::NewIndex { node, .. } => node,
+        _ => None,
+    }
+}
+
+#[test]
+fn a_read_and_a_write_of_one_key_share_one_probe_across_a_quiet_branch() {
+    let (mut func, read, write) = read_then_write(|_, _, _| {});
+    refs::run(&mut func);
+    check::check(&func, true).expect("the node reference is defined before its uses");
+    let node = shared_node(&func, read).expect("the read probes through a node reference");
+    assert_eq!(shared_node(&func, write), Some(node), "the write reuses the read's probe:
+{func}");
+    assert!(matches!(func.op(node), Op::NodeRef { .. }));
+}
+
+#[test]
+fn an_op_that_may_insert_between_keeps_separate_probes() {
+    let call = |func: &mut Func, block: BlockId, _: StateId| {
+        func.append(block, Op::CallLua { pc: 6, a: 2, b: 1, c: 1, inlined: None, callee: None }, Type::NONE, Rep::Word);
+    };
+    let (mut func, read, write) = read_then_write(call);
+    refs::run(&mut func);
+    assert_eq!(shared_node(&func, read), None, "a call may rehash the table:
+{func}");
+    assert_eq!(shared_node(&func, write), None);
+    let insert = |func: &mut Func, block: BlockId, s: StateId| {
+        let loaded = func.append(block, Op::LoadReg { slot: 0 }, Type::ANY, Rep::Boxed);
+        let other = func.append(block, Op::LoadReg { slot: 3 }, Type::ANY, Rep::Boxed);
+        func.append(block, Op::NewIndex { object: loaded, key: other, value: other, node: None, state: s }, Type::NONE, Rep::None);
+    };
+    let (mut func, read, write) = read_then_write(insert);
+    refs::run(&mut func);
+    assert_eq!(shared_node(&func, read), None, "a store of another key may rehash the table:
+{func}");
+    assert_eq!(shared_node(&func, write), None);
 }

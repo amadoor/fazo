@@ -860,6 +860,7 @@ impl<'a> Builder<'a, '_> {
             Instruction::Return { a, b, k, .. } if b != 0 => return self.ret(frame, pc, a, u32::from(b) - 1, k),
             Instruction::Return { a, k, .. } if frame.caller.is_none() => return self.ret(frame, pc, a, super::ir::MULTIPLE_RESULTS, k),
             Instruction::Vararg { a, c, k: false, .. } => return self.helper(frame, pc, HelperKind::Fast(sites::FAST_VARARG), [u32::from(a), u32::from(c), 0]),
+            Instruction::TForCall { a, c } if self.lacks_feedback(frame, pc) || sites::iterates_builtin(frame.proto, pc, self.facts.builtin_of) => return self.helper(frame, pc, HelperKind::Fast(sites::FAST_TFOR_CALL), [u32::from(a), u32::from(c), 0]),
             Instruction::Return0 { .. } => return self.ret(frame, pc, 0, 0, false),
             Instruction::Return1 { a } => return self.ret(frame, pc, a, 1, false),
             Instruction::ForPrep { a, bx } => return self.for_prep(frame, pc, a, bx),
@@ -1159,7 +1160,7 @@ impl<'a> Builder<'a, '_> {
             [] => {
                 let table = self.table_of(object, state);
                 let key = self.constant_value(frame, u32::from(c));
-                self.emit(Op::Index { object: table, key, state }, Type::ANY, Rep::Boxed)
+                self.emit(Op::Index { object: table, key, node: None, state }, Type::ANY, Rep::Boxed)
             }
             [entry] => {
                 let table = self.table_of(object, state);
@@ -1309,7 +1310,7 @@ impl<'a> Builder<'a, '_> {
         }
         let state = self.state_at(frame, pc);
         let table = self.table_of(object, state);
-        let value = self.emit(Op::Index { object: table, key, state }, Type::ANY, Rep::Boxed);
+        let value = self.emit(Op::Index { object: table, key, node: None, state }, Type::ANY, Rep::Boxed);
         self.write(frame, a, value);
         pc + 1
     }
@@ -1328,7 +1329,7 @@ impl<'a> Builder<'a, '_> {
         let value = self.stored(frame, value);
         let state = self.state_at(frame, pc);
         let table = self.table_of(object, state);
-        self.effect(Op::NewIndex { object: table, key, value, state });
+        self.effect(Op::NewIndex { object: table, key, value, node: None, state });
         pc + 1
     }
 
@@ -1363,7 +1364,7 @@ impl<'a> Builder<'a, '_> {
             _ => {
                 let table = self.table_of(object, state);
                 let key = self.constant_value(frame, u32::from(b));
-                self.effect(Op::NewIndex { object: table, key, value: stored, state });
+                self.effect(Op::NewIndex { object: table, key, value: stored, node: None, state });
             }
         }
         pc + 1
