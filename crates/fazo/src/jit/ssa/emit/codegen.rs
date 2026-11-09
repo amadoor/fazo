@@ -564,6 +564,15 @@ impl<'a, A: Asm> Gen<'a, A> {
         }
     }
 
+    /// An operand list can outnumber the register class, so each entry gives its registers back once stored.
+    pub(super) fn store_value(&mut self, value: Val, base: u8, disp: i32) {
+        let holds = self.alloc.holds();
+        let pair = self.pair(value);
+
+        self.store_pair(pair, base, disp);
+        self.alloc.set_holds(holds);
+    }
+
     pub(super) fn ctx_load(&mut self, dst: u8, offset: usize) {
         self.asm.load(super::asm::Width::Q, dst, A::CTX, offset as i32);
     }

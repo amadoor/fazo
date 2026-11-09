@@ -1563,7 +1563,6 @@ impl<A: Asm> Gen<'_, A> {
 
     /// Every register the frame state holds is written back first, so the collector step sees it.
     fn new_table(&mut self, value: Val, (hash_log, top): (u8, u32), (shape, fields): (Option<u64>, &[Val]), (state, after): (StateId, StateId)) {
-        let pairs: Vec<(Src, Src)> = fields.iter().map(|&field| self.pair(field)).collect();
         let ran = self.temp();
         let base = self.temp();
         let out = self.out(value);
@@ -1584,13 +1583,13 @@ impl<A: Asm> Gen<'_, A> {
         if let Some(shape) = shape {
             let layout = self.env.layout;
             self.table_address(base, out);
-            self.asm.load(Width::Q, A::SCRATCH, base, layout.slots);
-            for (index, &pair) in pairs.iter().enumerate() {
-                self.store_pair(pair, A::SCRATCH, index as i32 * VALUE_SIZE);
-            }
             self.asm.store_imm(Width::Q, base, layout.slots_len, fields.len() as i64);
             self.asm.mov_imm(A::SCRATCH, shape as i64);
             self.asm.store(Width::Q, A::SCRATCH, base, layout.shape);
+            self.asm.load(Width::Q, base, base, layout.slots);
+            for (index, &field) in fields.iter().enumerate() {
+                self.store_value(field, base, index as i32 * VALUE_SIZE);
+            }
         }
         let quiet = self.exit(after);
         self.asm.cmp_imm(ran, 0);
@@ -1609,20 +1608,18 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn materialize(&mut self, value: Val, object: &Virtual) {
-        let meta = match object.meta {
-            Some(meta) => self.pair(meta),
-            None => (Src::I(0), Src::I(0)),
-        };
-        let mut pairs = vec![meta];
-        pairs.extend(object.fields.iter().map(|&field| self.pair(field)));
+        match object.meta {
+            Some(meta) => self.store_value(meta, A::SP, self.scratch_at),
+            None => self.store_pair((Src::I(0), Src::I(0)), A::SP, self.scratch_at),
+        }
+        for (index, &field) in object.fields.iter().enumerate() {
+            self.store_value(field, A::SP, self.scratch_at + (index as i32 + 1) * VALUE_SIZE);
+        }
         let original = object.original.map(|(flag, original)| (self.reg(flag), self.reg(original)));
         let out = self.out(value);
         let saves = self.saves(&[]);
-        for (index, &pair) in pairs.iter().enumerate() {
-            self.store_pair(pair, A::SP, self.scratch_at + index as i32 * VALUE_SIZE);
-        }
         self.save(&saves);
-        let count = pairs.len() as i64;
+        let count = object.fields.len() as i64 + 1;
         for (index, arg) in [(4, Src::I(count)), (2, Src::I(i64::from(object.hash_log))), (1, Src::I(object.shape as i64))] {
             self.place_arg(index, arg);
         }

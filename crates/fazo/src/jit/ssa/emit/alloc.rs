@@ -328,6 +328,15 @@ impl Alloc {
         self.pinned.insert(reg);
     }
 
+    pub(crate) fn holds(&self) -> (RegSet, RegSet) {
+        (self.pinned, self.temps)
+    }
+
+    pub(crate) fn set_holds(&mut self, (pinned, temps): (RegSet, RegSet)) {
+        self.pinned = pinned;
+        self.temps = temps;
+    }
+
     /// A value rebuilt rather than reloaded: eviction drops it without a store.
     pub(crate) fn mark_rebuilt(&mut self, part: Part) {
         self.in_slot[part as usize] = true;
